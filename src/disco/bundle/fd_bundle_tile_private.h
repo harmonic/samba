@@ -11,6 +11,7 @@
 #include "../../waltz/fd_rtt_est.h"
 #include "../../util/alloc/fd_alloc.h"
 #include "../../util/hist/fd_histf.h"
+#include "../tiles.h"
 
 #if FD_HAS_OPENSSL
 #include <openssl/ssl.h> /* SSL_CTX */
@@ -104,6 +105,9 @@ struct fd_bundle_tile {
   uchar builder_info_wait  : 1;  /* Request already in-flight? */
   long  builder_info_valid_until;
 
+  /* Leader window info submission */
+  uchar submit_leader_window_info_wait : 1;  /* Request already in-flight? */
+
   /* Bundle subscriptions */
   uchar packet_subscription_live : 1;  /* Want to subscribe to a stream? */
   uchar packet_subscription_wait : 1;  /* Request already in-flight? */
@@ -124,6 +128,9 @@ struct fd_bundle_tile {
   fd_stem_context_t * stem;
   fd_bundle_out_ctx_t verify_out;
   fd_bundle_out_ctx_t plugin_out;
+
+  /* PoH pack link input */
+  fd_bundle_out_ctx_t poh_pack_in;
 
   /* App metrics */
   fd_bundle_metrics_t metrics;
@@ -150,6 +157,9 @@ struct fd_bundle_tile {
   /* Harmonic block metrics */
   ulong harmonic_block_received_cnt;
   ulong harmonic_block_txn_received_cnt;
+
+  /* PoH became_leader message */
+  fd_became_leader_t _became_leader[1];
 };
 
 typedef struct fd_bundle_tile fd_bundle_tile_t;
@@ -162,6 +172,8 @@ typedef struct fd_bundle_tile fd_bundle_tile_t;
 
 /* Harmonic block endpoint request context IDs */
 #define FD_BUNDLE_CLIENT_REQ_SubscribeBlocks                    7
+/* Leader window info submission */
+#define FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo             8
 
 FD_PROTOTYPES_BEGIN
 
@@ -291,6 +303,14 @@ fd_bundle_client_reset( fd_bundle_tile_t * ctx );
 
 void
 fd_bundle_client_send_ping( fd_bundle_tile_t * ctx );
+
+/* fd_bundle_client_submit_leader_window_info notifies the auction house
+   that we are leader for a given slot. */
+
+void
+fd_bundle_client_submit_leader_window_info( fd_bundle_tile_t * ctx,
+                                            ulong              slot,
+                                            long               start_timestamp_ns );
 
 FD_PROTOTYPES_END
 

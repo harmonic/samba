@@ -24,4 +24,10 @@ PB_BIND(block_engine_BlockBuilderFeeInfoRequest, block_engine_BlockBuilderFeeInf
 PB_BIND(block_engine_BlockBuilderFeeInfoResponse, block_engine_BlockBuilderFeeInfoResponse, AUTO)
 
 
+PB_BIND(block_engine_SubmitLeaderWindowInfoRequest, block_engine_SubmitLeaderWindowInfoRequest, AUTO)
+
+
+PB_BIND(block_engine_SubmitLeaderWindowInfoResponse, block_engine_SubmitLeaderWindowInfoResponse, AUTO)
+
+
 

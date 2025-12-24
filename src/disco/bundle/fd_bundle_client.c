@@ -48,6 +48,7 @@ fd_bundle_client_reset( fd_bundle_tile_t * ctx ) {
 
   ctx->builder_info_avail       = 0;
   ctx->builder_info_wait        = 0;
+  ctx->submit_leader_window_info_wait = 0;
   ctx->packet_subscription_live = 0;
   ctx->packet_subscription_wait = 0;
   ctx->bundle_subscription_live = 0;
@@ -302,6 +303,36 @@ fd_bundle_client_send_ping( fd_bundle_tile_t * ctx ) {
     fd_keepalive_tx( ctx->keepalive, ctx->rng, now );
     FD_LOG_DEBUG(( "Keepalive TX (deadline=+%gs)", (double)( ctx->keepalive->ts_deadline-now )/1e9 ));
   }
+}
+
+void
+fd_bundle_client_submit_leader_window_info( fd_bundle_tile_t * ctx,
+                                            ulong              slot,
+                                            long               start_timestamp_ns ) {
+  if( FD_UNLIKELY( !ctx->grpc_client ) ) return; /* no client */
+  if( FD_UNLIKELY( fd_grpc_client_request_is_blocked( ctx->grpc_client ) ) ) return;
+
+  block_engine_SubmitLeaderWindowInfoRequest req = block_engine_SubmitLeaderWindowInfoRequest_init_default;
+  req.slot = slot;
+  req.has_start_timestamp = 1;
+  req.start_timestamp.seconds = start_timestamp_ns / (long)1e9;
+  req.start_timestamp.nanos   = (int32_t)( start_timestamp_ns % (long)1e9 );
+
+  static char const path[] = "/block_engine.BlockEngineValidator/SubmitLeaderWindowInfo";
+  fd_grpc_h2_stream_t * request = fd_grpc_client_request_start(
+      ctx->grpc_client,
+      path, sizeof(path)-1,
+      FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo,
+      &block_engine_SubmitLeaderWindowInfoRequest_msg, &req,
+      ctx->auther.access_token, ctx->auther.access_token_sz
+  );
+  if( FD_UNLIKELY( !request ) ) return;
+  fd_grpc_client_deadline_set(
+      request,
+      FD_GRPC_DEADLINE_RX_END,
+      fd_log_wallclock() + FD_BUNDLE_CLIENT_REQUEST_TIMEOUT );
+
+  ctx->submit_leader_window_info_wait = 1;
 }
 
 int
@@ -840,6 +871,9 @@ fd_bundle_client_grpc_rx_start(
     ctx->harmonic_block_subscription_wait = 0;
     FD_LOG_INFO(( "Block subscription stream started" ));
     break;
+  case FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo:
+    /* Response handler will be called in rx_msg */
+    break;
   }
 }
 
@@ -877,6 +911,15 @@ fd_bundle_client_grpc_rx_msg(
   case FD_BUNDLE_CLIENT_REQ_SubscribeBlocks:
     fd_bundle_client_handle_block_batch( ctx, &istream );
     break;
+  case FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo: {
+    /* Handle SubmitLeaderWindowInfoResponse (empty response) */
+    block_engine_SubmitLeaderWindowInfoResponse res = block_engine_SubmitLeaderWindowInfoResponse_init_default;
+    if( FD_UNLIKELY( !pb_decode( &istream, &block_engine_SubmitLeaderWindowInfoResponse_msg, &res ) ) ) {
+      ctx->metrics.decode_fail_cnt++;
+      FD_LOG_WARNING(( "Protobuf decode of (block_engine.SubmitLeaderWindowInfoResponse) failed: %s", istream.errmsg ));
+    }
+    break;
+  }
   default:
     FD_LOG_ERR(( "Received unexpected gRPC message (request_ctx=%lu)", request_ctx ));
   }
@@ -940,6 +983,9 @@ fd_bundle_client_grpc_rx_end(
     return;
   case FD_BUNDLE_CLIENT_REQ_Bundle_GetBlockBuilderFeeInfo:
     ctx->builder_info_wait = 0;
+    break;
+  case FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo:
+    ctx->submit_leader_window_info_wait = 0;
     break;
   default:
     break;
@@ -1063,6 +1109,8 @@ fd_bundle_request_ctx_cstr( ulong request_ctx ) {
     return "GetBlockBuilderFeeInfo";
   case FD_BUNDLE_CLIENT_REQ_SubscribeBlocks:
     return "SubscribeBlocks";
+  case FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo:
+    return "SubmitLeaderWindowInfo";
   default:
     return "unknown";
   }
