@@ -27,6 +27,9 @@
 
 #define FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE (5UL)
 
+/* Forward declarations for harmonic block handlers */
+static void fd_bundle_client_handle_block_batch( fd_bundle_tile_t * ctx, pb_istream_t * istream );
+
 __attribute__((weak)) long
 fd_bundle_now( void ) {
   return fd_log_wallclock();
@@ -49,6 +52,8 @@ fd_bundle_client_reset( fd_bundle_tile_t * ctx ) {
   ctx->packet_subscription_wait = 0;
   ctx->bundle_subscription_live = 0;
   ctx->bundle_subscription_wait = 0;
+  ctx->harmonic_block_subscription_live = 0;
+  ctx->harmonic_block_subscription_wait = 0;
 
   memset( ctx->rtt, 0, sizeof(fd_rtt_estimate_t) );
 
@@ -233,10 +238,18 @@ fd_bundle_client_subscribe_bundles( fd_bundle_tile_t * ctx ) {
   if( FD_UNLIKELY( fd_grpc_client_request_is_blocked( ctx->grpc_client ) ) ) return;
 
   block_engine_SubscribeBundlesRequest req = block_engine_SubscribeBundlesRequest_init_default;
-  static char const path[] = "/block_engine.BlockEngineValidator/SubscribeBundles";
+
+  /*
+     When harmonic_block_mode is enabled, use SubscribeBundles2. 
+     TODO: revert once all clients migrate */
+  static char const path[]  = "/block_engine.BlockEngineValidator/SubscribeBundles";
+  static char const path2[] = "/block_engine.BlockEngineValidator/SubscribeBundles2";
+  char const * use_path = ctx->harmonic_block_mode ? path2 : path;
+  ulong        use_len  = ctx->harmonic_block_mode ? sizeof(path2)-1 : sizeof(path)-1;
+
   fd_grpc_h2_stream_t * request = fd_grpc_client_request_start(
       ctx->grpc_client,
-      path, sizeof(path)-1,
+      use_path, use_len,
       FD_BUNDLE_CLIENT_REQ_Bundle_SubscribeBundles,
       &block_engine_SubscribeBundlesRequest_msg, &req,
       ctx->auther.access_token, ctx->auther.access_token_sz
@@ -248,6 +261,32 @@ fd_bundle_client_subscribe_bundles( fd_bundle_tile_t * ctx ) {
       fd_log_wallclock() + FD_BUNDLE_CLIENT_REQUEST_TIMEOUT );
 
   ctx->bundle_subscription_wait = 1;
+}
+
+/* Subscribe to harmonic blocks (third stream on same connection).
+   Uses the same proto as SubscribeBundles but with different semantics:
+   - slot:ulong instead of bundle_id:string (sent as decimal string in uuid field)
+   - no len=5 limit on transactions */
+static void
+fd_bundle_client_subscribe_blocks( fd_bundle_tile_t * ctx ) {
+  if( FD_UNLIKELY( fd_grpc_client_request_is_blocked( ctx->grpc_client ) ) ) return;
+
+  block_engine_SubscribeBundlesRequest req = block_engine_SubscribeBundlesRequest_init_default;
+  static char const path[] = "/block_engine.BlockEngineValidator/SubscribeBlocks";
+  fd_grpc_h2_stream_t * request = fd_grpc_client_request_start(
+      ctx->grpc_client,
+      path, sizeof(path)-1,
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks,
+      &block_engine_SubscribeBundlesRequest_msg, &req,
+      ctx->auther.access_token, ctx->auther.access_token_sz
+  );
+  if( FD_UNLIKELY( !request ) ) return;
+  fd_grpc_client_deadline_set(
+      request,
+      FD_GRPC_DEADLINE_HEADER,
+      fd_log_wallclock() + FD_BUNDLE_CLIENT_REQUEST_TIMEOUT );
+
+  ctx->harmonic_block_subscription_wait = 1;
 }
 
 void
@@ -293,6 +332,14 @@ fd_bundle_client_step_reconnect( fd_bundle_tile_t * ctx,
   /* Subscribe to bundles */
   if( FD_UNLIKELY( !ctx->bundle_subscription_live && !ctx->bundle_subscription_wait ) ) {
     fd_bundle_client_subscribe_bundles( ctx );
+    return 1;
+  }
+
+  /* Subscribe to blocks (harmonic block mode) */
+  if( FD_UNLIKELY( ctx->harmonic_block_mode &&
+                   !ctx->harmonic_block_subscription_live &&
+                   !ctx->harmonic_block_subscription_wait ) ) {
+    fd_bundle_client_subscribe_blocks( ctx );
     return 1;
   }
 
@@ -788,6 +835,11 @@ fd_bundle_client_grpc_rx_start(
     ctx->bundle_subscription_live = 1;
     ctx->bundle_subscription_wait = 0;
     break;
+  case FD_BUNDLE_CLIENT_REQ_SubscribeBlocks:
+    ctx->harmonic_block_subscription_live = 1;
+    ctx->harmonic_block_subscription_wait = 0;
+    FD_LOG_INFO(( "Block subscription stream started" ));
+    break;
   }
 }
 
@@ -821,6 +873,9 @@ fd_bundle_client_grpc_rx_msg(
     break;
   case FD_BUNDLE_CLIENT_REQ_Bundle_GetBlockBuilderFeeInfo:
     fd_bundle_client_handle_builder_fee_info( ctx, &istream );
+    break;
+  case FD_BUNDLE_CLIENT_REQ_SubscribeBlocks:
+    fd_bundle_client_handle_block_batch( ctx, &istream );
     break;
   default:
     FD_LOG_ERR(( "Received unexpected gRPC message (request_ctx=%lu)", request_ctx ));
@@ -873,6 +928,14 @@ fd_bundle_client_grpc_rx_end(
     fd_bundle_tile_backoff( ctx, fd_bundle_now() );
     ctx->defer_reset = 1;
     FD_LOG_INFO(( "SubscribeBundles stream failed (gRPC status %u-%s). Reconnecting ...",
+                  resp->grpc_status, fd_grpc_status_cstr( resp->grpc_status ) ));
+    return;
+  case FD_BUNDLE_CLIENT_REQ_SubscribeBlocks:
+    ctx->harmonic_block_subscription_live = 0;
+    ctx->harmonic_block_subscription_wait = 0;
+    fd_bundle_tile_backoff( ctx, fd_bundle_now() );
+    ctx->defer_reset = 1;
+    FD_LOG_INFO(( "SubscribeBlocks stream failed (gRPC status %u-%s). Reconnecting ...",
                   resp->grpc_status, fd_grpc_status_cstr( resp->grpc_status ) ));
     return;
   case FD_BUNDLE_CLIENT_REQ_Bundle_GetBlockBuilderFeeInfo:
@@ -998,7 +1061,193 @@ fd_bundle_request_ctx_cstr( ulong request_ctx ) {
     return "SubscribeBundles";
   case FD_BUNDLE_CLIENT_REQ_Bundle_GetBlockBuilderFeeInfo:
     return "GetBlockBuilderFeeInfo";
+  case FD_BUNDLE_CLIENT_REQ_SubscribeBlocks:
+    return "SubscribeBlocks";
   default:
     return "unknown";
+  }
+}
+
+/* ========== Block mode protobuf handlers ========== */
+
+/* Forward block transaction to tango message bus.
+   Block transactions have no len=5 limit.
+   For blocks, the slot is parsed from the uuid field. */
+static void
+fd_harmonic_block_tile_publish_block_txn(
+    fd_bundle_tile_t * ctx,
+    void const *       txn,
+    ulong              txn_sz,
+    ulong              block_txn_cnt,
+    uint               source_ipv4
+) {
+  fd_txn_m_t * txnm = fd_chunk_to_laddr( ctx->verify_out.mem, ctx->verify_out.chunk );
+  *txnm = (fd_txn_m_t) {
+    .reference_slot = 0UL,
+    .payload_sz     = (ushort)txn_sz,
+    .txn_t_sz       = 0U,
+    .source_ipv4    = source_ipv4,
+    .source_tpu     = FD_TXN_M_TPU_SOURCE_BLOCK,
+    .block_engine   = {
+      .block_slot     = ctx->harmonic_block_slot,  /* Intended landing slot */
+      .bundle_txn_cnt = block_txn_cnt,
+      .commission     = (uchar)ctx->builder_commission
+    },
+  };
+  memcpy( txnm->block_engine.commission_pubkey, ctx->builder_pubkey, 32UL );
+  fd_memcpy( fd_txn_m_payload( txnm ), txn, txn_sz );
+
+  ulong sz  = fd_txn_m_realized_footprint( txnm, 0, 0 );
+  ulong sig = 2UL; /* Use sig=2 to distinguish block txns from bundle txns (sig=1) */
+
+  if( FD_UNLIKELY( !ctx->stem ) ) {
+    FD_LOG_CRIT(( "ctx->stem not set. This is a bug." ));
+  }
+
+  ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now() );
+  fd_stem_publish( ctx->stem, ctx->verify_out.idx, sig, ctx->verify_out.chunk, sz, 0UL, 0UL, tspub );
+  ctx->verify_out.chunk = fd_dcache_compact_next( ctx->verify_out.chunk, sz, ctx->verify_out.chunk0, ctx->verify_out.wmark );
+  ctx->harmonic_block_txn_received_cnt++;
+}
+
+/* Called for each transaction in a block.  Counts transactions. */
+static bool
+fd_harmonic_block_client_visit_pb_block_txn_preflight(
+    pb_istream_t *     istream,
+    pb_field_t const * field,
+    void **            arg
+) {
+  (void)istream; (void)field;
+  fd_bundle_tile_t * ctx = *arg;
+  ctx->harmonic_block_txn_cnt++;
+  return true;
+}
+
+/* Called for each transaction in a block.  Publishes each transaction. */
+static bool
+fd_harmonic_block_client_visit_pb_block_txn(
+    pb_istream_t *     istream,
+    pb_field_t const * field,
+    void **            arg
+) {
+  (void)field;
+  fd_bundle_tile_t * ctx = *arg;
+
+  packet_Packet packet = packet_Packet_init_default;
+  if( FD_UNLIKELY( !pb_decode( istream, &packet_Packet_msg, &packet ) ) ) {
+    ctx->metrics.decode_fail_cnt++;
+    FD_LOG_WARNING(( "Protobuf decode of block (packet.Packet) failed" ));
+    return false;
+  }
+
+  if( FD_UNLIKELY( packet.data.size == 0 ) ) {
+    FD_LOG_WARNING(( "Block server delivered an empty packet, ignoring" ));
+    return true;
+  }
+
+  if( FD_UNLIKELY( packet.data.size > FD_TXN_MTU ) ) {
+    FD_LOG_WARNING(( "Block server delivered an oversize transaction, ignoring" ));
+    return true;
+  }
+
+  uint _ip4; uint ip4 = fd_uint_if( packet.has_meta, fd_cstr_to_ip4_addr( packet.meta.addr, &_ip4 ) ? _ip4 : ctx->server_ip4_addr, ctx->server_ip4_addr );
+  fd_harmonic_block_tile_publish_block_txn(
+      ctx,
+      packet.data.bytes, packet.data.size,
+      ctx->harmonic_block_txn_cnt,
+      ip4
+  );
+
+  return true;
+}
+
+/* Called for each BundleUuid in a SubscribeBundles response (used for blocks).
+   Note: For blocks, there is NO len=5 limit.
+   For blocks, the uuid field contains a slot number as a string. */
+static bool
+fd_harmonic_block_client_visit_pb_block_uuid(
+    pb_istream_t *     istream,
+    pb_field_t const * field,
+    void **            arg
+) {
+  (void)field;
+  fd_bundle_tile_t * ctx = *arg;
+
+  /* Reset block state */
+  ctx->harmonic_block_txn_cnt = 0UL;
+  ctx->harmonic_block_slot    = 0UL;
+
+  /* First pass: Count number of transactions and extract slot from uuid */
+  pb_istream_t peek = *istream;
+  bundle_BundleUuid bundle = bundle_BundleUuid_init_default;
+  bundle.bundle.packets = (pb_callback_t) {
+    .funcs.decode = fd_harmonic_block_client_visit_pb_block_txn_preflight,
+    .arg          = ctx
+  };
+  if( FD_UNLIKELY( !pb_decode( &peek, &bundle_BundleUuid_msg, &bundle ) ) ) {
+    ctx->metrics.decode_fail_cnt++;
+    FD_LOG_WARNING(( "Protobuf decode of block (bundle.BundleUuid) failed: %s", peek.errmsg ));
+    return false;
+  }
+
+  /* Parse uuid as slot number.  For blocks, uuid contains a decimal slot string. */
+  if( FD_LIKELY( bundle.uuid.size>0UL && bundle.uuid.size<21UL ) ) {
+    char slot_str[ 21 ];
+    fd_memcpy( slot_str, bundle.uuid.bytes, bundle.uuid.size );
+    slot_str[ bundle.uuid.size ] = '\0';
+
+    char * endptr = NULL;
+    ulong slot = strtoul( slot_str, &endptr, 10 );
+    if( FD_UNLIKELY( endptr==slot_str || *endptr!='\0' ) ) {
+      FD_LOG_WARNING(( "Invalid block slot in uuid: %s", slot_str ));
+      ctx->metrics.decode_fail_cnt++;
+      return true;  /* Skip this block but continue processing */
+    }
+    ctx->harmonic_block_slot = slot;
+  } else {
+    FD_LOG_WARNING(( "Invalid block uuid size: %lu", (ulong)bundle.uuid.size ));
+    ctx->metrics.decode_fail_cnt++;
+    return true;  /* Skip this block but continue processing */
+  }
+
+  /* No len=5 limit for blocks! */
+
+  ctx->harmonic_block_seq++;
+  bundle = (bundle_BundleUuid)bundle_BundleUuid_init_default;
+  bundle.bundle.packets = (pb_callback_t) {
+    .funcs.decode = fd_harmonic_block_client_visit_pb_block_txn,
+    .arg          = ctx
+  };
+
+  ctx->harmonic_block_received_cnt++;
+
+  FD_LOG_DEBUG(( "Received block slot=%lu, %lu packets",
+                 ctx->harmonic_block_slot, ctx->harmonic_block_txn_cnt ));
+
+  if( FD_UNLIKELY( !pb_decode( istream, &bundle_BundleUuid_msg, &bundle ) ) ) {
+    ctx->metrics.decode_fail_cnt++;
+    FD_LOG_WARNING(( "Protobuf decode of block (bundle.BundleUuid) failed (internal error): %s", istream->errmsg ));
+    return false;
+  }
+
+  return true;
+}
+
+/* Handle a SubscribeBundlesResponse for harmonic blocks.
+   Note: Uses the same proto as bundles but with different semantics. */
+static void
+fd_bundle_client_handle_block_batch(
+    fd_bundle_tile_t * ctx,
+    pb_istream_t *     istream
+) {
+  block_engine_SubscribeBundlesResponse res = block_engine_SubscribeBundlesResponse_init_default;
+  res.bundles = (pb_callback_t) {
+    .funcs.decode = fd_harmonic_block_client_visit_pb_block_uuid,
+    .arg          = ctx
+  };
+  if( FD_UNLIKELY( !pb_decode( istream, &block_engine_SubscribeBundlesResponse_msg, &res ) ) ) {
+    ctx->metrics.decode_fail_cnt++;
+    FD_LOG_WARNING(( "Protobuf decode of (block_engine.SubscribeBundlesResponse) for blocks failed: %s", istream->errmsg ));
+    return;
   }
 }
