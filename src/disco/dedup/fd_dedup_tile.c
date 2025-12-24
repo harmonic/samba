@@ -44,6 +44,19 @@ typedef struct {
   ulong bundle_idx;
   uchar bundle_signatures[ 4UL ][ 64UL ];
 
+  /* 
+    Harmonic Block Dedup: We want to dedup transactions within a block,
+    but blocks are much larger than bundles so we cannot do the same linear
+    search. Instead, we use a dedicated tcache to dedup transactions.
+  */
+  int   block_failed;
+  ulong block_slot;
+  ulong block_tcache_depth;   /* == fd_tcache_depth( block_tcache ), depth of block tcache (const) */
+  ulong block_tcache_map_cnt; /* == fd_tcache_map_cnt( block_tcache ), number of slots for block tcache map (const) */
+  ulong * block_tcache_sync;  /* == fd_tcache_oldest_laddr( block_tcache ), local join to oldest key in block tcache */
+  ulong * block_tcache_ring;
+  ulong * block_tcache_map;
+
   fd_wksp_t * out_mem;
   ulong       out_chunk0;
   ulong       out_wmark;
@@ -67,6 +80,7 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   ulong l = FD_LAYOUT_INIT;
   l = FD_LAYOUT_APPEND( l, alignof( fd_dedup_ctx_t ), sizeof( fd_dedup_ctx_t ) );
   l = FD_LAYOUT_APPEND( l, fd_tcache_align(), fd_tcache_footprint( tile->dedup.tcache_depth, 0UL ) );
+  l = FD_LAYOUT_APPEND( l, fd_tcache_align(), fd_tcache_footprint( tile->dedup.tcache_depth, 0UL ) ); /* harmonic dedicated block_tcache */
   return FD_LAYOUT_FINI( l, scratch_align() );
 }
 
@@ -158,13 +172,34 @@ after_frag( fd_dedup_ctx_t *    ctx,
   FD_TEST( txnm->payload_sz<=FD_TPU_MTU );
   fd_txn_t * txn = fd_txn_m_txn_t( txnm );
 
-  if( FD_UNLIKELY( txnm->block_engine.bundle_id && (txnm->block_engine.bundle_id!=ctx->bundle_id) ) ) {
+  /* Check transaction type using source_tpu:
+     - Bundles: FD_TXN_M_TPU_SOURCE_BUNDLE with bundle_id
+     - Blocks: FD_TXN_M_TPU_SOURCE_BLOCK with block_slot
+     - Others: Use normal tcache dedup */
+  int is_block  = (txnm->source_tpu == FD_TXN_M_TPU_SOURCE_BLOCK);
+  int is_bundle = (txnm->source_tpu == FD_TXN_M_TPU_SOURCE_BUNDLE) && txnm->block_engine.bundle_id;
+
+  /* Bundle tracking */
+  if( FD_UNLIKELY( is_bundle && (txnm->block_engine.bundle_id!=ctx->bundle_id) ) ) {
     ctx->bundle_failed = 0;
     ctx->bundle_id     = txnm->block_engine.bundle_id;
     ctx->bundle_idx    = 0UL;
   }
 
-  if( FD_UNLIKELY( txnm->block_engine.bundle_id && ctx->bundle_failed ) ) {
+  if( FD_UNLIKELY( is_bundle && ctx->bundle_failed ) ) {
+    ctx->metrics.bundle_peer_failure_cnt++;
+    return;
+  }
+
+  /* Block tracking (similar to bundles but no length restriction) */
+  if( FD_UNLIKELY( is_block && (txnm->block_engine.block_slot!=ctx->block_slot) ) ) {
+    ctx->block_failed = 0;
+    ctx->block_slot   = txnm->block_engine.block_slot;
+    /* Reset block tcache for new block */
+    *ctx->block_tcache_sync = fd_tcache_reset( ctx->block_tcache_ring, ctx->block_tcache_depth, ctx->block_tcache_map, ctx->block_tcache_map_cnt );
+  }
+
+  if( FD_UNLIKELY( is_block && ctx->block_failed ) ) {
     ctx->metrics.bundle_peer_failure_cnt++;
     return;
   }
@@ -182,12 +217,12 @@ after_frag( fd_dedup_ctx_t *    ctx,
   }
 
   int is_dup = 0;
-  if( FD_LIKELY( !txnm->block_engine.bundle_id ) ) {
-    /* Compute fd_hash(signature) for dedup. */
+  if( FD_LIKELY( !is_bundle && !is_block ) ) {
+    /* For regular transactions (quic, udp, etc.), use normal signature-based dedup via tcache. */
     ulong ha_dedup_tag = fd_hash( ctx->hashmap_seed, fd_txn_m_payload( txnm )+txn->signature_off, 64UL );
 
     FD_TCACHE_INSERT( is_dup, *ctx->tcache_sync, ctx->tcache_ring, ctx->tcache_depth, ctx->tcache_map, ctx->tcache_map_cnt, ha_dedup_tag );
-  } else {
+  } else if( FD_UNLIKELY( is_bundle ) ) {
     /* Make sure bundles don't contain a duplicate transaction inside
        the bundle, which would not be valid. */
 
@@ -202,10 +237,17 @@ after_frag( fd_dedup_ctx_t *    ctx,
 
     if( FD_UNLIKELY( ctx->bundle_idx==4UL ) ) ctx->bundle_idx++;
     else fd_memcpy( ctx->bundle_signatures[ ctx->bundle_idx++ ], fd_txn_m_payload( txnm )+txn->signature_off, 64UL );
+  } else /* block */ {
+    /* Blocks: treated like bundles but without length restriction.
+       Use dedicated block tcache for duplicate detection within the block. */
+    ulong ha_dedup_tag = fd_hash( ctx->hashmap_seed, fd_txn_m_payload( txnm )+txn->signature_off, 64UL );
+    FD_TCACHE_INSERT( is_dup, *ctx->block_tcache_sync, ctx->block_tcache_ring, ctx->block_tcache_depth, ctx->block_tcache_map, ctx->block_tcache_map_cnt, ha_dedup_tag );
   }
 
   if( FD_LIKELY( is_dup ) ) {
-    if( FD_UNLIKELY( txnm->block_engine.bundle_id ) ) ctx->bundle_failed = 1;
+    ctx->bundle_failed = is_bundle;
+    ctx->block_failed  = is_block;
+    if( is_block ) FD_LOG_NOTICE(( "CAVEY DEBUG: dedup failed for block in slot %lu", ctx->block_slot ));
 
     ctx->metrics.dedup_fail_cnt++;
   } else {
@@ -235,10 +277,15 @@ unprivileged_init( fd_topo_t *      topo,
   fd_dedup_ctx_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof( fd_dedup_ctx_t ), sizeof( fd_dedup_ctx_t ) );
   fd_tcache_t * tcache = fd_tcache_join( fd_tcache_new( FD_SCRATCH_ALLOC_APPEND( l, fd_tcache_align(), fd_tcache_footprint( tile->dedup.tcache_depth, 0) ), tile->dedup.tcache_depth, 0 ) );
   if( FD_UNLIKELY( !tcache ) ) FD_LOG_ERR(( "fd_tcache_new failed" ));
+  fd_tcache_t * block_tcache = fd_tcache_join( fd_tcache_new( FD_SCRATCH_ALLOC_APPEND( l, fd_tcache_align(), fd_tcache_footprint( tile->dedup.tcache_depth, 0) ), tile->dedup.tcache_depth, 0 ) );
+  if( FD_UNLIKELY( !block_tcache ) ) FD_LOG_ERR(( "fd_tcache_new failed for block_tcache" ));
 
   ctx->bundle_failed = 0;
   ctx->bundle_id     = 0UL;
   ctx->bundle_idx    = 0UL;
+
+  ctx->block_failed  = 0;
+  ctx->block_slot    = 0UL;
 
   memset( &ctx->metrics, 0, sizeof( ctx->metrics ) );
 
@@ -247,6 +294,12 @@ unprivileged_init( fd_topo_t *      topo,
   ctx->tcache_sync    = fd_tcache_oldest_laddr( tcache );
   ctx->tcache_ring    = fd_tcache_ring_laddr  ( tcache );
   ctx->tcache_map     = fd_tcache_map_laddr   ( tcache );
+
+  ctx->block_tcache_depth   = fd_tcache_depth       ( block_tcache );
+  ctx->block_tcache_map_cnt = fd_tcache_map_cnt     ( block_tcache );
+  ctx->block_tcache_sync    = fd_tcache_oldest_laddr( block_tcache );
+  ctx->block_tcache_ring    = fd_tcache_ring_laddr  ( block_tcache );
+  ctx->block_tcache_map     = fd_tcache_map_laddr   ( block_tcache );
 
   FD_TEST( tile->in_cnt<=sizeof( ctx->in )/sizeof( ctx->in[ 0 ] ) );
   for( ulong i=0UL; i<tile->in_cnt; i++ ) {
