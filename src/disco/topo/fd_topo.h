@@ -265,6 +265,11 @@ struct fd_topo_tile {
       ulong ssl_heap_sz;
       ulong keepalive_interval_nanos;
       uchar tls_cert_verify : 1;
+
+      /* Harmonic block mode config */
+      int   harmonic_block_mode; /* If set, enables a third stream (subscribeBundles) for 
+                                    harmonic block subscriptions. Normal bundle subscriptions
+                                    (len<=5) remain active. */
     } bundle;
 
     struct {
