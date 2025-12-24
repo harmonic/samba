@@ -1343,6 +1343,105 @@ test_bundle_client_subscribe_bundles( fd_wksp_t * wksp ) {
   test_bundle_env_destroy( env );
 }
 
+/* Verify that the client submits leader window info */
+
+static void
+test_bundle_client_submit_leader_window_info( fd_wksp_t * wksp ) {
+  test_bundle_env_t env[1];
+  test_bundle_env_create( env, wksp );
+  test_bundle_env_mock_conn( env );
+  fd_bundle_tile_t * const state       = env->state;
+  fd_grpc_client_t * const grpc_client = state->grpc_client;
+
+  FD_TEST( state->submit_leader_window_info_wait==0 );
+
+  /* But it's blocked on stream count ... */
+  FD_TEST( fd_grpc_client_request_is_blocked( state->grpc_client )==0 );
+  FD_TEST( state->grpc_client->stream_cnt==2 );
+  state->grpc_client->conn->peer_settings.max_concurrent_streams = 2;
+  FD_TEST( fd_grpc_client_request_is_blocked( state->grpc_client )==1 );
+  long const test_timestamp_ns = 1234567890123456789L;
+  ulong const test_slot = 999999UL;
+  fd_bundle_client_submit_leader_window_info( state, test_slot, test_timestamp_ns );
+  FD_TEST( state->submit_leader_window_info_wait==0 );
+
+  /* Unblock it ... */
+  state->grpc_client->conn->peer_settings.max_concurrent_streams = 3;
+  FD_TEST( fd_grpc_client_request_is_blocked( state->grpc_client )==0 );
+  fd_bundle_client_submit_leader_window_info( state, test_slot, test_timestamp_ns );
+  FD_TEST( state->submit_leader_window_info_wait==1 );
+
+  /* Get newly created stream */
+  FD_TEST( !grpc_client->request_stream ); /* request instantly flushed */
+  ulong const stream_id = state->grpc_client->stream_ids[ 2 ];
+  fd_grpc_h2_stream_t * stream = &state->grpc_client->stream_pool[ 2 ];
+  FD_TEST( stream->s.stream_id==stream_id );
+  FD_TEST( stream->request_ctx==FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo );
+
+  /* Request header */
+  char const * const hdrs[] = {
+    ":method",      "POST",
+    ":scheme",      "https",
+    ":path",        "/block_engine.BlockEngineValidator/SubmitLeaderWindowInfo",
+    "te",           "trailers",
+    "content-type", "application/grpc+proto",
+    "user-agent",   "grpc-firedancer/0.0.0",
+    NULL
+  };
+  expect_h2_hdr( grpc_client->frame_tx, stream_id, hdrs );
+
+  /* Request body */
+  fd_h2_frame_hdr_t frame_hdr;
+  FD_TEST( fd_h2_rbuf_used_sz( grpc_client->frame_tx )>=sizeof(fd_h2_frame_hdr_t) );
+  fd_h2_rbuf_pop_copy( grpc_client->frame_tx, &frame_hdr, sizeof(fd_h2_frame_hdr_t) );
+  FD_TEST( fd_h2_frame_type( frame_hdr.typlen )==FD_H2_FRAME_TYPE_DATA );
+  FD_TEST( fd_uint_bswap( frame_hdr.r_stream_id )==stream_id );
+  FD_TEST( frame_hdr.flags==FD_H2_FLAG_END_STREAM );
+  fd_grpc_hdr_t grpc_hdr;
+  FD_TEST( fd_h2_rbuf_used_sz( grpc_client->frame_tx )>=sizeof(fd_grpc_hdr_t) );
+  fd_h2_rbuf_pop_copy( grpc_client->frame_tx, &grpc_hdr, sizeof(fd_grpc_hdr_t) );
+  FD_TEST( grpc_hdr.compressed==0 );
+  FD_TEST( grpc_hdr.msg_sz>0 );
+
+  /* Skip the protobuf message data */
+  ulong frame_len = fd_h2_frame_length( frame_hdr.typlen );
+  ulong remaining = frame_len - sizeof(fd_grpc_hdr_t);
+  if( remaining > 0UL ) {
+    FD_TEST( fd_h2_rbuf_used_sz( grpc_client->frame_tx ) >= remaining );
+    fd_h2_rbuf_skip( grpc_client->frame_tx, remaining );
+  }
+
+  /* Inject a response */
+  fd_bundle_client_grpc_rx_start( state, FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo );
+
+  /* Protobuf encoder util */
+  uchar pb_buf[ 128 ];
+  ulong pb_sz = 0UL;
+  block_engine_SubmitLeaderWindowInfoResponse resp = block_engine_SubmitLeaderWindowInfoResponse_init_default;
+#define ENCODE_MSG() do { \
+    pb_ostream_t ostream = pb_ostream_from_buffer( pb_buf, sizeof(pb_buf) ); \
+    FD_TEST( pb_encode( &ostream, &block_engine_SubmitLeaderWindowInfoResponse_msg, &resp ) ); \
+    pb_sz = ostream.bytes_written; \
+  } while(0)
+
+  /* Valid response */
+  ENCODE_MSG();
+  fd_bundle_client_grpc_rx_msg( state, pb_buf, pb_sz, FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo );
+  FD_TEST( state->submit_leader_window_info_wait==1 );
+
+  /* End stream */
+  fd_grpc_resp_hdrs_t grpc_resp_hdrs = {
+    .h2_status   = 200,
+    .grpc_status = FD_GRPC_STATUS_OK
+  };
+  fd_bundle_client_grpc_rx_end( state, FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo, &grpc_resp_hdrs );
+  FD_TEST( state->submit_leader_window_info_wait==0 );
+
+#undef ENCODE_MSG
+
+  test_bundle_env_destroy( env );
+}
+
 int
 main( int     argc,
       char ** argv ) {
@@ -1374,6 +1473,7 @@ main( int     argc,
   test_bundle_client_reset( wksp );
   test_bundle_no_builder_fee_info( wksp );
   test_bundle_client_request_builder_fee_info( wksp );
+  test_bundle_client_submit_leader_window_info( wksp );
   test_bundle_client_subscribe_packets( wksp );
   test_bundle_client_subscribe_bundles( wksp );
 
