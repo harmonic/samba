@@ -11,6 +11,7 @@
 #define FD_TXN_M_TPU_SOURCE_GOSSIP (3UL)
 #define FD_TXN_M_TPU_SOURCE_BUNDLE (4UL)
 #define FD_TXN_M_TPU_SOURCE_SEND   (5UL)
+#define FD_TXN_M_TPU_SOURCE_BLOCK  (6UL)
 
 struct fd_txn_m {
   /* The computed slot that this transaction is referencing, aka. the
@@ -50,8 +51,15 @@ struct fd_txn_m {
        the block engine, and the validator will crank the tip payment
        program with these values, if it is not using them already.
        These fields are only provided on the first transaction in a
-       bundle. */
-    ulong bundle_id;
+       bundle.
+
+       For block transactions (source_tpu == FD_TXN_M_TPU_SOURCE_BLOCK),
+       block_slot contains the intended slot from the block server.
+       Use source_tpu to determine which union member applies. */
+    union {
+      ulong bundle_id;   /* For bundles: sequential bundle ID */
+      ulong block_slot;  /* For blocks: intended slot from server */
+    };
     ulong bundle_txn_cnt;
     uchar commission;
     uchar commission_pubkey[ 32 ];

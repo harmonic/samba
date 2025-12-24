@@ -1247,6 +1247,13 @@ dynamic_port_range = "8900-9000"
         # this option to 'false'.
         tls_cert_verify = true
 
+        # If set to true, enables a third stream (SubscribeBlocks) on the same
+        # bundle connection.  Block subscriptions are tagged with the intended
+        # slot rather than bundle_id:string, and have no len=5 transaction limit.
+        # Normal bundle subscriptions (len<=5) remain active when harmonic_block_mode
+        # is enabled.
+        harmonic_block_mode = true
+
     # The pack tile takes incoming transactions that have been verified
     # by the verify tile and then deduplicated, and attempts to order
     # them in an optimal way to generate the most fees per compute
