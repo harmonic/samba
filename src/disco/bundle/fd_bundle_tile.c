@@ -459,6 +459,9 @@ privileged_init( fd_topo_t *      topo,
 
   ctx->keylog_fd = -1;
 
+  /* Initialize harmonic block mode state */
+  ctx->harmonic_block_mode = tile->bundle.harmonic_block_mode;
+
 # if FD_HAS_OPENSSL
 
   if( FD_UNLIKELY( tile->bundle.key_log_path[0] ) ) {
@@ -570,6 +573,10 @@ unprivileged_init( fd_topo_t *      topo,
   }
   fd_grpc_client_set_version( ctx->grpc_client, fdctl_version_string, strlen( fdctl_version_string ) );
   fd_grpc_client_set_authority( ctx->grpc_client, ctx->server_sni, ctx->server_sni_len, ctx->server_tcp_port );
+
+  if( ctx->harmonic_block_mode ) {
+    FD_LOG_NOTICE(( "Harmonic block mode enabled" ));
+  }
 
   fd_histf_new( ctx->metrics.msg_rx_delay,
       FD_MHIST_MIN( BUNDLE, MESSAGE_RX_DELAY_NANOS ),
