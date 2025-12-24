@@ -305,6 +305,7 @@ typedef struct {
     fd_keyguard_client_t  keyguard_client[1];
 
     ulong                 metrics[4];
+    int                   harmonic_block_mode; /* If set, processes harmonic blocks */
   } crank[1];
 
 
@@ -1243,6 +1244,7 @@ unprivileged_init( fd_topo_t *      topo,
   FD_TEST( (tile->pack.schedule_strategy>=0) & (tile->pack.schedule_strategy<=FD_PACK_STRATEGY_BUNDLE) );
 
   ctx->crank->enabled = tile->pack.bundle.enabled;
+  ctx->crank->harmonic_block_mode = tile->pack.bundle.harmonic_block_mode;
   if( FD_UNLIKELY( tile->pack.bundle.enabled ) ) {
     if( FD_UNLIKELY( !fd_bundle_crank_gen_init( ctx->crank->gen, (fd_acct_addr_t const *)tile->pack.bundle.tip_distribution_program_addr,
             (fd_acct_addr_t const *)tile->pack.bundle.tip_payment_program_addr,
@@ -1315,6 +1317,7 @@ unprivileged_init( fd_topo_t *      topo,
 #endif
   ctx->use_consumed_cus              = tile->pack.use_consumed_cus;
   ctx->crank->enabled                = tile->pack.bundle.enabled;
+  ctx->crank->harmonic_block_mode    = tile->pack.bundle.harmonic_block_mode;
 
   ctx->wait_duration_ticks[ 0 ] = ULONG_MAX;
   for( ulong i=1UL; i<MAX_TXN_PER_MICROBLOCK+1UL; i++ ) {
