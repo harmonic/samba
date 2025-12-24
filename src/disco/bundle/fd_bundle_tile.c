@@ -5,6 +5,8 @@
 #include "../keyguard/fd_keyload.h"
 #include "../plugin/fd_plugin.h"
 #include "../../waltz/http/fd_url.h"
+#include "../fd_disco_base.h"
+#include "../tiles.h"
 
 #include <errno.h>
 #include <dirent.h> /* opendir */
@@ -581,6 +583,16 @@ unprivileged_init( fd_topo_t *      topo,
   fd_histf_new( ctx->metrics.msg_rx_delay,
       FD_MHIST_MIN( BUNDLE, MESSAGE_RX_DELAY_NANOS ),
       FD_MHIST_MAX( BUNDLE, MESSAGE_RX_DELAY_NANOS ) );
+
+  /* Get poh_pack link */
+  ulong poh_pack_in_idx = fd_topo_find_tile_in_link( topo, tile, "poh_pack", tile->kind_id );
+  FD_TEST( poh_pack_in_idx != ULONG_MAX );
+  fd_topo_link_t const * poh_pack_link = &topo->links[ tile->in_link_id[ poh_pack_in_idx ] ];
+  ctx->poh_pack_in.idx    = poh_pack_in_idx;
+  ctx->poh_pack_in.mem    = topo->workspaces[ topo->objs[ poh_pack_link->dcache_obj_id ].wksp_id ].wksp;
+  ctx->poh_pack_in.chunk0 = fd_dcache_compact_chunk0( ctx->poh_pack_in.mem, poh_pack_link->dcache );
+  ctx->poh_pack_in.wmark  = fd_dcache_compact_wmark( ctx->poh_pack_in.mem, poh_pack_link->dcache, poh_pack_link->mtu );
+  ctx->poh_pack_in.chunk  = ctx->poh_pack_in.chunk0;
 }
 
 static ulong
@@ -621,6 +633,79 @@ populate_allowed_fds( fd_topo_t const *      topo,
   return out_cnt;
 }
 
+static int
+before_frag( fd_bundle_tile_t * ctx,
+             ulong              in_idx,
+             ulong              seq FD_PARAM_UNUSED,
+             ulong              sig ) {
+  (void)seq;
+
+  /* Ignore messages from poh_pack link that are not became_leader */
+  if( FD_UNLIKELY( in_idx == ctx->poh_pack_in.idx && fd_disco_poh_sig_pkt_type( sig ) != POH_PKT_TYPE_BECAME_LEADER ) ) {
+    return 1; /* Discard */
+  }
+
+  return 0;
+}
+
+static void
+during_frag( fd_bundle_tile_t * ctx,
+             ulong              in_idx,
+             ulong              seq FD_PARAM_UNUSED,
+             ulong              sig FD_PARAM_UNUSED,
+             ulong              chunk,
+             ulong              sz,
+             ulong              ctl FD_PARAM_UNUSED ) {
+  (void)seq;
+  (void)sig;
+  (void)ctl;
+
+  /* Only process messages from poh_pack link */
+  if( FD_UNLIKELY( in_idx != ctx->poh_pack_in.idx ) ) return;
+
+  /* Verify this is a became_leader message with correct size */
+  if( FD_UNLIKELY( chunk < ctx->poh_pack_in.chunk0
+                || chunk > ctx->poh_pack_in.wmark
+                || sz != sizeof(fd_became_leader_t) ) ) 
+    FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu] or wrong size %lu (expected %lu)", 
+                 chunk, sz, ctx->poh_pack_in.chunk0, ctx->poh_pack_in.wmark, sz, sizeof(fd_became_leader_t) ));
+
+  /* Copy the became_leader message */
+  uchar const * dcache_entry = fd_chunk_to_laddr_const( ctx->poh_pack_in.mem, chunk );
+  fd_memcpy( ctx->_became_leader, dcache_entry, sizeof(fd_became_leader_t) );
+}
+
+static void
+after_frag( fd_bundle_tile_t * ctx,
+            ulong              in_idx,
+            ulong              seq FD_PARAM_UNUSED,
+            ulong              sig FD_PARAM_UNUSED,
+            ulong              sz FD_PARAM_UNUSED,
+            ulong              tsorig FD_PARAM_UNUSED,
+            ulong              tspub FD_PARAM_UNUSED,
+            fd_stem_context_t * stem FD_PARAM_UNUSED ) {
+  (void)seq;
+  (void)sig;
+  (void)sz;
+  (void)tsorig;
+  (void)tspub;
+  (void)stem;
+
+  /* Only process messages from poh_pack link */
+  if( FD_UNLIKELY( in_idx != ctx->poh_pack_in.idx ) ) return; 
+
+  if( FD_UNLIKELY( ctx->submit_leader_window_info_wait ) ) {
+    FD_LOG_WARNING(( "CAVEY DEBUG: Received became_leader message for slot=%lu, but SubmitLeaderWindowInfo request already in-flight",ctx->_became_leader->slot ));
+    return; /* Request already in-flight */
+  }
+  /* Notify auction house that we are leader */
+  fd_bundle_client_submit_leader_window_info(
+      ctx,
+      ctx->_became_leader->slot,
+      ctx->_became_leader->slot_start_ns
+  );
+}
+
 #define STEM_BURST (5UL)
 #define STEM_LAZY ((long)10e6)
 
@@ -630,6 +715,10 @@ populate_allowed_fds( fd_topo_t const *      topo,
 #define STEM_CALLBACK_DURING_HOUSEKEEPING fd_bundle_tile_housekeeping
 #define STEM_CALLBACK_METRICS_WRITE       metrics_write
 #define STEM_CALLBACK_AFTER_CREDIT        after_credit
+#define STEM_CALLBACK_BEFORE_FRAG         before_frag
+#define STEM_CALLBACK_DURING_FRAG         during_frag
+#define STEM_CALLBACK_AFTER_FRAG          after_frag
+
 
 #include "../stem/fd_stem.c"
 

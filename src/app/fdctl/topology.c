@@ -308,6 +308,9 @@ fd_topo_initialize( config_t * config ) {
     /**/                 fd_topob_tile_in(  topo, "pack",   0UL,           "metric_in", "sign_pack",      0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_UNPOLLED );
     /**/                 fd_topob_tile_out( topo, "sign",   0UL,                        "sign_pack",      0UL                                                );
 
+    /* harmonic: read became_leader messages from poh_pack link */
+    /**/                 fd_topob_tile_in(  topo, "bundle", 0UL,           "metric_in", " poh_pack",      0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
+
     if( plugins_enabled ) {
       fd_topob_wksp( topo, "bundle_plugi" );
       /* bundle_plugi must be kind of deep, to prevent exhausting shared
