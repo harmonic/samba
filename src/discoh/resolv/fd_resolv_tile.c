@@ -120,6 +120,9 @@ typedef struct {
   int   bundle_failed;
   ulong bundle_id;
 
+  int   block_failed;
+  ulong block_slot;
+
   void * root_bank;
   ulong  root_slot;
 
@@ -370,7 +373,7 @@ after_frag( fd_resolv_ctx_t *   ctx,
      (2) The blockhash is not that old, but was created before this
          validator was started.
      (3) It's really new (we haven't seen the bank yet).
-     (4) It's a durable nonce transaction, or part of a bundle (just let
+     (4) It's a durable nonce transaction, or part of a bundle or block (just let
          it pass).
 
     For durable nonce transactions, there isn't much we can do except
@@ -381,13 +384,31 @@ after_frag( fd_resolv_ctx_t *   ctx,
     buffer.  If we later see the blockhash come to exist, we forward any
     buffered transactions to back. */
 
-  if( FD_UNLIKELY( txnm->block_engine.bundle_id && (txnm->block_engine.bundle_id!=ctx->bundle_id) ) ) {
+  /* Check transaction type using source_tpu:
+     - Bundles: FD_TXN_M_TPU_SOURCE_BUNDLE with bundle_id
+     - Blocks: FD_TXN_M_TPU_SOURCE_BLOCK with block_slot */
+  int is_bundle = (txnm->source_tpu == FD_TXN_M_TPU_SOURCE_BUNDLE) && txnm->block_engine.bundle_id;
+  int is_block  = (txnm->source_tpu == FD_TXN_M_TPU_SOURCE_BLOCK) && txnm->block_engine.block_slot;
+
+  /* Bundle tracking */
+  if( FD_UNLIKELY( is_bundle && (txnm->block_engine.bundle_id!=ctx->bundle_id) ) ) {
     ctx->bundle_failed = 0;
     ctx->bundle_id     = txnm->block_engine.bundle_id;
   }
 
-  if( FD_UNLIKELY( txnm->block_engine.bundle_id && ctx->bundle_failed ) ) {
+  if( FD_UNLIKELY( is_bundle && ctx->bundle_failed ) ) {
     ctx->metrics.bundle_peer_failure_cnt++;
+    return;
+  }
+
+  /* Block tracking (similar to bundles) */
+  if( FD_UNLIKELY( is_block && (txnm->block_engine.block_slot!=ctx->block_slot) ) ) {
+    ctx->block_failed = 0;
+    ctx->block_slot   = txnm->block_engine.block_slot;
+  }
+
+  if( FD_UNLIKELY( is_block && ctx->block_failed ) ) {
+    FD_LOG_NOTICE(( "CAVEY DEBUG: block failed in slot=%lu, dropping", txnm->block_engine.block_slot ));
     return;
   }
 
@@ -396,16 +417,18 @@ after_frag( fd_resolv_ctx_t *   ctx,
   if( FD_LIKELY( blockhash ) ) {
     txnm->reference_slot = blockhash->slot;
     if( FD_UNLIKELY( txnm->reference_slot+151UL<ctx->completed_slot ) ) {
-      if( FD_UNLIKELY( txnm->block_engine.bundle_id ) ) ctx->bundle_failed = 1;
+      ctx->bundle_failed = is_bundle;
+      ctx->block_failed  = is_block;
       ctx->metrics.blockhash_expired++;
       return;
     }
   }
 
-  int is_bundle_member = !!txnm->block_engine.bundle_id;
+  /* Bundles and blocks skip blockhash stashing (they're pre-validated) */
+  int is_bundle_or_block = is_bundle || is_block;
   int is_durable_nonce = fd_resolv_is_durable_nonce( txnt, fd_txn_m_payload( txnm ) );
 
-  if( FD_UNLIKELY( !is_bundle_member && !is_durable_nonce && !blockhash ) ) {
+  if( FD_UNLIKELY( !is_bundle_or_block && !is_durable_nonce && !blockhash ) ) {
     ulong pool_idx;
     if( FD_UNLIKELY( !pool_free( ctx->pool ) ) ) {
       pool_idx = lru_list_idx_pop_tail( ctx->lru_list, ctx->pool );
@@ -438,7 +461,8 @@ after_frag( fd_resolv_ctx_t *   ctx,
   if( FD_UNLIKELY( txnt->addr_table_adtl_cnt ) ) {
     if( FD_UNLIKELY( !ctx->root_bank ) ) {
       FD_MCNT_INC( RESOLV, NO_BANK_DROP, 1 );
-      if( FD_UNLIKELY( txnm->block_engine.bundle_id ) ) ctx->bundle_failed = 1;
+      ctx->bundle_failed = is_bundle;
+      ctx->block_failed  = is_block;
       return;
     }
 
@@ -447,7 +471,8 @@ after_frag( fd_resolv_ctx_t *   ctx,
     ctx->metrics.lut[ (ulong)((long)FD_METRICS_COUNTER_RESOLV_LUT_RESOLVED_CNT+result-1L) ]++;
 
     if( FD_UNLIKELY( result!=FD_BANK_ABI_TXN_INIT_SUCCESS ) ) {
-      if( FD_UNLIKELY( txnm->block_engine.bundle_id ) ) ctx->bundle_failed = 1;
+      ctx->bundle_failed = is_bundle;
+      ctx->block_failed  = is_block;
       return;
     }
   }
@@ -471,6 +496,9 @@ unprivileged_init( fd_topo_t *      topo,
 
   ctx->bundle_failed = 0;
   ctx->bundle_id     = 0UL;
+
+  ctx->block_failed = 0;
+  ctx->block_slot   = 0UL;
 
   ctx->completed_slot = 0UL;
   ctx->blockhash_ring_idx = 0UL;
