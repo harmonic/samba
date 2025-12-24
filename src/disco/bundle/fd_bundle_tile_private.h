@@ -129,8 +129,14 @@ struct fd_bundle_tile {
   fd_bundle_out_ctx_t verify_out;
   fd_bundle_out_ctx_t plugin_out;
 
-  /* PoH pack link input */
-  fd_bundle_out_ctx_t poh_pack_in;
+  /* 
+     need to read became_leader msgs for leader window notifications
+
+     frankendancer: poh_pack
+     firedancer:    replay_out
+   */
+  fd_bundle_out_ctx_t leader_in;
+  int leader_in_is_replay; /* 1 if using replay_out, 0 if using poh_pack */
 
   /* App metrics */
   fd_bundle_metrics_t metrics;
