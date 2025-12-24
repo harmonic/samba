@@ -482,6 +482,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
       PARSE_PUBKEY( pack, tip_payment_program_addr      );
       PARSE_PUBKEY( pack, tip_distribution_authority    );
       tile->pack.bundle.commission_bps = config->tiles.bundle.commission_bps;
+      tile->pack.bundle.harmonic_block_mode = config->tiles.bundle.harmonic_block_mode;
       strncpy( tile->pack.bundle.identity_key_path, config->paths.identity_key, sizeof(tile->pack.bundle.identity_key_path) );
       strncpy( tile->pack.bundle.vote_account_path, config->paths.vote_account, sizeof(tile->pack.bundle.vote_account_path) );
     } else {
