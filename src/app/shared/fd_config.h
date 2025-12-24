@@ -396,6 +396,8 @@ struct fd_config {
       uint commission_bps;
       ulong keepalive_interval_millis;
       int   tls_cert_verify;
+      /* Harmonic config */
+      int  harmonic_block_mode;
     } bundle;
 
     struct {

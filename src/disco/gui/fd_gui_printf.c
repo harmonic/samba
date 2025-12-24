@@ -1678,6 +1678,11 @@ fd_gui_printf_slot_transactions_request( fd_gui_t * gui,
                   jsonp_string( gui->http, NULL, "bundle");
                   break;
                 }
+                /* cavey: harmonic */
+                case FD_TXN_M_TPU_SOURCE_BLOCK: {
+                  jsonp_string( gui->http, NULL, "harmonic");
+                  break;
+                }
                 case FD_TXN_M_TPU_SOURCE_SEND  : {
                   jsonp_string( gui->http, NULL, "send");
                   break;
