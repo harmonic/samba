@@ -7,6 +7,7 @@
 #include "../../waltz/http/fd_url.h"
 #include "../fd_disco_base.h"
 #include "../tiles.h"
+#include "../../discof/replay/fd_replay_tile.h" /* REPLAY_SIG_BECAME_LEADER */
 
 #include <errno.h>
 #include <dirent.h> /* opendir */
@@ -584,15 +585,21 @@ unprivileged_init( fd_topo_t *      topo,
       FD_MHIST_MIN( BUNDLE, MESSAGE_RX_DELAY_NANOS ),
       FD_MHIST_MAX( BUNDLE, MESSAGE_RX_DELAY_NANOS ) );
 
-  /* Get poh_pack link */
-  ulong poh_pack_in_idx = fd_topo_find_tile_in_link( topo, tile, "poh_pack", tile->kind_id );
-  FD_TEST( poh_pack_in_idx != ULONG_MAX );
-  fd_topo_link_t const * poh_pack_link = &topo->links[ tile->in_link_id[ poh_pack_in_idx ] ];
-  ctx->poh_pack_in.idx    = poh_pack_in_idx;
-  ctx->poh_pack_in.mem    = topo->workspaces[ topo->objs[ poh_pack_link->dcache_obj_id ].wksp_id ].wksp;
-  ctx->poh_pack_in.chunk0 = fd_dcache_compact_chunk0( ctx->poh_pack_in.mem, poh_pack_link->dcache );
-  ctx->poh_pack_in.wmark  = fd_dcache_compact_wmark( ctx->poh_pack_in.mem, poh_pack_link->dcache, poh_pack_link->mtu );
-  ctx->poh_pack_in.chunk  = ctx->poh_pack_in.chunk0;
+  /* Get poh_pack or replay_out link (franken: poh_pack, firedancer: replay_out) */
+  ulong leader_in_idx;
+  if( ULONG_MAX!=(leader_in_idx=fd_topo_find_tile_in_link( topo, tile, "poh_pack", tile->kind_id )) ) {
+    ctx->leader_in_is_replay = 0;
+  } else if( ULONG_MAX!=(leader_in_idx=fd_topo_find_tile_in_link( topo, tile, "replay_out", tile->kind_id )) ) {
+    ctx->leader_in_is_replay = 1;
+  } else {
+    FD_LOG_ERR(( "bundle tile requires either poh_pack or replay_out link" ));
+  }
+  fd_topo_link_t const * leader_link = &topo->links[ tile->in_link_id[ leader_in_idx ] ];
+  ctx->leader_in.idx    = leader_in_idx;
+  ctx->leader_in.mem    = topo->workspaces[ topo->objs[ leader_link->dcache_obj_id ].wksp_id ].wksp;
+  ctx->leader_in.chunk0 = fd_dcache_compact_chunk0( ctx->leader_in.mem, leader_link->dcache );
+  ctx->leader_in.wmark  = fd_dcache_compact_wmark( ctx->leader_in.mem, leader_link->dcache, leader_link->mtu );
+  ctx->leader_in.chunk  = ctx->leader_in.chunk0;
 }
 
 static ulong
@@ -640,9 +647,15 @@ before_frag( fd_bundle_tile_t * ctx,
              ulong              sig ) {
   (void)seq;
 
-  /* Ignore messages from poh_pack link that are not became_leader */
-  if( FD_UNLIKELY( in_idx == ctx->poh_pack_in.idx && fd_disco_poh_sig_pkt_type( sig ) != POH_PKT_TYPE_BECAME_LEADER ) ) {
-    return 1; /* Discard */
+  /* Ignore messages from leader link that are not became_leader */
+  if( FD_UNLIKELY( in_idx == ctx->leader_in.idx ) ) {
+    if( FD_LIKELY( ctx->leader_in_is_replay ) ) {
+      /* replay_out uses REPLAY_SIG_BECAME_LEADER */
+      if( FD_UNLIKELY( sig != REPLAY_SIG_BECAME_LEADER ) ) return 1; /* Discard */
+    } else {
+      /* poh_pack uses POH_PKT_TYPE_BECAME_LEADER */
+      if( FD_UNLIKELY( fd_disco_poh_sig_pkt_type( sig ) != POH_PKT_TYPE_BECAME_LEADER ) ) return 1; /* Discard */
+    }
   }
 
   return 0;
@@ -660,18 +673,18 @@ during_frag( fd_bundle_tile_t * ctx,
   (void)sig;
   (void)ctl;
 
-  /* Only process messages from poh_pack link */
-  if( FD_UNLIKELY( in_idx != ctx->poh_pack_in.idx ) ) return;
+  /* Only process messages from leader link */
+  if( FD_UNLIKELY( in_idx != ctx->leader_in.idx ) ) return;
 
   /* Verify this is a became_leader message with correct size */
-  if( FD_UNLIKELY( chunk < ctx->poh_pack_in.chunk0
-                || chunk > ctx->poh_pack_in.wmark
+  if( FD_UNLIKELY( chunk < ctx->leader_in.chunk0
+                || chunk > ctx->leader_in.wmark
                 || sz != sizeof(fd_became_leader_t) ) ) 
     FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu] or wrong size %lu (expected %lu)", 
-                 chunk, sz, ctx->poh_pack_in.chunk0, ctx->poh_pack_in.wmark, sz, sizeof(fd_became_leader_t) ));
+                 chunk, sz, ctx->leader_in.chunk0, ctx->leader_in.wmark, sz, sizeof(fd_became_leader_t) ));
 
   /* Copy the became_leader message */
-  uchar const * dcache_entry = fd_chunk_to_laddr_const( ctx->poh_pack_in.mem, chunk );
+  uchar const * dcache_entry = fd_chunk_to_laddr_const( ctx->leader_in.mem, chunk );
   fd_memcpy( ctx->_became_leader, dcache_entry, sizeof(fd_became_leader_t) );
 }
 
@@ -691,8 +704,8 @@ after_frag( fd_bundle_tile_t * ctx,
   (void)tspub;
   (void)stem;
 
-  /* Only process messages from poh_pack link */
-  if( FD_UNLIKELY( in_idx != ctx->poh_pack_in.idx ) ) return; 
+  /* Only process messages from leader link */
+  if( FD_UNLIKELY( in_idx != ctx->leader_in.idx ) ) return; 
 
   if( FD_UNLIKELY( ctx->submit_leader_window_info_wait ) ) {
     FD_LOG_WARNING(( "CAVEY DEBUG: Received became_leader message for slot=%lu, but SubmitLeaderWindowInfo request already in-flight",ctx->_became_leader->slot ));
