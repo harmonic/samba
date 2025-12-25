@@ -2941,8 +2941,9 @@ ulong fd_pack_current_block_cost( fd_pack_t const * pack ) { return pack->cumula
 
 void
 fd_pack_set_block_limits( fd_pack_t * pack, fd_pack_limits_t const * limits ) {
+#define FD_PACK_HARMONIC_VOTE_COST_PER_BLOCK (4UL*1000UL*1000UL)
   FD_TEST( limits->max_cost_per_block      >= FD_PACK_MAX_COST_PER_BLOCK_LOWER_BOUND      );
-  FD_TEST( limits->max_vote_cost_per_block >= 4UL*1000UL*1000UL                           );
+  FD_TEST( limits->max_vote_cost_per_block >= FD_PACK_HARMONIC_VOTE_COST_PER_BLOCK        );
   FD_TEST( limits->max_write_cost_per_acct >= FD_PACK_MAX_WRITE_COST_PER_ACCT_LOWER_BOUND );
 
   pack->lim->max_microblocks_per_block = limits->max_microblocks_per_block;
