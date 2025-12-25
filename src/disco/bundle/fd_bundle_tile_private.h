@@ -114,6 +114,52 @@ struct fd_bundle_tile {
   uchar bundle_subscription_live : 1;
   uchar bundle_subscription_wait : 1;
 
+  /* ========== TPU endpoint  ========== */
+
+  uint tpu_conn_enabled : 1;  /* Is the TPU connection configured? */
+  uint tpu_is_ssl : 1;
+
+# if FD_HAS_OPENSSL
+  SSL * tpu_ssl;
+# endif /* FD_HAS_OPENSSL */
+
+  /* Config for TPU endpoint */
+  char   tpu_server_fqdn[ 256 ]; /* cstr */
+  ulong  tpu_server_fqdn_len;
+  char   tpu_server_sni[ 256 ]; /* cstr */
+  ulong  tpu_server_sni_len;
+  ushort tpu_server_tcp_port;
+
+  /* Resolver for TPU endpoint */
+  uint tpu_server_ip4_addr; /* last DNS lookup result */
+
+  /* TCP socket for TPU endpoint */
+  int  tpu_tcp_sock;
+  uint tpu_tcp_sock_connected : 1;
+  uint tpu_defer_reset : 1;
+  long tpu_cached_ts;
+
+  /* Keepalive for TPU endpoint */
+  fd_keepalive_t    tpu_keepalive[1];
+  fd_rtt_estimate_t tpu_rtt[1];
+
+  /* gRPC client for TPU endpoint */
+  void *                   grpc_client_tpu_mem;
+  fd_grpc_client_t *       tpu_grpc_client;
+  fd_grpc_client_metrics_t tpu_grpc_metrics[1];
+
+  /* Bundle authenticator for TPU endpoint */
+  fd_bundle_auther_t tpu_auther;
+
+  /* Bundle subscriptions for TPU endpoint */
+  uchar tpu_packet_subscription_live : 1;  /* Want to subscribe to a stream? */
+  uchar tpu_packet_subscription_wait : 1;  /* Request already in-flight? */
+
+  /* Error backoff for TPU endpoint */
+  uint  tpu_backoff_iter;
+  long  tpu_backoff_until;
+  long  tpu_backoff_reset;
+
   /* Bundle state */
   ulong bundle_seq;
   ulong bundle_txn_cnt;
@@ -180,6 +226,9 @@ typedef struct fd_bundle_tile fd_bundle_tile_t;
 #define FD_BUNDLE_CLIENT_REQ_SubscribeBlocks                    7
 /* Leader window info submission */
 #define FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo             8
+
+/* TPU endpoint subscribePackets request context ID */
+#define FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU                9
 
 FD_PROTOTYPES_BEGIN
 
@@ -317,6 +366,29 @@ void
 fd_bundle_client_submit_leader_window_info( fd_bundle_tile_t * ctx,
                                             ulong              slot,
                                             long               start_timestamp_ns );
+
+/* ========== TPU endpoint functions ========== */
+
+/* fd_bundle_tpu_client_grpc_callbacks provides callbacks for TPU grpc_client. */
+
+extern fd_grpc_client_callbacks_t fd_bundle_tpu_client_grpc_callbacks;
+
+/* fd_bundle_tpu_client_step drives the TPU endpoint client logic.
+   Similar to fd_bundle_client_step but for the TPU connection. */
+
+void
+fd_bundle_tpu_client_step( fd_bundle_tile_t * bundle,
+                           int *              charge_busy );
+
+/* fd_bundle_tpu_client_reset frees TPU connection resources. */
+
+void
+fd_bundle_tpu_client_reset( fd_bundle_tile_t * ctx );
+
+/* fd_bundle_tpu_client_send_ping enqueues a PING frame for the TPU connection. */
+
+void
+fd_bundle_tpu_client_send_ping( fd_bundle_tile_t * ctx );
 
 FD_PROTOTYPES_END
 
