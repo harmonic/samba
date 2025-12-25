@@ -259,6 +259,11 @@ struct fd_topo_tile {
       ulong url_len;
       char  sni[ 256 ];
       ulong sni_len;
+      /* Second endpoint for a second subscribePackets connection */
+      char  tpu_url[ 256 ];
+      ulong tpu_url_len;
+      char  tpu_sni[ 256 ];
+      ulong tpu_sni_len;
       char  identity_key_path[ PATH_MAX ];
       char  key_log_path[ PATH_MAX ];
       ulong buf_sz;

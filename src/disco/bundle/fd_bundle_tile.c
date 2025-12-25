@@ -36,6 +36,8 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   ulong l = FD_LAYOUT_INIT;
   l = FD_LAYOUT_APPEND( l, alignof(fd_bundle_tile_t), sizeof(fd_bundle_tile_t)                        );
   l = FD_LAYOUT_APPEND( l, fd_grpc_client_align(),    fd_grpc_client_footprint( tile->bundle.buf_sz ) );
+  /* harmonic: second gRPC client for TPU endpoint */
+  l = FD_LAYOUT_APPEND( l, fd_grpc_client_align(),    fd_grpc_client_footprint( tile->bundle.buf_sz ) );
   l = FD_LAYOUT_APPEND( l, fd_alloc_align(),          fd_alloc_footprint()                            );
   return FD_LAYOUT_FINI( l, 32 );
 }
@@ -144,6 +146,11 @@ after_credit( fd_bundle_tile_t *  ctx,
   if( FD_UNLIKELY( !ctx->stem ) ) ctx->stem = stem;
   fd_bundle_client_step( ctx, charge_busy );
 
+  /* Drive the TPU endpoint if enabled */
+  if( FD_UNLIKELY( ctx->tpu_conn_enabled ) ) {
+    fd_bundle_tpu_client_step( ctx, charge_busy );
+  }
+
   if( ctx->plugin_out.mem ) {
     if( FD_UNLIKELY( ctx->bundle_status_recent != ctx->bundle_status_plugin ) ) {
       fd_bundle_tile_publish_block_engine_update( ctx, stem );
@@ -240,6 +247,47 @@ fd_bundle_tile_parse_endpoint( fd_bundle_tile_t *     ctx,
   }
 
   ctx->is_ssl = !!is_ssl;
+#if !FD_HAS_OPENSSL
+  if( FD_UNLIKELY( is_ssl ) ) {
+    FD_LOG_ERR(( "This build does not include OpenSSL. To install OpenSSL, re-run ./deps.sh and do a clean re build." ));
+  }
+#endif
+}
+
+/* Parse the TPU endpoint URL if configured */
+static void
+fd_bundle_tile_parse_tpu_endpoint( fd_bundle_tile_t *     ctx,
+                                   fd_topo_tile_t const * tile ) {
+  /* Check if TPU endpoint is configured */
+  if( FD_UNLIKELY( !tile->bundle.tpu_url_len ) ) {
+    ctx->tpu_conn_enabled = 0;
+    return;
+  }
+
+  fd_url_t url[1];
+  _Bool is_ssl = 0;
+  parse_url(
+      url,
+      tile->bundle.tpu_url, tile->bundle.tpu_url_len,
+      &ctx->tpu_server_tcp_port,
+      &is_ssl
+  );
+  if( FD_UNLIKELY( url->host_len > 255 ) ) {
+    FD_LOG_CRIT(( "Invalid tpu_url->host_len" )); /* unreachable */
+  }
+  fd_cstr_fini( fd_cstr_append_text( fd_cstr_init( ctx->tpu_server_fqdn ), url->host, url->host_len ) );
+  ctx->tpu_server_fqdn_len = url->host_len;
+
+  if( FD_UNLIKELY( tile->bundle.tpu_sni_len ) ) {
+    fd_cstr_fini( fd_cstr_append_text( fd_cstr_init( ctx->tpu_server_sni ), tile->bundle.tpu_sni, tile->bundle.tpu_sni_len ) );
+    ctx->tpu_server_sni_len = tile->bundle.tpu_sni_len;
+  } else {
+    fd_cstr_fini( fd_cstr_append_text( fd_cstr_init( ctx->tpu_server_sni ), url->host, url->host_len ) );
+    ctx->tpu_server_sni_len = url->host_len;
+  }
+
+  ctx->tpu_is_ssl = !!is_ssl;
+  ctx->tpu_conn_enabled = 1;
 #if !FD_HAS_OPENSSL
   if( FD_UNLIKELY( is_ssl ) ) {
     FD_LOG_ERR(( "This build does not include OpenSSL. To install OpenSSL, re-run ./deps.sh and do a clean re build." ));
@@ -438,10 +486,11 @@ privileged_init( fd_topo_t *      topo,
   void * scratch = fd_topo_obj_laddr( topo, tile->tile_obj_id );
 
   FD_SCRATCH_ALLOC_INIT( l, scratch );
-  fd_bundle_tile_t * ctx         = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_bundle_tile_t), sizeof(fd_bundle_tile_t)                        );
-  void *             grpc_mem    = FD_SCRATCH_ALLOC_APPEND( l, fd_grpc_client_align(),    fd_grpc_client_footprint( tile->bundle.buf_sz ) );
-  void *             alloc_mem   = FD_SCRATCH_ALLOC_APPEND( l, fd_alloc_align(),          fd_alloc_footprint()                            );
-  ulong              scratch_end = FD_SCRATCH_ALLOC_FINI( l, scratch_align() );
+  fd_bundle_tile_t * ctx             = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_bundle_tile_t), sizeof(fd_bundle_tile_t)                        );
+  void *             grpc_mem        = FD_SCRATCH_ALLOC_APPEND( l, fd_grpc_client_align(),    fd_grpc_client_footprint( tile->bundle.buf_sz ) );
+  void *             grpc_tpu_mem    = FD_SCRATCH_ALLOC_APPEND( l, fd_grpc_client_align(),    fd_grpc_client_footprint( tile->bundle.buf_sz ) );
+  void *             alloc_mem       = FD_SCRATCH_ALLOC_APPEND( l, fd_alloc_align(),          fd_alloc_footprint()                            );
+  ulong              scratch_end     = FD_SCRATCH_ALLOC_FINI( l, scratch_align() );
   (void)alloc_mem; /* potentially unused */
 
   if( FD_UNLIKELY( (ulong)ctx != (ulong)scratch ) ) {
@@ -452,9 +501,11 @@ privileged_init( fd_topo_t *      topo,
   }
 
   memset( ctx, 0, sizeof(fd_bundle_tile_t) );
-  ctx->grpc_client_mem = grpc_mem;
-  ctx->grpc_buf_max    = tile->bundle.buf_sz;
-  ctx->tcp_sock        = -1;
+  ctx->grpc_client_mem     = grpc_mem;
+  ctx->grpc_client_tpu_mem = grpc_tpu_mem;
+  ctx->grpc_buf_max        = tile->bundle.buf_sz;
+  ctx->tcp_sock            = -1;
+  ctx->tpu_tcp_sock        = -1;
 
   fd_bundle_auther_init( &ctx->auther );
   uchar const * public_key = fd_keyload_load( tile->bundle.identity_key_path, 1 /* public key only */ );
@@ -576,6 +627,22 @@ unprivileged_init( fd_topo_t *      topo,
   }
   fd_grpc_client_set_version( ctx->grpc_client, fdctl_version_string, strlen( fdctl_version_string ) );
   fd_grpc_client_set_authority( ctx->grpc_client, ctx->server_sni, ctx->server_sni_len, ctx->server_tcp_port );
+
+  /* Initialize TPU endpoint if configured */
+  fd_bundle_tile_parse_tpu_endpoint( ctx, tile );
+  if( ctx->tpu_conn_enabled ) {
+    fd_bundle_auther_init( &ctx->tpu_auther );
+    fd_memcpy( ctx->tpu_auther.pubkey, ctx->auther.pubkey, 32UL );
+
+    ctx->tpu_grpc_client = fd_grpc_client_new( ctx->grpc_client_tpu_mem, &fd_bundle_tpu_client_grpc_callbacks, ctx->tpu_grpc_metrics, ctx, ctx->grpc_buf_max, ctx->map_seed );
+    if( FD_UNLIKELY( !ctx->tpu_grpc_client ) ) {
+      FD_LOG_CRIT(( "fd_grpc_client_new for TPU endpoint failed" )); /* unreachable */
+    }
+    fd_grpc_client_set_version( ctx->tpu_grpc_client, fdctl_version_string, strlen( fdctl_version_string ) );
+    fd_grpc_client_set_authority( ctx->tpu_grpc_client, ctx->tpu_server_sni, ctx->tpu_server_sni_len, ctx->tpu_server_tcp_port );
+
+    FD_LOG_NOTICE(( "TPU bundle endpoint configured: %.*s", (int)ctx->tpu_server_fqdn_len, ctx->tpu_server_fqdn ));
+  }
 
   if( ctx->harmonic_block_mode ) {
     FD_LOG_NOTICE(( "Harmonic block mode enabled" ));
