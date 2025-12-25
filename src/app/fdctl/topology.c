@@ -430,6 +430,11 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->bundle.url_len = strnlen( tile->bundle.url, 255 );
     strncpy( tile->bundle.sni, config->tiles.bundle.tls_domain_name, 256 );
     tile->bundle.sni_len = strnlen( tile->bundle.sni, 255 );
+    /* Second endpoint for a second subscribePackets connection */
+    strncpy( tile->bundle.tpu_url, config->tiles.bundle.tpu_url, sizeof(tile->bundle.tpu_url) );
+    tile->bundle.tpu_url_len = strnlen( tile->bundle.tpu_url, 255 );
+    strncpy( tile->bundle.tpu_sni, config->tiles.bundle.tpu_tls_domain_name, 256 );
+    tile->bundle.tpu_sni_len = strnlen( tile->bundle.tpu_sni, 255 );
     strncpy( tile->bundle.identity_key_path, config->paths.identity_key, sizeof(tile->bundle.identity_key_path) );
     strncpy( tile->bundle.key_log_path, config->development.bundle.ssl_key_log_file, sizeof(tile->bundle.key_log_path) );
     tile->bundle.buf_sz = config->development.bundle.buffer_size_kib<<10;

@@ -388,6 +388,8 @@ struct fd_config {
       int  enabled;
       char url[ 256 ];
       char tls_domain_name[ 256 ];
+      char tpu_url[ 256 ];
+      char tpu_tls_domain_name[ 256 ];
       char tip_distribution_program_addr[ FD_BASE58_ENCODED_32_SZ ];
       char tip_payment_program_addr[ FD_BASE58_ENCODED_32_SZ ];
       char tip_distribution_authority[ FD_BASE58_ENCODED_32_SZ ];

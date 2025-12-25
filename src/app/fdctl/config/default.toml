@@ -1176,6 +1176,15 @@ dynamic_port_range = "8900-9000"
         # it is being accessed.
         tls_domain_name = ""
 
+        # The URL for a second subscribePackets stream from the remote
+        # TPU.  If empty, no second connection is established.
+        tpu_url = ""
+
+        # The domain name of the TLS certificate to use when verifying
+        # the remote tpu.  If none is provided, the domain from tpu_url above
+        # will be used by default.
+        tpu_tls_domain_name = ""
+
         # The tip distribution program is used to control the
         # distribution of tips that transactions from bundles may pay.
         # This should be set to the public key of the tip distribution
