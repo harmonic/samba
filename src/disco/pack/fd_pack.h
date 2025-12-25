@@ -677,7 +677,89 @@ fd_pack_schedule_next_microblock( fd_pack_t  * pack,
                                   float        vote_fraction,
                                   ulong        bank_tile,
                                   int          schedule_flags,
+                                  int          harmonic,
                                   fd_txn_p_t * out );
+
+
+/* Harmonic block scheduling functions.
+
+   fd_pack_try_schedule_block_txn: Attempts to schedule a single block
+   transaction from the pending_blocks treap to the specified bank_tile.
+   Walks the treap in FIFO order (by block_txn_idx), checking for
+   account conflicts.  Returns >0 if scheduled, <0 otherwise:
+     TRY_SCHEDULE_BLOCK_NO_PENDING (-1): no pending block transactions
+     TRY_SCHEDULE_BLOCK_ALL_CONFLICT (-2): all pending txns have conflicts
+
+   fd_pack_complete_harmonic_txn: Releases the account locks for a
+   harmonic transaction that was previously scheduled to bank_tile.
+   This should be called when the bank tile completes execution. */
+
+void
+fd_pack_complete_harmonic_txn( fd_pack_t * pack,
+                               ulong       bank_tile );
+
+/* fd_pack_harmonic_reset: Resets harmonic state for a new slot.
+   Clears pending transactions and resets decision state. */
+void fd_pack_harmonic_reset( fd_pack_t * pack );
+
+/* fd_pack_harmonic_insert: Attempts to insert a block transaction into
+   the pending_blocks treap.  Returns 1 on success, 0 if pool is full.
+   Transaction data is copied directly into the treap pool (single copy).
+   Uses FIFO ordering via block_txn_idx encoding.
+   
+   block_txn_expected is the total number of transactions expected in this
+   block (used to determine when the block is complete).
+   
+   If block_slot changes, resets harmonic state for the new block. */
+int fd_pack_harmonic_insert( fd_pack_t      * pack,
+                             fd_txn_t const * txn,
+                             uchar const    * payload,
+                             ulong            payload_sz,
+                             uchar const    * alt_accts,
+                             uint             source_ipv4,
+                             uchar            source_tpu,
+                             long             arrival_time_nanos,
+                             ulong            block_slot,
+                             ulong            block_txn_expected );
+
+/* Harmonic decision state values */
+#define HARMONIC_MODE_UNDECIDED  0
+#define HARMONIC_MODE_HARMONIC   1
+#define HARMONIC_MODE_SPRINT    -1
+
+/* fd_pack_harmonic_state_update: Updates harmonic state machine.
+   Called each scheduling iteration to transition between states:
+   - UNDECIDED -> HARMONIC: when block transactions arrive
+   - UNDECIDED -> SPRINT: when threshold time reached without block txns
+   - HARMONIC -> SPRINT: when all expected block txns have completed */
+void fd_pack_harmonic_state_update( fd_pack_t * pack,
+                                    long        approx_wallclock_ns,
+                                    long        harmonic_threshold_ns );
+
+/* fd_pack_harmonic_decision: Returns the decision state:
+   HARMONIC_MODE_UNDECIDED, HARMONIC_MODE_HARMONIC, or HARMONIC_MODE_SPRINT */
+FD_FN_PURE int fd_pack_harmonic_decision( fd_pack_t const * pack );
+
+/* fd_pack_harmonic_set_decision: Sets the decision state. */
+void fd_pack_harmonic_set_decision( fd_pack_t * pack, int decision );
+
+/* fd_pack_harmonic_pending_cnt: Returns number of pending block txns */
+FD_FN_PURE ulong fd_pack_harmonic_pending_cnt( fd_pack_t const * pack );
+
+/* fd_pack_harmonic_inflight_cnt: Returns number of in-flight block txns */
+FD_FN_PURE ulong fd_pack_harmonic_inflight_cnt( fd_pack_t const * pack );
+
+/* fd_pack_harmonic_pool_full: Returns 1 if treap pool is exhausted */
+FD_FN_PURE int fd_pack_harmonic_pool_full( fd_pack_t const * pack );
+
+/* fd_pack_harmonic_block_slot: Returns current block's target slot */
+FD_FN_PURE ulong fd_pack_harmonic_block_slot( fd_pack_t const * pack );
+
+/* fd_pack_harmonic_block_txn_expected: Returns expected total txn count */
+FD_FN_PURE ulong fd_pack_harmonic_block_txn_expected( fd_pack_t const * pack );
+
+/* fd_pack_harmonic_block_txn_completed: Returns count of completed txns */
+FD_FN_PURE ulong fd_pack_harmonic_block_txn_completed( fd_pack_t const * pack );
 
 
 /* fd_pack_rebate_cus adjusts the compute unit accounting for the
