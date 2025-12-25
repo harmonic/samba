@@ -100,7 +100,7 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@1.81.0
+      - uses: dtolnay/rust-toolchain@1.100.0
 
       - uses: ./.github/actions/deps
         with:
@@ -155,7 +155,7 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@1.81.0
+      - uses: dtolnay/rust-toolchain@1.100.0
 
       - uses: ./.github/actions/deps
         with:

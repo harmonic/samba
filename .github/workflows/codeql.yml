@@ -37,7 +37,7 @@ jobs:
           compiler: ${{ matrix.compiler }}
           compiler-version: ${{ matrix.compiler-version }}
           extras: +dev
-      - uses: dtolnay/rust-toolchain@1.84.1
+      - uses: dtolnay/rust-toolchain@1.100.0
       - name: clean targets
         run: |
           make clean --silent >/dev/null
