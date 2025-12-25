@@ -1111,6 +1111,8 @@ fd_bundle_request_ctx_cstr( ulong request_ctx ) {
     return "SubscribeBlocks";
   case FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo:
     return "SubmitLeaderWindowInfo";
+  case FD_BUNDLE_CLIENT_REQ_TPU_SubscribePackets:
+    return "SubscribePacketsTPU";
   default:
     return "unknown";
   }
@@ -1299,3 +1301,427 @@ fd_bundle_client_handle_block_batch(
     return;
   }
 }
+
+/* ========== TPU endpoint connection implementation ========== */
+
+void
+fd_bundle_tpu_client_reset( fd_bundle_tile_t * ctx ) {
+  if( FD_UNLIKELY( ctx->tpu_tcp_sock >= 0 ) ) {
+    if( FD_UNLIKELY( 0!=close( ctx->tpu_tcp_sock ) ) ) {
+      FD_LOG_ERR(( "close(tpu_tcp_sock=%i) failed (%i-%s)", ctx->tpu_tcp_sock, errno, fd_io_strerror( errno ) ));
+    }
+    ctx->tpu_tcp_sock = -1;
+    ctx->tpu_tcp_sock_connected = 0;
+  }
+  ctx->tpu_defer_reset = 0;
+
+  ctx->tpu_packet_subscription_live = 0;
+  ctx->tpu_packet_subscription_wait = 0;
+
+  memset( ctx->tpu_rtt, 0, sizeof(fd_rtt_estimate_t) );
+
+# if FD_HAS_OPENSSL
+  if( FD_UNLIKELY( ctx->tpu_ssl ) ) {
+    SSL_free( ctx->tpu_ssl );
+    ctx->tpu_ssl = NULL;
+  }
+# endif
+
+  /* Backoff for TPU connection */
+  long now = fd_bundle_now();
+  uint iter = ctx->tpu_backoff_iter;
+  if( now < ctx->tpu_backoff_reset ) iter = 0U;
+  iter++;
+
+  long backoff_dur = (long)500e6 * (long)fd_ulong_min( 1UL<<iter, 60UL );
+  backoff_dur += (long)( fd_rng_ulong( ctx->rng ) % (ulong)backoff_dur );
+
+  ctx->tpu_backoff_iter  = iter;
+  ctx->tpu_backoff_until = now + backoff_dur;
+  ctx->tpu_backoff_reset = now + (long)120e9;
+
+  fd_bundle_auther_reset( &ctx->tpu_auther );
+  if( ctx->tpu_grpc_client ) {
+    fd_grpc_client_reset( ctx->tpu_grpc_client );
+  }
+}
+
+static int
+fd_bundle_tpu_client_do_connect( fd_bundle_tile_t const * ctx,
+                                 uint                     ip4_addr ) {
+  struct sockaddr_in addr = {
+    .sin_family      = AF_INET,
+    .sin_addr.s_addr = ip4_addr,
+    .sin_port        = fd_ushort_bswap( ctx->tpu_server_tcp_port )
+  };
+  errno = 0;
+  connect( ctx->tpu_tcp_sock, fd_type_pun_const( &addr ), sizeof(struct sockaddr_in) );
+  return errno;
+}
+
+static void
+fd_bundle_tpu_client_create_conn( fd_bundle_tile_t * ctx ) {
+  fd_bundle_tpu_client_reset( ctx );
+
+  /* FIXME IPv6 support */
+  fd_addrinfo_t hints = {0};
+  hints.ai_family = AF_INET;
+  fd_addrinfo_t * res = NULL;
+  uchar scratch[ 4096 ];
+  void * pscratch = scratch;
+  int err = fd_getaddrinfo( ctx->tpu_server_fqdn, &hints, &res, &pscratch, sizeof(scratch) );
+  if( FD_UNLIKELY( err ) ) {
+    FD_LOG_WARNING(( "fd_getaddrinfo `%s` (TPU endpoint) failed (%d-%s)", ctx->tpu_server_fqdn, err, fd_gai_strerror( err ) ));
+    fd_bundle_tpu_client_reset( ctx );
+    ctx->metrics.transport_fail_cnt++;
+    return;
+  }
+  uint const ip4_addr = ((struct sockaddr_in *)res->ai_addr)->sin_addr.s_addr;
+  ctx->tpu_server_ip4_addr = ip4_addr;
+
+  int tcp_sock = socket( AF_INET, SOCK_STREAM|SOCK_CLOEXEC, 0 );
+  if( FD_UNLIKELY( tcp_sock<0 ) ) {
+    FD_LOG_ERR(( "socket(AF_INET,SOCK_STREAM|SOCK_CLOEXEC,0) for TPU endpoint failed (%i-%s)", errno, fd_io_strerror( errno ) ));
+  }
+  ctx->tpu_tcp_sock = tcp_sock;
+
+  if( FD_UNLIKELY( 0!=setsockopt( tcp_sock, SOL_SOCKET, SO_RCVBUF, &ctx->so_rcvbuf, sizeof(int) ) ) ) {
+    FD_LOG_ERR(( "setsockopt(SOL_SOCKET,SO_RCVBUF,%i) for TPU endpoint failed (%i-%s)", ctx->so_rcvbuf, errno, fd_io_strerror( errno ) ));
+  }
+
+  int tcp_nodelay = 1;
+  if( FD_UNLIKELY( 0!=setsockopt( tcp_sock, SOL_TCP, TCP_NODELAY, &tcp_nodelay, sizeof(int) ) ) ) {
+    FD_LOG_ERR(( "setsockopt for TPU endpoint failed (%d-%s)", errno, fd_io_strerror( errno ) ));
+  }
+
+  if( FD_UNLIKELY( fcntl( tcp_sock, F_SETFL, O_NONBLOCK )==-1 ) ) {
+    FD_LOG_ERR(( "fcntl(tpu_tcp_sock,F_SETFL,O_NONBLOCK) failed (%i-%s)", errno, fd_io_strerror( errno ) ));
+  }
+
+  char const * scheme = "http";
+# if FD_HAS_OPENSSL
+  if( ctx->tpu_is_ssl ) scheme = "https";
+# endif
+
+  FD_LOG_INFO(( "Connecting to TPU endpoint %s://" FD_IP4_ADDR_FMT ":%hu (%.*s)",
+                scheme,
+                FD_IP4_ADDR_FMT_ARGS( ip4_addr ), ctx->tpu_server_tcp_port,
+                (int)ctx->tpu_server_sni_len, ctx->tpu_server_sni ));
+
+  int connect_err = fd_bundle_tpu_client_do_connect( ctx, ip4_addr );
+  if( FD_UNLIKELY( connect_err ) ) {
+    if( FD_UNLIKELY( connect_err!=EINPROGRESS ) ) {
+      FD_LOG_WARNING(( "connect(tpu_tcp_sock," FD_IP4_ADDR_FMT ":%u) failed (%i-%s)",
+                      FD_IP4_ADDR_FMT_ARGS( ip4_addr ), ctx->tpu_server_tcp_port,
+                      connect_err, fd_io_strerror( connect_err ) ));
+      fd_bundle_tpu_client_reset( ctx );
+      ctx->metrics.transport_fail_cnt++;
+      return;
+    }
+  }
+
+# if FD_HAS_OPENSSL
+  if( ctx->tpu_is_ssl ) {
+    BIO * bio = BIO_new_socket( ctx->tpu_tcp_sock, BIO_NOCLOSE );
+    if( FD_UNLIKELY( !bio ) ) {
+      FD_LOG_ERR(( "BIO_new_socket for TPU endpoint failed" ));
+    }
+
+    SSL * ssl = SSL_new( ctx->ssl_ctx );  /* Reuse same SSL context */
+    if( FD_UNLIKELY( !ssl ) ) {
+      FD_LOG_ERR(( "SSL_new for TPU endpoint failed" ));
+    }
+
+    SSL_set_bio( ssl, bio, bio );
+    SSL_set_connect_state( ssl );
+
+    if( FD_UNLIKELY( !SSL_set_tlsext_host_name( ssl, ctx->tpu_server_sni ) ) ) {
+      FD_LOG_ERR(( "SSL_set_tlsext_host_name for TPU endpoint failed" ));
+    }
+
+    if( FD_UNLIKELY( !SSL_set1_host( ssl, ctx->tpu_server_sni ) ) ) {
+      FD_LOG_ERR(( "SSL_set1_host for TPU endpoint failed" ));
+    }
+
+    ctx->tpu_ssl = ssl;
+  }
+# endif /* FD_HAS_OPENSSL */
+
+  fd_grpc_client_reset( ctx->tpu_grpc_client );
+  fd_keepalive_init( ctx->tpu_keepalive, ctx->rng, ctx->keepalive_interval, ctx->keepalive_interval, fd_bundle_now() );
+}
+
+static int
+fd_bundle_tpu_client_drive_io( fd_bundle_tile_t * ctx,
+                               int *              charge_busy ) {
+# if FD_HAS_OPENSSL
+  if( ctx->tpu_is_ssl ) {
+    return fd_grpc_client_rxtx_ossl( ctx->tpu_grpc_client, ctx->tpu_ssl, charge_busy );
+  }
+# endif /* FD_HAS_OPENSSL */
+
+  return fd_grpc_client_rxtx_socket( ctx->tpu_grpc_client, ctx->tpu_tcp_sock, charge_busy );
+}
+
+static void
+fd_bundle_tpu_client_subscribe_packets( fd_bundle_tile_t * ctx ) {
+  if( FD_UNLIKELY( fd_grpc_client_request_is_blocked( ctx->tpu_grpc_client ) ) ) return;
+
+  block_engine_SubscribePacketsRequest req = block_engine_SubscribePacketsRequest_init_default;
+  static char const path[] = "/block_engine.BlockEngineValidator/SubscribePackets";
+  fd_grpc_h2_stream_t * request = fd_grpc_client_request_start(
+      ctx->tpu_grpc_client,
+      path, sizeof(path)-1,
+      FD_BUNDLE_CLIENT_REQ_TPU_SubscribePackets,
+      &block_engine_SubscribePacketsRequest_msg, &req,
+      ctx->tpu_auther.access_token, ctx->tpu_auther.access_token_sz
+  );
+  if( FD_UNLIKELY( !request ) ) return;
+  fd_grpc_client_deadline_set(
+      request,
+      FD_GRPC_DEADLINE_HEADER,
+      fd_log_wallclock() + FD_BUNDLE_CLIENT_REQUEST_TIMEOUT );
+
+  ctx->tpu_packet_subscription_wait = 1;
+}
+
+void
+fd_bundle_tpu_client_send_ping( fd_bundle_tile_t * ctx ) {
+  if( FD_UNLIKELY( !ctx->tpu_grpc_client ) ) return;
+  fd_h2_conn_t * conn = fd_grpc_client_h2_conn( ctx->tpu_grpc_client );
+  if( FD_UNLIKELY( !conn ) ) return;
+  if( FD_UNLIKELY( conn->flags ) ) return;
+  fd_h2_rbuf_t * rbuf_tx = fd_grpc_client_rbuf_tx( ctx->tpu_grpc_client );
+  if( FD_UNLIKELY( !rbuf_tx ) ) return;
+
+  if( FD_LIKELY( fd_h2_tx_ping( conn, rbuf_tx ) ) ) {
+    long now = fd_bundle_now();
+    fd_keepalive_tx( ctx->tpu_keepalive, ctx->rng, now );
+    FD_LOG_DEBUG(( "TPU Keepalive TX (deadline=+%gs)", (double)( ctx->tpu_keepalive->ts_deadline-now )/1e9 ));
+  }
+}
+
+static int
+fd_bundle_tpu_client_step_reconnect( fd_bundle_tile_t * ctx,
+                                     long               now ) {
+  /* Drive auth for TPU connection */
+  if( FD_UNLIKELY( ctx->tpu_auther.needs_poll ) ) {
+    fd_bundle_auther_poll( &ctx->tpu_auther, ctx->tpu_grpc_client, ctx->keyguard_client );
+    return 1;
+  }
+  if( FD_UNLIKELY( ctx->tpu_auther.state!=FD_BUNDLE_AUTH_STATE_DONE_WAIT ) ) return 0;
+
+  /* Subscribe to packets on TPU connection */
+  if( FD_UNLIKELY( !ctx->tpu_packet_subscription_live && !ctx->tpu_packet_subscription_wait ) ) {
+    fd_bundle_tpu_client_subscribe_packets( ctx );
+    return 1;
+  }
+
+  /* Send a PING */
+  if( FD_UNLIKELY( fd_keepalive_should_tx( ctx->tpu_keepalive, now ) ) ) {
+    fd_bundle_tpu_client_send_ping( ctx );
+    return 1;
+  }
+
+  return 0;
+}
+
+static void
+fd_bundle_tpu_client_step1( fd_bundle_tile_t * ctx,
+                            int *              charge_busy ) {
+
+  /* Wait for TCP socket to connect */
+  if( FD_UNLIKELY( !ctx->tpu_tcp_sock_connected ) ) {
+    if( FD_UNLIKELY( ctx->tpu_tcp_sock < 0 ) ) goto reconnect_tpu;
+
+    struct pollfd pfds[1] = {
+      { .fd = ctx->tpu_tcp_sock, .events = POLLOUT }
+    };
+    int poll_res = fd_syscall_poll( pfds, 1, 0 );
+    if( FD_UNLIKELY( poll_res<0 ) ) {
+      FD_LOG_ERR(( "fd_syscall_poll(tpu_tcp_sock) failed (%i-%s)", errno, fd_io_strerror( errno ) ));
+    }
+    if( poll_res==0 ) return;
+
+    if( pfds[0].revents & (POLLERR|POLLHUP) ) {
+      int connect_err = fd_bundle_tpu_client_do_connect( ctx, 0 );
+      FD_LOG_INFO(( "Bundle gRPC TPU endpoint connect attempt failed (%i-%s)", connect_err, fd_io_strerror( connect_err ) ));
+      fd_bundle_tpu_client_reset( ctx );
+      ctx->metrics.transport_fail_cnt++;
+      *charge_busy = 1;
+      return;
+    }
+    if( pfds[0].revents & POLLOUT ) {
+      FD_LOG_DEBUG(( "Bundle TCP TPU socket connected" ));
+      ctx->tpu_tcp_sock_connected = 1;
+      *charge_busy = 1;
+      return;
+    }
+    return;
+  }
+
+  /* gRPC conn died? */
+  if( FD_UNLIKELY( !ctx->tpu_grpc_client ) ) {
+    long sleep_start;
+  reconnect_tpu:
+    sleep_start = fd_bundle_now();
+    if( FD_UNLIKELY( sleep_start < ctx->tpu_backoff_until ) ) {
+      long wait_dur = ctx->tpu_backoff_until - sleep_start;
+      fd_log_sleep( fd_long_min( wait_dur, 1e6 ) );
+      return;
+    }
+    fd_bundle_tpu_client_create_conn( ctx );
+    *charge_busy = 1;
+    return;
+  }
+
+  /* Did a HTTP/2 PING time out */
+  long check_ts = ctx->tpu_cached_ts = fd_bundle_now();
+  if( FD_UNLIKELY( fd_keepalive_is_timeout( ctx->tpu_keepalive, check_ts ) ) ) {
+    FD_LOG_WARNING(( "Bundle gRPC TPU endpoint timed out (HTTP/2 PING went unanswered for %.2f seconds)",
+                     (double)( check_ts - ctx->tpu_keepalive->ts_last_tx )/1e9 ));
+    ctx->tpu_keepalive->inflight = 0;
+    ctx->tpu_defer_reset = 1;
+    *charge_busy = 1;
+    return;
+  }
+
+  /* Drive I/O, SSL handshake, and any inflight requests */
+  if( FD_UNLIKELY( !fd_bundle_tpu_client_drive_io( ctx, charge_busy ) ||
+                   ctx->tpu_defer_reset ) ) {
+    fd_bundle_tpu_client_reset( ctx );
+    ctx->metrics.transport_fail_cnt++;
+    *charge_busy = 1;
+    return;
+  }
+
+  /* Are we ready to issue a new request? */
+  if( FD_UNLIKELY( fd_grpc_client_request_is_blocked( ctx->tpu_grpc_client ) ) ) return;
+  long io_ts = fd_bundle_now();
+  if( FD_UNLIKELY( io_ts < ctx->tpu_backoff_until ) ) return;
+
+  *charge_busy |= fd_bundle_tpu_client_step_reconnect( ctx, io_ts );
+}
+
+void
+fd_bundle_tpu_client_step( fd_bundle_tile_t * ctx,
+                           int *              charge_busy ) {
+  fd_bundle_tpu_client_step1( ctx, charge_busy );
+}
+
+/* ========== Callbacks for TPU endpoint gRPC client ========== */
+
+static void
+fd_bundle_tpu_client_grpc_conn_established( void * app_ctx ) {
+  (void)app_ctx;
+  FD_LOG_INFO(( "TPU endpoint gRPC connection established" ));
+}
+
+static void
+fd_bundle_tpu_client_grpc_conn_dead( void * app_ctx,
+                                     uint   h2_err,
+                                     int    closed_by ) {
+  fd_bundle_tile_t * ctx = app_ctx;
+  FD_LOG_INFO(( "TPU endpoint gRPC connection closed %s (%u-%s)",
+                closed_by ? "by peer" : "locally",
+                h2_err, fd_h2_strerror( h2_err ) ));
+  ctx->tpu_defer_reset = 1;
+}
+
+static void
+fd_bundle_tpu_client_grpc_tx_complete( void * app_ctx,
+                                       ulong  request_ctx ) {
+  (void)app_ctx;
+  (void)request_ctx;
+}
+
+static void
+fd_bundle_tpu_client_grpc_rx_start( void * app_ctx,
+                                    ulong  request_ctx ) {
+  fd_bundle_tile_t * ctx = app_ctx;
+  switch( request_ctx ) {
+  case FD_BUNDLE_CLIENT_REQ_TPU_SubscribePackets:
+    ctx->tpu_packet_subscription_live = 1;
+    ctx->tpu_packet_subscription_wait = 0;
+    break;
+  default:
+    break;
+  }
+}
+
+static void
+fd_bundle_tpu_client_grpc_rx_msg( void *       app_ctx,
+                                  void const * protobuf,
+                                  ulong        protobuf_sz,
+                                  ulong        request_ctx ) {
+  fd_bundle_tile_t * ctx = app_ctx;
+  pb_istream_t istream = pb_istream_from_buffer( protobuf, protobuf_sz );
+
+  switch( request_ctx ) {
+  case FD_BUNDLE_CLIENT_REQ_TPU_SubscribePackets:
+    /* Handle packets from TPU endpoint - same as first endpoint */
+    fd_bundle_client_handle_packet_batch( ctx, &istream );
+    break;
+  default:
+    FD_LOG_WARNING(( "Unexpected RPC response on TPU endpoint (request_ctx=%lu)", request_ctx ));
+    break;
+  }
+}
+
+static void
+fd_bundle_tpu_client_grpc_rx_end( void *                app_ctx,
+                                  ulong                 request_ctx,
+                                  fd_grpc_resp_hdrs_t * resp ) {
+  fd_bundle_tile_t * ctx = app_ctx;
+  (void)resp;
+
+  switch( request_ctx ) {
+  case FD_BUNDLE_CLIENT_REQ_TPU_SubscribePackets:
+    ctx->tpu_packet_subscription_wait = 0;
+    ctx->tpu_packet_subscription_live = 0;
+    break;
+  default:
+    break;
+  }
+}
+
+static void
+fd_bundle_tpu_client_grpc_rx_timeout( void * app_ctx,
+                                      ulong  request_ctx,
+                                      int    deadline_kind ) {
+  fd_bundle_tile_t * ctx = app_ctx;
+  (void)deadline_kind;
+
+  FD_LOG_WARNING(( "TPU endpoint RPC timeout (request_ctx=%lu)", request_ctx ));
+
+  switch( request_ctx ) {
+  case FD_BUNDLE_CLIENT_REQ_TPU_SubscribePackets:
+    ctx->tpu_packet_subscription_wait = 0;
+    break;
+  default:
+    break;
+  }
+
+  ctx->tpu_defer_reset = 1;
+}
+
+static void
+fd_bundle_tpu_client_grpc_ping_ack( void * app_ctx ) {
+  fd_bundle_tile_t * ctx = app_ctx;
+  long rtt_sample = fd_keepalive_rx( ctx->tpu_keepalive, fd_bundle_now() );
+  if( FD_LIKELY( rtt_sample ) ) {
+    fd_rtt_sample( ctx->tpu_rtt, (float)rtt_sample, 0 );
+    FD_LOG_DEBUG(( "TPU Keepalive ACK" ));
+  }
+}
+
+fd_grpc_client_callbacks_t fd_bundle_tpu_client_grpc_callbacks = {
+  .conn_established = fd_bundle_tpu_client_grpc_conn_established,
+  .conn_dead        = fd_bundle_tpu_client_grpc_conn_dead,
+  .tx_complete      = fd_bundle_tpu_client_grpc_tx_complete,
+  .rx_start         = fd_bundle_tpu_client_grpc_rx_start,
+  .rx_msg           = fd_bundle_tpu_client_grpc_rx_msg,
+  .rx_end           = fd_bundle_tpu_client_grpc_rx_end,
+  .rx_timeout       = fd_bundle_tpu_client_grpc_rx_timeout,
+  .ping_ack         = fd_bundle_tpu_client_grpc_ping_ack,
+};
