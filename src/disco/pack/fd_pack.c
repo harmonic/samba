@@ -2837,16 +2837,19 @@ fd_pack_harmonic_reset( fd_pack_t * pack ) {
 int
 fd_pack_harmonic_insert( fd_pack_t      * pack,
                          fd_txn_t const * txn,
-                         uchar const    * payload,
+                         uchar    const * payload,
                          ulong            payload_sz,
-                         uchar const    * alt_accts,
+                         uchar    const * alt_accts,
                          uint             source_ipv4,
                          uchar            source_tpu,
                          long             arrival_time_nanos,
                          ulong            block_slot,
                          ulong            block_txn_expected ) {
 
-  /* Handle block_slot change: reset state for new block */
+  /* 
+    Handle block_slot change: reset state for new block. 
+    Function caller has already verified block_slot==leader_slot.
+    */
   if( FD_UNLIKELY( block_slot != pack->harmonic_block_slot ) ) {
     fd_pack_harmonic_reset( pack );
     pack->harmonic_block_slot          = block_slot;
