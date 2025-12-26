@@ -682,11 +682,17 @@ fd_topo_initialize( config_t * config ) {
 
     /**/                 fd_topob_tile( topo, "bundle",  "bundle",  "metric_in", tile_to_cpu[ topo->tile_cnt ], 0, 1 );
 
+    /* harmonic: read became_leader messages from replay_out link.
+       NOTE: replay_out must be the first in_link for bundle tile because fd_stem
+       uses poll indices (skipping unpolled links), so we need the polled link first. */
+    /**/                 fd_topob_tile_in(  topo, "bundle", 0UL,           "metric_in", "replay_out",     0UL,        FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
+
     /**/                 fd_topob_tile_out( topo, "bundle", 0UL, "bundle_verif", 0UL );
     FOR(verify_tile_cnt) fd_topob_tile_in(  topo, "verify", i,             "metric_in", "bundle_verif",   0UL,        FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
 
     /**/                 fd_topob_tile_in(  topo, "sign",   0UL,           "metric_in", "bundle_sign",    0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
     /**/                 fd_topob_tile_out( topo, "bundle", 0UL,                        "bundle_sign",    0UL                                                );
+    /* sign_bundle must be the last in_link for bundle tile (unpolled links go last) */
     /**/                 fd_topob_tile_in(  topo, "bundle", 0UL,           "metric_in", "sign_bundle",    0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_UNPOLLED );
     /**/                 fd_topob_tile_out( topo, "sign",   0UL,                        "sign_bundle",    0UL                                                );
 
@@ -694,9 +700,6 @@ fd_topo_initialize( config_t * config ) {
     /**/                 fd_topob_tile_out( topo, "pack",   0UL,                        "pack_sign",      0UL                                                );
     /**/                 fd_topob_tile_in(  topo, "pack",   0UL,           "metric_in", "sign_pack",      0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_UNPOLLED );
     /**/                 fd_topob_tile_out( topo, "sign",   0UL,                        "sign_pack",      0UL                                                );
-
-    /* harmonic: read became_leader messages from replay_out link */
-    /**/                 fd_topob_tile_in(  topo, "bundle", 0UL,           "metric_in", "replay_out",     0UL,        FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
 
     /* bundle_gossip link for bundle->gossip TPU updates.
        In full Firedancer, gossip tile consumes this. */
