@@ -100,14 +100,14 @@ fd_bundle_tile_housekeeping( fd_bundle_tile_t * ctx ) {
 
   if( FD_UNLIKELY( fd_keyswitch_state_query( ctx->keyswitch )==FD_KEYSWITCH_STATE_SWITCH_PENDING ) ) {
     fd_memcpy( ctx->auther.pubkey, ctx->keyswitch->bytes, 32UL );
-    fd_keyswitch_state( ctx->keyswitch, FD_KEYSWITCH_STATE_COMPLETED );
-    ctx->defer_reset = 1;
 
     /* cavey: also update TPU auther pubkey and reset TPU connection */
     if( ctx->tpu_conn_enabled ) {
       fd_memcpy( ctx->tpu_auther.pubkey, ctx->keyswitch->bytes, 32UL );
       ctx->tpu_defer_reset = 1;
     }
+    fd_keyswitch_state( ctx->keyswitch, FD_KEYSWITCH_STATE_COMPLETED );
+    ctx->defer_reset = 1;
   }
 }
 
