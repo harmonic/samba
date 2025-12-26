@@ -1924,6 +1924,10 @@ fd_bundle_tpu_client_grpc_rx_timeout( void * app_ctx,
   FD_LOG_WARNING(( "TPU endpoint RPC timeout (request_ctx=%lu)", request_ctx ));
 
   switch( request_ctx ) {
+  case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthChallenge:
+  case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthTokens:
+    fd_bundle_auther_handle_request_fail( &ctx->tpu_auther );
+    break;
   case FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU:
     ctx->tpu_packet_subscription_wait = 0;
     break;
