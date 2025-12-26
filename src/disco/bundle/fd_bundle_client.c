@@ -1596,7 +1596,7 @@ fd_bundle_tpu_client_subscribe_packets( fd_bundle_tile_t * ctx ) {
   if( FD_UNLIKELY( fd_grpc_client_request_is_blocked( ctx->tpu_grpc_client ) ) ) return;
 
   block_engine_SubscribePacketsRequest req = block_engine_SubscribePacketsRequest_init_default;
-  static char const path[] = "/block_engine.BlockEngineValidator/SubscribePackets";
+  static char const path[] = "/relayer.Relayer/SubscribePackets";
   fd_grpc_h2_stream_t * request = fd_grpc_client_request_start(
       ctx->tpu_grpc_client,
       path, sizeof(path)-1,
