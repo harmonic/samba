@@ -167,6 +167,18 @@ fd_bundle_tile_publish_tpu_update(
     update->tpu_fwd_port     = ctx->tpu_config_tpu_fwd_port;
   }
 
+  if( is_connected ) {
+    FD_LOG_NOTICE(( "Publishing TPU update: status=CONNECTED tpu=%u.%u.%u.%u:%u tpu_fwd=%u.%u.%u.%u:%u",
+                    (update->tpu_ip4_addr    ) & 0xFFU, (update->tpu_ip4_addr>>8    ) & 0xFFU,
+                    (update->tpu_ip4_addr>>16) & 0xFFU, (update->tpu_ip4_addr>>24   ) & 0xFFU,
+                    update->tpu_port,
+                    (update->tpu_fwd_ip4_addr    ) & 0xFFU, (update->tpu_fwd_ip4_addr>>8    ) & 0xFFU,
+                    (update->tpu_fwd_ip4_addr>>16) & 0xFFU, (update->tpu_fwd_ip4_addr>>24   ) & 0xFFU,
+                    update->tpu_fwd_port ));
+  } else {
+    FD_LOG_NOTICE(( "Publishing TPU update: status=DISCONNECTED" ));
+  }
+
   ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now() );
   fd_stem_publish(
       stem,
