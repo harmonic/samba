@@ -1840,6 +1840,16 @@ fd_bundle_tpu_client_grpc_rx_msg( void *       app_ctx,
   pb_istream_t istream = pb_istream_from_buffer( protobuf, protobuf_sz );
 
   switch( request_ctx ) {
+  case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthChallenge:
+  if( FD_UNLIKELY( !fd_bundle_auther_handle_challenge_resp( &ctx->tpu_auther, protobuf, protobuf_sz ) ) ) {
+    ctx->metrics.decode_fail_cnt++;
+  }
+  break;
+case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthTokens:
+  if( FD_UNLIKELY( !fd_bundle_auther_handle_tokens_resp( &ctx->tpu_auther, protobuf, protobuf_sz ) ) ) {
+    ctx->metrics.decode_fail_cnt++;
+  }
+  break;
   case FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU:
     /* Handle packets from TPU endpoint */
     fd_bundle_tpu_client_handle_packet_batch( ctx, &istream );
