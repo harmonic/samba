@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "fd_bundle_tile_private.h"
+#include "fd_bundle_tpu.h"
 #include "../metrics/fd_metrics.h"
 #include "../topo/fd_topo.h"
 #include "../keyguard/fd_keyload.h"
@@ -51,14 +52,16 @@ loose_footprint( fd_topo_tile_t const * tile ) {
 
 static inline void
 metrics_write( fd_bundle_tile_t * ctx ) {
-  FD_MCNT_SET( BUNDLE, TRANSACTION_RECEIVED,   ctx->metrics.txn_received_cnt          );
-  FD_MCNT_SET( BUNDLE, BUNDLE_RECEIVED,        ctx->metrics.bundle_received_cnt       );
-  FD_MCNT_SET( BUNDLE, PACKET_RECEIVED,        ctx->metrics.packet_received_cnt       );
-  FD_MCNT_SET( BUNDLE, SHREDSTREAM_HEARTBEATS, ctx->metrics.shredstream_heartbeat_cnt );
-  FD_MCNT_SET( BUNDLE, KEEPALIVES,             ctx->metrics.ping_ack_cnt              );
-  FD_MCNT_SET( BUNDLE, ERRORS_PROTOBUF,        ctx->metrics.decode_fail_cnt           );
-  FD_MCNT_SET( BUNDLE, ERRORS_TRANSPORT,       ctx->metrics.transport_fail_cnt        );
-  FD_MCNT_SET( BUNDLE, ERRORS_NO_FEE_INFO,     ctx->metrics.missing_builder_info_fail_cnt );
+  FD_MCNT_SET( BUNDLE, TRANSACTION_RECEIVED,     ctx->metrics.txn_received_cnt          );
+  FD_MCNT_SET( BUNDLE, BUNDLE_RECEIVED,          ctx->metrics.bundle_received_cnt       );
+  FD_MCNT_SET( BUNDLE, PACKET_RECEIVED,          ctx->metrics.packet_received_cnt       );
+  FD_MCNT_SET( BUNDLE, SHREDSTREAM_HEARTBEATS,   ctx->metrics.shredstream_heartbeat_cnt );
+  FD_MCNT_SET( BUNDLE, KEEPALIVES,               ctx->metrics.ping_ack_cnt              );
+  FD_MCNT_SET( BUNDLE, ERRORS_PROTOBUF,          ctx->metrics.decode_fail_cnt           );
+  FD_MCNT_SET( BUNDLE, ERRORS_TRANSPORT,         ctx->metrics.transport_fail_cnt        );
+  FD_MCNT_SET( BUNDLE, ERRORS_NO_FEE_INFO,       ctx->metrics.missing_builder_info_fail_cnt );
+  FD_MCNT_SET( BUNDLE, TPU_PACKET_RECEIVED,      ctx->metrics.tpu_packet_received_cnt   );
+  FD_MCNT_SET( BUNDLE, TPU_TRANSACTION_RECEIVED, ctx->metrics.tpu_txn_received_cnt      );
 
   FD_MGAUGE_SET( BUNDLE, RTT_SAMPLE,   (ulong)ctx->rtt->latest_rtt   );
   FD_MGAUGE_SET( BUNDLE, RTT_SMOOTHED, (ulong)ctx->rtt->smoothed_rtt );
@@ -78,6 +81,10 @@ metrics_write( fd_bundle_tile_t * ctx ) {
   int bundle_status = fd_bundle_client_status( ctx );
   FD_MGAUGE_SET( BUNDLE, CONNECTED, bundle_status==FD_PLUGIN_MSG_BLOCK_ENGINE_UPDATE_STATUS_CONNECTED );
   ctx->bundle_status_recent = (uchar)bundle_status;
+
+  int tpu_status = fd_bundle_tpu_client_status( ctx );
+  FD_MGAUGE_SET( BUNDLE, TPU_CONNECTED, tpu_status==FD_PLUGIN_MSG_BLOCK_ENGINE_UPDATE_STATUS_CONNECTED );
+  ctx->tpu_status_recent = (uchar)tpu_status;
 }
 
 void
@@ -137,6 +144,43 @@ fd_bundle_tile_publish_block_engine_update(
   ctx->plugin_out.chunk = fd_dcache_compact_next( ctx->plugin_out.chunk, sizeof(fd_plugin_msg_block_engine_update_t), ctx->plugin_out.chunk0, ctx->plugin_out.wmark );
 }
 
+/* Publish TPU connection update to gossip link.
+   For Frankendancer, the poh tile (Agave) receives this.
+   For full Firedancer, the gossip tile receives this. */
+static void
+fd_bundle_tile_publish_tpu_update(
+    fd_bundle_tile_t *  ctx,
+    fd_stem_context_t * stem
+) {
+  fd_bundle_tpu_update_t * update =
+      fd_chunk_to_laddr( ctx->gossip_out.mem, ctx->gossip_out.chunk );
+  memset( update, 0, sizeof(fd_bundle_tpu_update_t) );
+
+  int is_connected = ( ctx->tpu_status_recent == FD_PLUGIN_MSG_BLOCK_ENGINE_UPDATE_STATUS_CONNECTED );
+  update->status = is_connected ? FD_BUNDLE_TPU_UPDATE_CONNECTED : FD_BUNDLE_TPU_UPDATE_DISCONNECTED;
+
+  /* When connected, populate TPU addresses from cached GetTpuConfigs response */
+  if( is_connected && ctx->tpu_config_avail ) {
+    update->tpu_ip4_addr     = ctx->tpu_config_tpu_ip4_addr;
+    update->tpu_port         = ctx->tpu_config_tpu_port;
+    update->tpu_fwd_ip4_addr = ctx->tpu_config_tpu_fwd_ip4_addr;
+    update->tpu_fwd_port     = ctx->tpu_config_tpu_fwd_port;
+  }
+
+  ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now() );
+  fd_stem_publish(
+      stem,
+      ctx->gossip_out.idx,
+      FD_BUNDLE_TPU_UPDATE,
+      ctx->gossip_out.chunk,
+      sizeof(fd_bundle_tpu_update_t),
+      0UL, /* ctl */
+      0UL, /* seq */
+      tspub
+  );
+  ctx->gossip_out.chunk = fd_dcache_compact_next( ctx->gossip_out.chunk, sizeof(fd_bundle_tpu_update_t), ctx->gossip_out.chunk0, ctx->gossip_out.wmark );
+}
+
 static void
 after_credit( fd_bundle_tile_t *  ctx,
               fd_stem_context_t * stem,
@@ -155,6 +199,15 @@ after_credit( fd_bundle_tile_t *  ctx,
     if( FD_UNLIKELY( ctx->bundle_status_recent != ctx->bundle_status_plugin ) ) {
       fd_bundle_tile_publish_block_engine_update( ctx, stem );
       ctx->bundle_status_plugin = (uchar)ctx->bundle_status_recent;
+      *charge_busy = 1;
+    }
+  }
+
+  /* Publish TPU status updates to gossip link */
+  if( ctx->gossip_out.mem ) {
+    if( FD_UNLIKELY( ctx->tpu_status_recent != ctx->tpu_status_gossip ) ) {
+      fd_bundle_tile_publish_tpu_update( ctx, stem );
+      ctx->tpu_status_gossip = ctx->tpu_status_recent;
       *charge_busy = 1;
     }
   }
@@ -606,6 +659,14 @@ unprivileged_init( fd_topo_t *      topo,
     ctx->plugin_out = (fd_bundle_out_ctx_t){ .idx=ULONG_MAX };
   }
 
+  /* Initialize gossip output for TPU updates */
+  ulong gossip_out_idx = fd_topo_find_tile_out_link( topo, tile, "bundle_gossi", tile->kind_id );
+  if( gossip_out_idx!=ULONG_MAX ) {
+    ctx->gossip_out = bundle_out_link( topo, &topo->links[ tile->out_link_id[ gossip_out_idx ] ], gossip_out_idx );
+  } else {
+    ctx->gossip_out = (fd_bundle_out_ctx_t){ .idx=ULONG_MAX };
+  }
+
   /* Set socket receive buffer size */
   ulong so_rcvbuf = tile->bundle.buf_sz;
   if( FD_UNLIKELY( so_rcvbuf < 2048UL  ) ) FD_LOG_ERR(( "Invalid [development.bundle.buffer_size_kib]: too small" ));
@@ -618,6 +679,9 @@ unprivileged_init( fd_topo_t *      topo,
   ctx->bundle_status_plugin = 127;
   ctx->bundle_status_recent = FD_PLUGIN_MSG_BLOCK_ENGINE_UPDATE_STATUS_DISCONNECTED;
   ctx->last_bundle_status_log_nanos = fd_log_wallclock();
+
+  ctx->tpu_status_gossip = 127;  /* Force initial update */
+  ctx->tpu_status_recent = FD_PLUGIN_MSG_BLOCK_ENGINE_UPDATE_STATUS_DISCONNECTED;
 
   fd_bundle_tile_parse_endpoint( ctx, tile );
 
@@ -784,6 +848,13 @@ after_frag( fd_bundle_tile_t * ctx,
       ctx->_became_leader->slot,
       ctx->_became_leader->slot_start_ns
   );
+  if( FD_UNLIKELY( !ctx->submit_leader_window_info_wait ) ) {
+    FD_LOG_WARNING(( "SubmitLeaderWindowInfo request for slot=%lu was NOT initiated (client not ready or blocked)", 
+                     ctx->_became_leader->slot ));
+  } else {
+    FD_LOG_NOTICE(( "SubmitLeaderWindowInfo request for slot=%lu successfully queued", 
+                    ctx->_became_leader->slot ));
+  }
 }
 
 #define STEM_BURST (5UL)

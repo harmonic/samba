@@ -3,7 +3,7 @@ syntax = "proto3";
 import "packet.proto";
 import "shared.proto";
 import "bundle.proto";
-import "google/protobuf/timestamp.proto";
+import "timestamp.proto";
 
 package block_engine;
 
