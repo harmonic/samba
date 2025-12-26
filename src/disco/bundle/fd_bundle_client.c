@@ -1868,7 +1868,38 @@ fd_bundle_tpu_client_grpc_rx_end( void *                app_ctx,
                                   ulong                 request_ctx,
                                   fd_grpc_resp_hdrs_t * resp ) {
   fd_bundle_tile_t * ctx = app_ctx;
-  (void)resp;
+  /* Handle HTTP-level failures */
+  if( FD_UNLIKELY( resp->h2_status!=200 ) ) {
+    FD_LOG_WARNING(( "TPU endpoint gRPC request failed (HTTP status %u)", resp->h2_status ));
+    switch( request_ctx ) {
+    case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthChallenge:
+    case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthTokens:
+      fd_bundle_auther_handle_request_fail( &ctx->tpu_auther );
+      break;
+    default:
+      break;
+    }
+    return;
+  }
+
+  /* Handle gRPC-level failures */
+  if( FD_UNLIKELY( resp->grpc_status!=FD_GRPC_STATUS_OK ) ) {
+    FD_LOG_INFO(( "TPU endpoint gRPC request failed (gRPC status %u-%s)",
+                  resp->grpc_status, fd_grpc_status_cstr( resp->grpc_status ) ));
+    switch( request_ctx ) {
+    case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthChallenge:
+    case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthTokens:
+      fd_bundle_auther_handle_request_fail( &ctx->tpu_auther );
+      break;
+    default:
+      break;
+    }
+    if( resp->grpc_status==FD_GRPC_STATUS_UNAUTHENTICATED ||
+        resp->grpc_status==FD_GRPC_STATUS_PERMISSION_DENIED ) {
+      fd_bundle_auther_reset( &ctx->tpu_auther );
+    }
+    return;
+  }
 
   switch( request_ctx ) {
   case FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU:
