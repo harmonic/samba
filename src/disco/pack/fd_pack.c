@@ -2871,11 +2871,28 @@ fd_pack_harmonic_insert( fd_pack_t      * pack,
   ord_txn->txn_e->txnp->source_tpu                   = source_tpu;
   ord_txn->txn_e->txnp->scheduler_arrival_time_nanos = arrival_time_nanos;
 
-  /* Encode FIFO ordering: higher rewards = higher priority.
-     Lower block_txn_idx should have higher priority, so invert.
-     Block txns are in pending_blocks treap, separate from normal treaps. */
-  ord_txn->rewards     = (uint)(UINT_MAX - pack->block_txn_idx);
-  ord_txn->compute_est = 1U;
+  uint  txn_flags = 0;
+  ulong execution_cost = 0UL;
+  ulong loaded_accounts_data_cost = 0UL;
+  ulong total_cost = fd_pack_compute_cost( txn, payload, &txn_flags, &execution_cost, NULL, NULL, &loaded_accounts_data_cost );
+
+  if( FD_UNLIKELY( !total_cost ) ) { trp_pool_idx_release( pool, txn_idx ); return 0; }
+  ord_txn->txn_e->txnp->pack_cu.requested_exec_plus_acct_data_cus = (uint)(execution_cost + loaded_accounts_data_cost);
+  ord_txn->txn_e->txnp->pack_cu.non_execution_cus                 = (uint)(total_cost - execution_cost - loaded_accounts_data_cost);
+  ord_txn->txn_e->txnp->flags                                     = txn_flags;
+
+  /* Encode FIFO ordering using the same machinery as bundles.
+     Each block transaction gets its own "bundle index" (block_txn_idx).
+     Use the RC_TO_REL_BUNDLE_IDX encoding so that lower block_txn_idx
+     has higher priority (FIFO order).
+     
+     This mirrors insert_bundle_impl: for a single-txn "bundle", we compute
+     rewards such that RC_TO_REL_BUNDLE_IDX(rewards, compute_est) == block_idx */
+  ulong block_idx = pack->block_txn_idx;
+  ulong prev_reward = ((BUNDLE_L_PRIME * (BUNDLE_N - block_idx))) - 1UL;
+  ulong prev_cost = 1UL<<32;
+  ord_txn->compute_est = (uint)total_cost;
+  ord_txn->rewards     = (uint)(((ulong)ord_txn->compute_est * (prev_reward + 1UL) + prev_cost - 1UL) / prev_cost);
   ord_txn->root        = FD_ORD_TXN_ROOT_PENDING_BLOCK;
 
   /* Insert into pending_blocks treap */
