@@ -6,6 +6,7 @@
 #include "../../disco/topo/fd_topob.h"
 #include "../../disco/topo/fd_cpu_topo.h"
 #include "../../disco/plugin/fd_plugin.h"
+#include "../../disco/bundle/fd_bundle_tpu.h"
 #include "../../util/pod/fd_pod_format.h"
 #include "../../util/net/fd_ip4.h"
 #include "../../util/tile/fd_tile_private.h"
@@ -310,6 +311,15 @@ fd_topo_initialize( config_t * config ) {
 
     /* harmonic: read became_leader messages from poh_pack link */
     /**/                 fd_topob_tile_in(  topo, "bundle", 0UL,           "metric_in", "poh_pack",      0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
+
+    /* bundle_gossip link for bundle->gossip TPU updates.
+       In Frankendancer, poh tile (Agave) consumes this.
+       In full FD, gossip tile will consume this. */
+    fd_topob_wksp( topo, "bundle_gossi" );
+    fd_topob_link( topo, "bundle_gossi", "bundle_gossi", 128UL, sizeof(fd_bundle_tpu_update_t), 1UL );
+    fd_topob_tile_out( topo, "bundle", 0UL, "bundle_gossi", 0UL );
+    /* poh tile (Agave) reads from bundle_gossip */
+    fd_topob_tile_in( topo, "poh", 0UL, "metric_in", "bundle_gossi", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
 
     if( plugins_enabled ) {
       fd_topob_wksp( topo, "bundle_plugi" );

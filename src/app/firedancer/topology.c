@@ -10,6 +10,8 @@
 #include "../../discof/repair/fd_repair.h"
 #include "../../discof/replay/fd_replay_tile.h"
 #include "../../disco/net/fd_net_tile.h"
+#include "../../disco/plugin/fd_plugin.h"
+#include "../../disco/bundle/fd_bundle_tpu.h"
 #include "../../discof/restore/fd_snapct_tile.h"
 #include "../../disco/gui/fd_gui_peers.h"
 #include "../../disco/quic/fd_tpu.h"
@@ -695,6 +697,14 @@ fd_topo_initialize( config_t * config ) {
 
     /* harmonic: read became_leader messages from replay_out link */
     /**/                 fd_topob_tile_in(  topo, "bundle", 0UL,           "metric_in", "replay_out",     0UL,        FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
+
+    /* bundle_gossip link for bundle->gossip TPU updates.
+       In full Firedancer, gossip tile consumes this. */
+    fd_topob_wksp( topo, "bundle_gossi" );
+    fd_topob_link( topo, "bundle_gossi", "bundle_gossi", 128UL, sizeof(fd_bundle_tpu_update_t), 1UL );
+    fd_topob_tile_out( topo, "bundle", 0UL, "bundle_gossi", 0UL );
+    /* gossip tile reads from bundle_gossip */
+    fd_topob_tile_in( topo, "gossip", 0UL, "metric_in", "bundle_gossi", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
 
     /* TODO: bundle gui support needs to be integrated here */
   }

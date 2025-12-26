@@ -6,6 +6,7 @@
 #include "proto/block_engine.pb.h"
 #include "proto/bundle.pb.h"
 #include "proto/packet.pb.h"
+#include "proto/tpu.pb.h"
 #include "../fd_txn_m.h"
 #include "../plugin/fd_plugin.h"
 #include "../../waltz/h2/fd_h2_conn.h"
@@ -791,6 +792,41 @@ fd_bundle_client_visit_pb_packet(
   return true;
 }
 
+/* TPU endpoint packet visitor - same as above but increments TPU-specific metrics */
+static bool
+fd_bundle_tpu_client_visit_pb_packet(
+    pb_istream_t *     istream,
+    pb_field_t const * field,
+    void **            arg
+) {
+  (void)field;
+  fd_bundle_tile_t * ctx = *arg;
+
+  packet_Packet packet = packet_Packet_init_default;
+  if( FD_UNLIKELY( !pb_decode( istream, &packet_Packet_msg, &packet ) ) ) {
+    ctx->metrics.decode_fail_cnt++;
+    FD_LOG_WARNING(( "Protobuf decode of TPU (packet.Packet) failed" ));
+    return false;
+  }
+
+  if( FD_UNLIKELY( packet.data.size == 0 ) ) {
+    FD_LOG_WARNING(( "TPU endpoint delivered an empty packet, ignoring" ));
+    return true;
+  }
+
+  if( FD_UNLIKELY( packet.data.size > FD_TXN_MTU ) ) {
+    FD_LOG_WARNING(( "TPU endpoint delivered an oversize transaction, ignoring" ));
+    return true;
+  }
+
+  uint _ip4; uint ip4 = fd_uint_if( packet.has_meta, fd_cstr_to_ip4_addr( packet.meta.addr, &_ip4 ) ? _ip4 : 0U, 0U );
+  fd_bundle_tile_publish_txn( ctx, packet.data.bytes, packet.data.size, ip4 );
+  ctx->metrics.tpu_packet_received_cnt++;
+  ctx->metrics.tpu_txn_received_cnt++;
+
+  return true;
+}
+
 /* Handle a SubscribePacketsResponse from a SubscribePackets gRPC call. */
 
 static void
@@ -810,6 +846,24 @@ fd_bundle_client_handle_packet_batch(
   }
 
   fd_bundle_client_sample_rx_delay( ctx, &res.header.ts );
+}
+
+/* Handle a SubscribePacketsResponse from the TPU endpoint. */
+static void
+fd_bundle_tpu_client_handle_packet_batch(
+    fd_bundle_tile_t * ctx,
+    pb_istream_t *     istream
+) {
+  block_engine_SubscribePacketsResponse res = block_engine_SubscribePacketsResponse_init_default;
+  res.batch.packets = (pb_callback_t) {
+    .funcs.decode = fd_bundle_tpu_client_visit_pb_packet,
+    .arg          = ctx
+  };
+  if( FD_UNLIKELY( !pb_decode( istream, &block_engine_SubscribePacketsResponse_msg, &res ) ) ) {
+    ctx->metrics.decode_fail_cnt++;
+    FD_LOG_WARNING(( "Protobuf decode of TPU (block_engine.SubscribePacketsResponse) failed" ));
+    return;
+  }
 }
 
 /* Handle a BlockBuilderFeeInfoResponse from a GetBlockBuilderFeeInfo
@@ -1094,6 +1148,55 @@ fd_bundle_client_status( fd_bundle_tile_t const * ctx ) {
 #undef CONNECTING
 #undef CONNECTED
 
+int
+fd_bundle_tpu_client_status( fd_bundle_tile_t const * ctx ) {
+  /* If TPU connection is not enabled, always return disconnected */
+  if( FD_UNLIKELY( !ctx->tpu_conn_enabled ) ) {
+    return FD_PLUGIN_MSG_BLOCK_ENGINE_UPDATE_STATUS_DISCONNECTED;
+  }
+
+  if( FD_UNLIKELY( ( !ctx->tpu_tcp_sock_connected ) |
+                   ( !ctx->tpu_grpc_client        ) ) ) {
+    return FD_PLUGIN_MSG_BLOCK_ENGINE_UPDATE_STATUS_DISCONNECTED;
+  }
+
+  fd_h2_conn_t * conn = fd_grpc_client_h2_conn( ctx->tpu_grpc_client );
+  if( FD_UNLIKELY( !conn ) ) {
+    return FD_PLUGIN_MSG_BLOCK_ENGINE_UPDATE_STATUS_DISCONNECTED;
+  }
+  if( FD_UNLIKELY( conn->flags &
+      ( FD_H2_CONN_FLAGS_DEAD |
+        FD_H2_CONN_FLAGS_SEND_GOAWAY ) ) ) {
+    return FD_PLUGIN_MSG_BLOCK_ENGINE_UPDATE_STATUS_DISCONNECTED;
+  }
+
+  if( FD_UNLIKELY( conn->flags &
+      ( FD_H2_CONN_FLAGS_CLIENT_INITIAL      |
+        FD_H2_CONN_FLAGS_WAIT_SETTINGS_ACK_0 |
+        FD_H2_CONN_FLAGS_WAIT_SETTINGS_0     |
+        FD_H2_CONN_FLAGS_SERVER_INITIAL ) ) ) {
+    return FD_PLUGIN_MSG_BLOCK_ENGINE_UPDATE_STATUS_CONNECTING;
+  }
+
+  if( FD_UNLIKELY( ctx->tpu_auther.state != FD_BUNDLE_AUTH_STATE_DONE_WAIT ) ) {
+    return FD_PLUGIN_MSG_BLOCK_ENGINE_UPDATE_STATUS_CONNECTING;
+  }
+
+  if( FD_UNLIKELY( !ctx->tpu_packet_subscription_live ) ) {
+    return FD_PLUGIN_MSG_BLOCK_ENGINE_UPDATE_STATUS_CONNECTING;
+  }
+
+  if( FD_UNLIKELY( fd_keepalive_is_timeout( ctx->tpu_keepalive, fd_bundle_now() ) ) ) {
+    return FD_PLUGIN_MSG_BLOCK_ENGINE_UPDATE_STATUS_DISCONNECTED;
+  }
+
+  if( FD_UNLIKELY( !fd_grpc_client_is_connected( ctx->tpu_grpc_client ) ) ) {
+    return FD_PLUGIN_MSG_BLOCK_ENGINE_UPDATE_STATUS_CONNECTING;
+  }
+
+  return FD_PLUGIN_MSG_BLOCK_ENGINE_UPDATE_STATUS_CONNECTED;
+}
+
 FD_FN_CONST char const *
 fd_bundle_request_ctx_cstr( ulong request_ctx ) {
   switch( request_ctx ) {
@@ -1111,7 +1214,7 @@ fd_bundle_request_ctx_cstr( ulong request_ctx ) {
     return "SubscribeBlocks";
   case FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo:
     return "SubmitLeaderWindowInfo";
-  case FD_BUNDLE_CLIENT_REQ_TPU_SubscribePackets:
+  case FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU:
     return "SubscribePacketsTPU";
   default:
     return "unknown";
@@ -1318,6 +1421,9 @@ fd_bundle_tpu_client_reset( fd_bundle_tile_t * ctx ) {
   ctx->tpu_packet_subscription_live = 0;
   ctx->tpu_packet_subscription_wait = 0;
 
+  ctx->tpu_config_avail = 0;
+  ctx->tpu_config_wait  = 0;
+
   memset( ctx->tpu_rtt, 0, sizeof(fd_rtt_estimate_t) );
 
 # if FD_HAS_OPENSSL
@@ -1464,6 +1570,28 @@ fd_bundle_tpu_client_drive_io( fd_bundle_tile_t * ctx,
 }
 
 static void
+fd_bundle_tpu_client_request_tpu_configs( fd_bundle_tile_t * ctx ) {
+  if( FD_UNLIKELY( fd_grpc_client_request_is_blocked( ctx->tpu_grpc_client ) ) ) return;
+
+  tpu_GetTpuConfigsRequest req = tpu_GetTpuConfigsRequest_init_default;
+  static char const path[] = "/relayer.Relayer/GetTpuConfigs";
+  fd_grpc_h2_stream_t * request = fd_grpc_client_request_start(
+      ctx->tpu_grpc_client,
+      path, sizeof(path)-1,
+      FD_BUNDLE_CLIENT_REQ_GetTpuConfigs,
+      &tpu_GetTpuConfigsRequest_msg, &req,
+      ctx->tpu_auther.access_token, ctx->tpu_auther.access_token_sz
+  );
+  if( FD_UNLIKELY( !request ) ) return;
+  fd_grpc_client_deadline_set(
+      request,
+      FD_GRPC_DEADLINE_RX_END,
+      fd_log_wallclock() + FD_BUNDLE_CLIENT_REQUEST_TIMEOUT );
+
+  ctx->tpu_config_wait = 1;
+}
+
+static void
 fd_bundle_tpu_client_subscribe_packets( fd_bundle_tile_t * ctx ) {
   if( FD_UNLIKELY( fd_grpc_client_request_is_blocked( ctx->tpu_grpc_client ) ) ) return;
 
@@ -1472,7 +1600,7 @@ fd_bundle_tpu_client_subscribe_packets( fd_bundle_tile_t * ctx ) {
   fd_grpc_h2_stream_t * request = fd_grpc_client_request_start(
       ctx->tpu_grpc_client,
       path, sizeof(path)-1,
-      FD_BUNDLE_CLIENT_REQ_TPU_SubscribePackets,
+      FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU,
       &block_engine_SubscribePacketsRequest_msg, &req,
       ctx->tpu_auther.access_token, ctx->tpu_auther.access_token_sz
   );
@@ -1510,6 +1638,15 @@ fd_bundle_tpu_client_step_reconnect( fd_bundle_tile_t * ctx,
     return 1;
   }
   if( FD_UNLIKELY( ctx->tpu_auther.state!=FD_BUNDLE_AUTH_STATE_DONE_WAIT ) ) return 0;
+
+  /* Request TPU configs (periodically refresh) */
+  int const tpu_config_expired = ( ctx->tpu_config_valid_until - now )<0;
+  if( FD_UNLIKELY( ( ( !ctx->tpu_config_avail ) |
+                     ( tpu_config_expired     ) ) &
+                   ( !ctx->tpu_config_wait      ) ) ) {
+    fd_bundle_tpu_client_request_tpu_configs( ctx );
+    return 1;
+  }
 
   /* Subscribe to packets on TPU connection */
   if( FD_UNLIKELY( !ctx->tpu_packet_subscription_live && !ctx->tpu_packet_subscription_wait ) ) {
@@ -1640,13 +1777,58 @@ fd_bundle_tpu_client_grpc_rx_start( void * app_ctx,
                                     ulong  request_ctx ) {
   fd_bundle_tile_t * ctx = app_ctx;
   switch( request_ctx ) {
-  case FD_BUNDLE_CLIENT_REQ_TPU_SubscribePackets:
+  case FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU:
     ctx->tpu_packet_subscription_live = 1;
     ctx->tpu_packet_subscription_wait = 0;
     break;
   default:
     break;
   }
+}
+
+/* Handle a GetTpuConfigsResponse from the TPU endpoint. */
+static void
+fd_bundle_tpu_client_handle_tpu_configs(
+    fd_bundle_tile_t * ctx,
+    pb_istream_t *     istream
+) {
+  tpu_GetTpuConfigsResponse res = tpu_GetTpuConfigsResponse_init_default;
+  if( FD_UNLIKELY( !pb_decode( istream, &tpu_GetTpuConfigsResponse_msg, &res ) ) ) {
+    ctx->metrics.decode_fail_cnt++;
+    FD_LOG_WARNING(( "Protobuf decode of (relayer.GetTpuConfigsResponse) failed" ));
+    return;
+  }
+
+  /* Parse TPU address from string IP + port */
+  uint tpu_ip4_addr = 0;
+  if( res.has_tpu && res.tpu.ip.size>0 ) {
+    /* Null-terminate the IP string */
+    char ip_str[65];
+    ulong len = fd_ulong_min( res.tpu.ip.size, sizeof(ip_str)-1 );
+    fd_memcpy( ip_str, res.tpu.ip.bytes, len );
+    ip_str[len] = '\0';
+    fd_cstr_to_ip4_addr( ip_str, &tpu_ip4_addr );
+  }
+
+  uint tpu_fwd_ip4_addr = 0;
+  if( res.has_tpu_forward && res.tpu_forward.ip.size>0 ) {
+    char ip_str[65];
+    ulong len = fd_ulong_min( res.tpu_forward.ip.size, sizeof(ip_str)-1 );
+    fd_memcpy( ip_str, res.tpu_forward.ip.bytes, len );
+    ip_str[len] = '\0';
+    fd_cstr_to_ip4_addr( ip_str, &tpu_fwd_ip4_addr );
+  }
+
+  ctx->tpu_config_tpu_ip4_addr     = tpu_ip4_addr;
+  ctx->tpu_config_tpu_port         = res.has_tpu ? (ushort)res.tpu.port : 0;
+  ctx->tpu_config_tpu_fwd_ip4_addr = tpu_fwd_ip4_addr;
+  ctx->tpu_config_tpu_fwd_port     = res.has_tpu_forward ? (ushort)res.tpu_forward.port : 0;
+  ctx->tpu_config_avail            = 1;
+  ctx->tpu_config_valid_until      = fd_bundle_now() + (long)60e9;  /* 60 second TTL */
+
+  FD_LOG_INFO(( "TPU configs: tpu=" FD_IP4_ADDR_FMT ":%u, tpu_fwd=" FD_IP4_ADDR_FMT ":%u",
+                FD_IP4_ADDR_FMT_ARGS( tpu_ip4_addr ), ctx->tpu_config_tpu_port,
+                FD_IP4_ADDR_FMT_ARGS( tpu_fwd_ip4_addr ), ctx->tpu_config_tpu_fwd_port ));
 }
 
 static void
@@ -1658,9 +1840,12 @@ fd_bundle_tpu_client_grpc_rx_msg( void *       app_ctx,
   pb_istream_t istream = pb_istream_from_buffer( protobuf, protobuf_sz );
 
   switch( request_ctx ) {
-  case FD_BUNDLE_CLIENT_REQ_TPU_SubscribePackets:
-    /* Handle packets from TPU endpoint - same as first endpoint */
-    fd_bundle_client_handle_packet_batch( ctx, &istream );
+  case FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU:
+    /* Handle packets from TPU endpoint */
+    fd_bundle_tpu_client_handle_packet_batch( ctx, &istream );
+    break;
+  case FD_BUNDLE_CLIENT_REQ_GetTpuConfigs:
+    fd_bundle_tpu_client_handle_tpu_configs( ctx, &istream );
     break;
   default:
     FD_LOG_WARNING(( "Unexpected RPC response on TPU endpoint (request_ctx=%lu)", request_ctx ));
@@ -1676,9 +1861,12 @@ fd_bundle_tpu_client_grpc_rx_end( void *                app_ctx,
   (void)resp;
 
   switch( request_ctx ) {
-  case FD_BUNDLE_CLIENT_REQ_TPU_SubscribePackets:
+  case FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU:
     ctx->tpu_packet_subscription_wait = 0;
     ctx->tpu_packet_subscription_live = 0;
+    break;
+  case FD_BUNDLE_CLIENT_REQ_GetTpuConfigs:
+    ctx->tpu_config_wait = 0;
     break;
   default:
     break;
@@ -1695,8 +1883,11 @@ fd_bundle_tpu_client_grpc_rx_timeout( void * app_ctx,
   FD_LOG_WARNING(( "TPU endpoint RPC timeout (request_ctx=%lu)", request_ctx ));
 
   switch( request_ctx ) {
-  case FD_BUNDLE_CLIENT_REQ_TPU_SubscribePackets:
+  case FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU:
     ctx->tpu_packet_subscription_wait = 0;
+    break;
+  case FD_BUNDLE_CLIENT_REQ_GetTpuConfigs:
+    ctx->tpu_config_wait = 0;
     break;
   default:
     break;
