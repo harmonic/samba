@@ -309,6 +309,7 @@
 #include "../../disco/tiles.h"
 #include "../../disco/fd_txn_m.h"
 #include "../../disco/bundle/fd_bundle_crank.h"
+#include "../../disco/bundle/fd_bundle_tpu.h"
 #include "../../disco/pack/fd_pack.h"
 #include "../../disco/pack/fd_pack_cost.h"
 #include "../../ballet/sha256/fd_sha256.h"
@@ -351,9 +352,10 @@
    569,424 or more prior slots. */
 #define MAX_SKIPPED_TICKS (1UL+(FD_PACK_MAX_DATA_PER_BLOCK/48UL))
 
-#define IN_KIND_BANK  (0)
-#define IN_KIND_PACK  (1)
-#define IN_KIND_STAKE (2)
+#define IN_KIND_BANK          (0)
+#define IN_KIND_PACK          (1)
+#define IN_KIND_STAKE         (2)
+#define IN_KIND_BUNDLE_GOSSIP (3)
 
 
 typedef struct {
@@ -550,6 +552,9 @@ typedef struct {
      after_frag once the frag has been validated as not overrun. */
   uchar _txns[ USHORT_MAX ];
   fd_microblock_trailer_t _microblock_trailer[ 1 ];
+
+  /* TPU update from bundle tile, set in during_frag for after_frag */
+  fd_bundle_tpu_update_t _tpu_update[ 1 ];
 
   int in_kind[ 64 ];
   fd_poh_in_ctx_t in[ 64 ];
@@ -756,6 +761,19 @@ extern CALLED_FROM_RUST void fd_ext_bank_acquire( void const * bank );
 extern CALLED_FROM_RUST void fd_ext_bank_release( void const * bank );
 extern CALLED_FROM_RUST void fd_ext_poh_signal_leader_change( void * sender );
 extern                  void fd_ext_poh_register_tick( void const * bank, uchar const * hash );
+
+/* fd_ext_tpu_update is called when the bundle tile sends a TPU connection
+   status update.  Agave should update the node's gossip contact info to
+   advertise the new TPU address.
+
+   status: 0 = disconnected, 1 = connected
+   tpu_ip4_addr, tpu_port: TPU address (network byte order for IP)
+   tpu_fwd_ip4_addr, tpu_fwd_port: TPU forwards address */
+extern void fd_ext_tpu_update( int    status,
+                               uint   tpu_ip4_addr,
+                               ushort tpu_port,
+                               uint   tpu_fwd_ip4_addr,
+                               ushort tpu_fwd_port );
 
 /* fd_ext_poh_initialize is called by Agave on startup to
    initialize the PoH tile with some static configuration, and the
@@ -1842,6 +1860,20 @@ during_frag( fd_poh_ctx_t * ctx,
     return;
   }
 
+  /* Bundle gossip messages: copy TPU update for after_frag */
+  if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_BUNDLE_GOSSIP ) ) {
+    if( FD_UNLIKELY( chunk<ctx->in[ in_idx ].chunk0 || chunk>ctx->in[ in_idx ].wmark ) )
+      FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu]", chunk, sz,
+            ctx->in[ in_idx ].chunk0, ctx->in[ in_idx ].wmark ));
+    if( FD_LIKELY( sz==sizeof(fd_bundle_tpu_update_t) ) ) {
+      fd_memcpy( ctx->_tpu_update, fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk ), sz );
+      ctx->skip_frag = 0;
+    } else {
+      ctx->skip_frag = 1;
+    }
+    return;
+  }
+
   ulong slot;
   switch( ctx->in_kind[ in_idx ] ) {
     case IN_KIND_BANK:
@@ -1962,6 +1994,30 @@ after_frag( fd_poh_ctx_t *      ctx,
   (void)tspub;
 
   if( FD_UNLIKELY( ctx->skip_frag ) ) return;
+
+  if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_BUNDLE_GOSSIP ) ) {
+    /* TPU update from bundle tile - forward to Agave via fd_ext callback.
+       The fd_ext_tpu_update function is implemented in Rust and will
+       update the node's gossip contact info. */
+    fd_bundle_tpu_update_t const * update = ctx->_tpu_update;
+    if( update->status==FD_BUNDLE_TPU_UPDATE_CONNECTED ) {
+      FD_LOG_INFO(( "TPU connected: advertising remote TPU %u.%u.%u.%u:%u, forwards %u.%u.%u.%u:%u",
+                    (update->tpu_ip4_addr    ) & 0xFFU, (update->tpu_ip4_addr>>8    ) & 0xFFU,
+                    (update->tpu_ip4_addr>>16) & 0xFFU, (update->tpu_ip4_addr>>24   ) & 0xFFU,
+                    update->tpu_port,
+                    (update->tpu_fwd_ip4_addr    ) & 0xFFU, (update->tpu_fwd_ip4_addr>>8    ) & 0xFFU,
+                    (update->tpu_fwd_ip4_addr>>16) & 0xFFU, (update->tpu_fwd_ip4_addr>>24   ) & 0xFFU,
+                    update->tpu_fwd_port ));
+    } else {
+      FD_LOG_INFO(( "TPU disconnected: reverted to local TPU" ));
+    }
+    fd_ext_tpu_update( update->status,
+                       update->tpu_ip4_addr,
+                       update->tpu_port,
+                       update->tpu_fwd_ip4_addr,
+                       update->tpu_fwd_port );
+    return;
+  }
 
   if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_STAKE ) ) {
     fd_multi_epoch_leaders_stake_msg_fini( ctx->mleaders );
@@ -2367,6 +2423,8 @@ unprivileged_init( fd_topo_t *      topo,
       ctx->in_kind[ i ] = IN_KIND_PACK;
     } else if( !strcmp( link->name, "bank_poh"  ) ) {
       ctx->in_kind[ i ] = IN_KIND_BANK;
+    } else if( !strcmp( link->name, "bundle_gossi" ) ) {
+      ctx->in_kind[ i ] = IN_KIND_BUNDLE_GOSSIP;
     } else {
       FD_LOG_ERR(( "unexpected input link name %s", link->name ));
     }
