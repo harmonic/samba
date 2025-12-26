@@ -41,6 +41,10 @@ struct fd_bundle_metrics {
   ulong transport_fail_cnt;
   ulong missing_builder_info_fail_cnt;
 
+  /* TPU endpoint metrics */
+  ulong tpu_packet_received_cnt;
+  ulong tpu_txn_received_cnt;
+
   fd_histf_t msg_rx_delay[1];
 };
 
@@ -155,6 +159,15 @@ struct fd_bundle_tile {
   uchar tpu_packet_subscription_live : 1;  /* Want to subscribe to a stream? */
   uchar tpu_packet_subscription_wait : 1;  /* Request already in-flight? */
 
+  /* Cached TPU configs from GetTpuConfigs RPC */
+  uchar  tpu_config_avail : 1;  /* TPU config available? (potentially stale) */
+  uchar  tpu_config_wait  : 1;  /* Request already in-flight? */
+  long   tpu_config_valid_until;
+  uint   tpu_config_tpu_ip4_addr;       /* network byte order */
+  ushort tpu_config_tpu_port;           /* host byte order */
+  uint   tpu_config_tpu_fwd_ip4_addr;   /* network byte order */
+  ushort tpu_config_tpu_fwd_port;       /* host byte order */
+
   /* Error backoff for TPU endpoint */
   uint  tpu_backoff_iter;
   long  tpu_backoff_until;
@@ -174,6 +187,7 @@ struct fd_bundle_tile {
   fd_stem_context_t * stem;
   fd_bundle_out_ctx_t verify_out;
   fd_bundle_out_ctx_t plugin_out;
+  fd_bundle_out_ctx_t gossip_out;  /* TPU updates to gossip (Franken: Agave, full FD: gossip tile) */
 
   /* 
      need to read became_leader msgs for leader window notifications
@@ -192,6 +206,10 @@ struct fd_bundle_tile {
   uchar bundle_status_plugin;  /* last 'plugin' update written */
   uchar bundle_status_logged;
   long  last_bundle_status_log_nanos;
+
+  /* TPU status for gossip updates */
+  uchar tpu_status_recent;  /* most recently observed TPU status */
+  uchar tpu_status_gossip;  /* last TPU status sent to gossip link */
 
   /* ========== Harmonic block mode  ========== */
 
@@ -227,8 +245,9 @@ typedef struct fd_bundle_tile fd_bundle_tile_t;
 /* Leader window info submission */
 #define FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo             8
 
-/* TPU endpoint subscribePackets request context ID */
+/* TPU endpoint request context IDs */
 #define FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU                9
+#define FD_BUNDLE_CLIENT_REQ_GetTpuConfigs                      10
 
 FD_PROTOTYPES_BEGIN
 
@@ -340,6 +359,13 @@ fd_bundle_client_grpc_rx_timeout(
 
 int
 fd_bundle_client_status( fd_bundle_tile_t const * ctx );
+
+/* fd_bundle_tpu_client_status provides a "check engine light" for the
+   TPU connection.  Returns the same status codes as fd_bundle_client_status.
+   If TPU connection is not enabled, always returns DISCONNECTED. */
+
+int
+fd_bundle_tpu_client_status( fd_bundle_tile_t const * ctx );
 
 /* fd_bundle_request_ctx_cstr returns the gRPC method name for a
    FD_BUNDLE_CLIENT_REQ_* ID.  Returns "unknown" the ID is not

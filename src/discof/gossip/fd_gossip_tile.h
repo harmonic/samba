@@ -43,6 +43,12 @@ struct fd_gossip_tile_ctx {
   ushort            net_id;
   fd_ip4_udp_hdrs_t net_out_hdr[ 1 ];
   fd_rng_t          rng[ 1 ];
+
+  /* Local TPU addresses - saved at startup for reverting when bundle disconnects */
+  fd_ip4_port_t local_tpu_addr;
+  fd_ip4_port_t local_tpu_quic_addr;
+  fd_ip4_port_t local_tpu_fwd_addr;
+  fd_ip4_port_t local_tpu_fwd_quic_addr;
 };
 
 typedef struct fd_gossip_tile_ctx fd_gossip_tile_ctx_t;

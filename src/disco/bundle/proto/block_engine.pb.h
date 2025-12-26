@@ -157,10 +157,10 @@ extern const pb_msgdesc_t block_engine_SubmitLeaderWindowInfoResponse_msg;
 #define BLOCK_ENGINE_BLOCK_ENGINE_PB_H_MAX_SIZE  block_engine_BlockBuilderFeeInfoResponse_size
 #define block_engine_BlockBuilderFeeInfoRequest_size 0
 #define block_engine_BlockBuilderFeeInfoResponse_size 57
+#define block_engine_SubmitLeaderWindowInfoRequest_size 35
+#define block_engine_SubmitLeaderWindowInfoResponse_size 0
 #define block_engine_SubscribeBundlesRequest_size 0
 #define block_engine_SubscribePacketsRequest_size 0
-#define block_engine_SubmitLeaderWindowInfoRequest_size (32 + google_protobuf_Timestamp_size)
-#define block_engine_SubmitLeaderWindowInfoResponse_size 0
 #if defined(packet_PacketBatch_size)
 #define block_engine_SubscribePacketsResponse_size (32 + packet_PacketBatch_size)
 #endif
