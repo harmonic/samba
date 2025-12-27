@@ -62,6 +62,8 @@ metrics_write( fd_bundle_tile_t * ctx ) {
   FD_MCNT_SET( BUNDLE, ERRORS_NO_FEE_INFO,       ctx->metrics.missing_builder_info_fail_cnt );
   FD_MCNT_SET( BUNDLE, TPU_PACKET_RECEIVED,      ctx->metrics.tpu_packet_received_cnt   );
   FD_MCNT_SET( BUNDLE, TPU_TRANSACTION_RECEIVED, ctx->metrics.tpu_txn_received_cnt      );
+  FD_MCNT_SET( BUNDLE, BLOCK_RECEIVED,           ctx->harmonic_block_received_cnt       );
+  FD_MCNT_SET( BUNDLE, BLOCK_TRANSACTION_RECEIVED, ctx->harmonic_block_txn_received_cnt );
 
   FD_MGAUGE_SET( BUNDLE, RTT_SAMPLE,   (ulong)ctx->rtt->latest_rtt   );
   FD_MGAUGE_SET( BUNDLE, RTT_SMOOTHED, (ulong)ctx->rtt->smoothed_rtt );
