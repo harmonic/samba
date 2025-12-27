@@ -208,6 +208,8 @@
 | <span class="metrics-name">bundle_&#8203;tpu_&#8203;connected</span> | gauge | 1 if connected to the TPU endpoint, 0 if not |
 | <span class="metrics-name">bundle_&#8203;tpu_&#8203;packet_&#8203;received</span> | counter | Total count of packets received from TPU endpoint |
 | <span class="metrics-name">bundle_&#8203;tpu_&#8203;transaction_&#8203;received</span> | counter | Total count of transactions received from TPU endpoint |
+| <span class="metrics-name">bundle_&#8203;block_&#8203;received</span> | counter | Total count of blocks received |
+| <span class="metrics-name">bundle_&#8203;block_&#8203;transaction_&#8203;received</span> | counter | Total count of transactions received from blocks |
 | <span class="metrics-name">bundle_&#8203;rtt_&#8203;sample</span> | gauge | Latest RTT sample at scrape time (nanoseconds) |
 | <span class="metrics-name">bundle_&#8203;rtt_&#8203;smoothed</span> | gauge | RTT moving average (nanoseconds) |
 | <span class="metrics-name">bundle_&#8203;rtt_&#8203;var</span> | gauge | RTT variance (nanoseconds) |

@@ -390,6 +390,8 @@ metric introduced.
     <gauge name="TpuConnected" summary="1 if connected to the TPU endpoint, 0 if not" />
     <counter name="TpuPacketReceived" summary="Total count of packets received from TPU endpoint" />
     <counter name="TpuTransactionReceived" summary="Total count of transactions received from TPU endpoint" />
+    <counter name="BlockReceived" summary="Total count of blocks received" />
+    <counter name="BlockTransactionReceived" summary="Total count of transactions received from blocks" />
     <gauge name="RttSample" summary="Latest RTT sample at scrape time (nanoseconds)" />
     <gauge name="RttSmoothed" summary="RTT moving average (nanoseconds)" />
     <gauge name="RttVar" summary="RTT variance (nanoseconds)" />
