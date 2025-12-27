@@ -12,6 +12,7 @@
 #define FD_TXN_M_TPU_SOURCE_BUNDLE (4UL)
 #define FD_TXN_M_TPU_SOURCE_SEND   (5UL)
 #define FD_TXN_M_TPU_SOURCE_BLOCK  (6UL)
+#define FD_TXN_M_TPU_SOURCE_HTPU   (7UL)
 
 struct fd_txn_m {
   /* The computed slot that this transaction is referencing, aka. the

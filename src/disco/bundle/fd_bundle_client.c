@@ -575,7 +575,8 @@ fd_bundle_tile_publish_txn(
     fd_bundle_tile_t * ctx,
     void const *       txn,
     ulong              txn_sz,  /* <=FD_TXN_MTU */
-    uint               source_ipv4
+    uint               source_ipv4,
+    uchar              source_tpu
 ) {
   fd_txn_m_t * txnm = fd_chunk_to_laddr( ctx->verify_out.mem, ctx->verify_out.chunk );
   *txnm = (fd_txn_m_t) {
@@ -583,7 +584,7 @@ fd_bundle_tile_publish_txn(
     .payload_sz     = (ushort)txn_sz,
     .txn_t_sz       = 0U,
     .source_ipv4    = source_ipv4,
-    .source_tpu     = FD_TXN_M_TPU_SOURCE_BUNDLE,
+    .source_tpu     = source_tpu,
     .block_engine   = {
       .bundle_id         = 0UL,
       .bundle_txn_cnt    = 1UL,
@@ -786,7 +787,7 @@ fd_bundle_client_visit_pb_packet(
 
 
   uint _ip4; uint ip4 = fd_uint_if( packet.has_meta, fd_cstr_to_ip4_addr( packet.meta.addr, &_ip4 ) ? _ip4 : 0U, 0U );
-  fd_bundle_tile_publish_txn( ctx, packet.data.bytes, packet.data.size, ip4 );
+  fd_bundle_tile_publish_txn( ctx, packet.data.bytes, packet.data.size, ip4, FD_TXN_M_TPU_SOURCE_BUNDLE );
   ctx->metrics.packet_received_cnt++;
 
   return true;
@@ -820,7 +821,7 @@ fd_bundle_tpu_client_visit_pb_packet(
   }
 
   uint _ip4; uint ip4 = fd_uint_if( packet.has_meta, fd_cstr_to_ip4_addr( packet.meta.addr, &_ip4 ) ? _ip4 : 0U, 0U );
-  fd_bundle_tile_publish_txn( ctx, packet.data.bytes, packet.data.size, ip4 );
+  fd_bundle_tile_publish_txn( ctx, packet.data.bytes, packet.data.size, ip4, FD_TXN_M_TPU_SOURCE_HTPU );
   ctx->metrics.tpu_packet_received_cnt++;
   ctx->metrics.tpu_txn_received_cnt++;
 
