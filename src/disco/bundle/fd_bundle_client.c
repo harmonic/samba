@@ -848,22 +848,25 @@ fd_bundle_client_handle_packet_batch(
   fd_bundle_client_sample_rx_delay( ctx, &res.header.ts );
 }
 
-/* Handle a SubscribePacketsResponse from the TPU endpoint. */
+/* Handle a SubscribePacketsResponse from the TPU endpoint.
+   Note: The relayer uses tpu.SubscribePacketsResponse which has a oneof msg
+   containing either a heartbeat or a packet batch. */
 static void
 fd_bundle_tpu_client_handle_packet_batch(
     fd_bundle_tile_t * ctx,
     pb_istream_t *     istream
 ) {
-  block_engine_SubscribePacketsResponse res = block_engine_SubscribePacketsResponse_init_default;
-  res.batch.packets = (pb_callback_t) {
+  tpu_SubscribePacketsResponse res = tpu_SubscribePacketsResponse_init_default;
+  res.msg.batch.packets = (pb_callback_t) {
     .funcs.decode = fd_bundle_tpu_client_visit_pb_packet,
     .arg          = ctx
   };
-  if( FD_UNLIKELY( !pb_decode( istream, &block_engine_SubscribePacketsResponse_msg, &res ) ) ) {
+  if( FD_UNLIKELY( !pb_decode( istream, &tpu_SubscribePacketsResponse_msg, &res ) ) ) {
     ctx->metrics.decode_fail_cnt++;
-    FD_LOG_WARNING(( "Protobuf decode of TPU (block_engine.SubscribePacketsResponse) failed" ));
+    FD_LOG_WARNING(( "Protobuf decode of TPU (tpu.SubscribePacketsResponse) failed" ));
     return;
   }
+  /* If it was a heartbeat message, nothing else to do (packets callback not invoked) */
 }
 
 /* Handle a BlockBuilderFeeInfoResponse from a GetBlockBuilderFeeInfo
@@ -1595,13 +1598,13 @@ static void
 fd_bundle_tpu_client_subscribe_packets( fd_bundle_tile_t * ctx ) {
   if( FD_UNLIKELY( fd_grpc_client_request_is_blocked( ctx->tpu_grpc_client ) ) ) return;
 
-  block_engine_SubscribePacketsRequest req = block_engine_SubscribePacketsRequest_init_default;
+  tpu_SubscribePacketsRequest req = tpu_SubscribePacketsRequest_init_default;
   static char const path[] = "/relayer.Relayer/SubscribePackets";
   fd_grpc_h2_stream_t * request = fd_grpc_client_request_start(
       ctx->tpu_grpc_client,
       path, sizeof(path)-1,
       FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU,
-      &block_engine_SubscribePacketsRequest_msg, &req,
+      &tpu_SubscribePacketsRequest_msg, &req,
       ctx->tpu_auther.access_token, ctx->tpu_auther.access_token_sz
   );
   if( FD_UNLIKELY( !request ) ) return;
