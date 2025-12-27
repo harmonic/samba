@@ -211,6 +211,12 @@ typedef struct {
      for, if we are currently packing for a slot.*/
   long slot_end_ns;
 
+  /* Buffer time added to slot_end_ns when broadcasting harmonic blocks.
+     Set to 200ms when actively broadcasting, 0 otherwise.
+     Almost all blocks will not use this extra time; this is just here to
+     accommodate the worst case scenario. */
+  long slot_end_ns_buffer;
+
   /* pacer and ticks_per_ns are used for pacing CUs through the slot,
      i.e. deciding when to schedule a microblock given the number of CUs
      that have been consumed so far.  pacer is an opaque pacing object,
@@ -320,6 +326,7 @@ typedef struct {
   int  harmonic; /* If set, processes harmonic blocks */
 
 #define FD_PACK_HARMONIC_MARGIN_NS (50000000L) /* 50ms before slot end */
+#define FD_PACK_HARMONIC_EXTENSION_NS (200000000L) /* 200ms extension when broadcasting harmonic block */
 
   /* Used between during_frag and after_frag */
   ulong pending_rebate_sz;
@@ -589,7 +596,7 @@ after_credit( fd_pack_ctx_t *     ctx,
 
   /* If we time out on our slot, then stop being leader.  This can only
      happen in the first after_credit after a housekeeping. */
-  if( FD_UNLIKELY( ctx->approx_wallclock_ns>=ctx->slot_end_ns && ctx->leader_slot!=ULONG_MAX ) ) {
+  if( FD_UNLIKELY( ctx->approx_wallclock_ns>=(ctx->slot_end_ns+ctx->slot_end_ns_buffer) && ctx->leader_slot!=ULONG_MAX ) ) {
     *charge_busy = 1;
 
     fd_done_packing_t * done_packing = fd_chunk_to_laddr( ctx->poh_out_mem, ctx->poh_out_chunk );
@@ -738,6 +745,26 @@ after_credit( fd_pack_ctx_t *     ctx,
      The tile just needs to update the decision state. */
   if( FD_UNLIKELY( ctx->harmonic && ctx->leader_slot!=ULONG_MAX ) ) {
     fd_pack_harmonic_state_update( ctx->pack, ctx->approx_wallclock_ns, ctx->harmonic_threshold_ns );
+    
+    /* Manage slot_end_ns_buffer based on harmonic state:
+       - While harmonic state is UNDECIDED: buffer = 0 (don't extend)
+       - While broadcasting harmonic block (HARMONIC mode): buffer = 200ms
+       - Once done or decision changes to SPRINT/FAILED: buffer = 0 */
+    int harmonic_decision = fd_pack_harmonic_decision( ctx->pack );
+    
+    if( FD_LIKELY( harmonic_decision==HARMONIC_MODE_HARMONIC ) ) {
+      /* Currently broadcasting harmonic block - extend slot by 200ms */
+      if( FD_UNLIKELY( ctx->slot_end_ns_buffer==0L ) ) {
+        ctx->slot_end_ns_buffer = FD_PACK_HARMONIC_EXTENSION_NS;
+        FD_LOG_INFO(( "HARMONIC: extending slot end (slot=%lu, decision=%d)", ctx->leader_slot, harmonic_decision ));
+      }
+    } else {
+      /* Not broadcasting - remove extension */
+      if( FD_UNLIKELY( ctx->slot_end_ns_buffer!=0L ) ) {
+        ctx->slot_end_ns_buffer = 0L;
+        FD_LOG_INFO(( "HARMONIC: removing slot extension (slot=%lu, decision=%d)", ctx->leader_slot, harmonic_decision ));
+      }
+    }
   }
 
   /* Try to schedule the next microblock. */
@@ -764,6 +791,9 @@ after_credit( fd_pack_ctx_t *     ctx,
                                       | fd_int_if( i<pacing_bank_cnt, FD_PACK_SCHEDULE_TXN,    0 );
         break;
       case FD_PACK_STRATEGY_BUNDLE:
+        /* cavey: adding the buffer here is unnecessary as this strategy
+           will not be used during harmonic mode, and the buffer does not
+           exist when not in harmonic mode (re: slot_end_ns_buffer). */
         flags = FD_PACK_SCHEDULE_VOTE | FD_PACK_SCHEDULE_BUNDLE
                                       | fd_int_if( ctx->slot_end_ns - ctx->approx_wallclock_ns<50000000L, FD_PACK_SCHEDULE_TXN,  0 );
         break;
@@ -1148,6 +1178,7 @@ after_frag( fd_pack_ctx_t *     ctx,
     update_metric_state( ctx, fd_tickcount(), FD_PACK_METRIC_STATE_LEADER, 1 );
 
     ctx->slot_end_ns = ctx->_became_leader->slot_end_ns;
+    ctx->slot_end_ns_buffer = 0L;
 
     /* Reset harmonic state for new slot.
        Note: pack's acct_in_use is cleared by fd_pack_end_block, so we don't
