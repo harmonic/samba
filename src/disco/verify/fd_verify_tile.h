@@ -29,6 +29,9 @@ typedef struct {
   int   bundle_failed;
   ulong bundle_id;
 
+  int   block_failed;
+  ulong block_slot;
+
   ulong round_robin_idx;
   ulong round_robin_cnt;
 
@@ -53,6 +56,7 @@ typedef struct {
     ulong verify_fail_cnt;
     ulong dedup_fail_cnt;
     ulong bundle_peer_fail_cnt;
+    ulong block_peer_fail_cnt;
     ulong gossiped_votes_cnt;
   } metrics;
 } fd_verify_ctx_t;
