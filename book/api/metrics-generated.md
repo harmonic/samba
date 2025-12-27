@@ -224,6 +224,7 @@
 | Metric | Type | Description |
 |--------|------|-------------|
 | <span class="metrics-name">verify_&#8203;transaction_&#8203;bundle_&#8203;peer_&#8203;failure</span> | counter | Count of transactions that failed to verify because a peer transaction in the bundle failed |
+| <span class="metrics-name">verify_&#8203;transaction_&#8203;block_&#8203;peer_&#8203;failure</span> | counter | Count of transactions that failed to verify because a peer transaction in the block failed |
 | <span class="metrics-name">verify_&#8203;transaction_&#8203;parse_&#8203;failure</span> | counter | Count of transactions that failed to parse |
 | <span class="metrics-name">verify_&#8203;transaction_&#8203;dedup_&#8203;failure</span> | counter | Count of transactions that failed to deduplicate in the verify stage |
 | <span class="metrics-name">verify_&#8203;transaction_&#8203;verify_&#8203;failure</span> | counter | Count of transactions that failed to deduplicate in the verify stage |
