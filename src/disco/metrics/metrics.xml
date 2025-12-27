@@ -402,6 +402,7 @@ metric introduced.
 
 <tile name="verify">
     <counter name="TransactionBundlePeerFailure" summary="Count of transactions that failed to verify because a peer transaction in the bundle failed" />
+    <counter name="TransactionBlockPeerFailure" summary="Count of transactions that failed to verify because a peer transaction in the block failed" />
     <counter name="TransactionParseFailure" summary="Count of transactions that failed to parse" />
     <counter name="TransactionDedupFailure" summary="Count of transactions that failed to deduplicate in the verify stage" />
     <counter name="TransactionVerifyFailure" summary="Count of transactions that failed to deduplicate in the verify stage" />
