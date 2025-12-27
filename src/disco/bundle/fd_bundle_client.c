@@ -1411,6 +1411,23 @@ fd_bundle_client_handle_block_batch(
 
 /* ========== TPU endpoint connection implementation ========== */
 
+static void
+fd_bundle_tpu_client_backoff( fd_bundle_tile_t * ctx,
+                              long               now ) {
+  uint iter = ctx->tpu_backoff_iter;
+  if( now < ctx->tpu_backoff_reset ) iter = 0U;
+  iter++;
+
+  /* FIXME proper backoff */
+  long wait_ns = (long)2e9;
+  wait_ns = (long)( fd_rng_ulong( ctx->rng ) & ( (1UL<<fd_ulong_find_msb_w_default( (ulong)wait_ns, 0 ))-1UL ) );
+
+  ctx->tpu_backoff_until = now +   wait_ns;
+  ctx->tpu_backoff_reset = now + 2*wait_ns;
+
+  ctx->tpu_backoff_iter = iter;
+}
+
 void
 fd_bundle_tpu_client_reset( fd_bundle_tile_t * ctx ) {
   if( FD_UNLIKELY( ctx->tpu_tcp_sock >= 0 ) ) {
@@ -1438,17 +1455,7 @@ fd_bundle_tpu_client_reset( fd_bundle_tile_t * ctx ) {
 # endif
 
   /* Backoff for TPU connection */
-  long now = fd_bundle_now();
-  uint iter = ctx->tpu_backoff_iter;
-  if( now < ctx->tpu_backoff_reset ) iter = 0U;
-  iter++;
-
-  long backoff_dur = (long)500e6 * (long)fd_ulong_min( 1UL<<iter, 60UL );
-  backoff_dur += (long)( fd_rng_ulong( ctx->rng ) % (ulong)backoff_dur );
-
-  ctx->tpu_backoff_iter  = iter;
-  ctx->tpu_backoff_until = now + backoff_dur;
-  ctx->tpu_backoff_reset = now + (long)120e9;
+  fd_bundle_tpu_client_backoff( ctx, fd_bundle_now() );
 
   fd_bundle_auther_reset( &ctx->tpu_auther );
   if( ctx->tpu_grpc_client ) {
@@ -1868,6 +1875,18 @@ case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthTokens:
 }
 
 static void
+fd_bundle_tpu_client_request_failed( fd_bundle_tile_t * ctx,
+                                     ulong              request_ctx ) {
+  fd_bundle_tpu_client_backoff( ctx, fd_bundle_now() );
+  switch( request_ctx ) {
+  case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthChallenge:
+  case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthTokens:
+    fd_bundle_auther_handle_request_fail( &ctx->tpu_auther );
+    break;
+  }
+}
+
+static void
 fd_bundle_tpu_client_grpc_rx_end( void *                app_ctx,
                                   ulong                 request_ctx,
                                   fd_grpc_resp_hdrs_t * resp ) {
@@ -1875,14 +1894,7 @@ fd_bundle_tpu_client_grpc_rx_end( void *                app_ctx,
   /* Handle HTTP-level failures */
   if( FD_UNLIKELY( resp->h2_status!=200 ) ) {
     FD_LOG_WARNING(( "TPU endpoint gRPC request failed (HTTP status %u)", resp->h2_status ));
-    switch( request_ctx ) {
-    case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthChallenge:
-    case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthTokens:
-      fd_bundle_auther_handle_request_fail( &ctx->tpu_auther );
-      break;
-    default:
-      break;
-    }
+    fd_bundle_tpu_client_request_failed( ctx, request_ctx );
     return;
   }
 
@@ -1890,14 +1902,7 @@ fd_bundle_tpu_client_grpc_rx_end( void *                app_ctx,
   if( FD_UNLIKELY( resp->grpc_status!=FD_GRPC_STATUS_OK ) ) {
     FD_LOG_INFO(( "TPU endpoint gRPC request failed (gRPC status %u-%s)",
                   resp->grpc_status, fd_grpc_status_cstr( resp->grpc_status ) ));
-    switch( request_ctx ) {
-    case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthChallenge:
-    case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthTokens:
-      fd_bundle_auther_handle_request_fail( &ctx->tpu_auther );
-      break;
-    default:
-      break;
-    }
+    fd_bundle_tpu_client_request_failed( ctx, request_ctx );
     if( resp->grpc_status==FD_GRPC_STATUS_UNAUTHENTICATED ||
         resp->grpc_status==FD_GRPC_STATUS_PERMISSION_DENIED ) {
       fd_bundle_auther_reset( &ctx->tpu_auther );
