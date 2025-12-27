@@ -1687,6 +1687,10 @@ fd_gui_printf_slot_transactions_request( fd_gui_t * gui,
                   jsonp_string( gui->http, NULL, "send");
                   break;
                 }
+                case FD_TXN_M_TPU_SOURCE_HTPU  : {
+                  jsonp_string( gui->http, NULL, "harmonic_tpu");
+                  break;
+                }
                 default: FD_LOG_ERR(("unknown tpu"));
               }
             }
