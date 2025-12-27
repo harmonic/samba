@@ -387,14 +387,15 @@ void fd_pack_get_pending_smallest( fd_pack_t * pack, fd_pack_smallest_t * opt_pe
 #define FD_PACK_INSERT_REJECT_INVALID_NONCE         (-12)
 #define FD_PACK_INSERT_REJECT_BUNDLE_BLACKLIST      (-13)
 #define FD_PACK_INSERT_REJECT_NONCE_CONFLICT        (-14)
+#define FD_PACK_INSERT_REJECT_BLOCK_FAILED          (-15)
 
 /* The FD_PACK_INSERT_{ACCEPT, REJECT}_* values defined above are in the
    range [-FD_PACK_INSERT_RETVAL_OFF,
    -FD_PACK_INSERT_RETVAL_OFF+FD_PACK_INSERT_RETVAL_CNT ) */
-#define FD_PACK_INSERT_RETVAL_OFF 14
-#define FD_PACK_INSERT_RETVAL_CNT 21
+#define FD_PACK_INSERT_RETVAL_OFF 15
+#define FD_PACK_INSERT_RETVAL_CNT 22
 
-FD_STATIC_ASSERT( FD_PACK_INSERT_REJECT_NONCE_CONFLICT>=-FD_PACK_INSERT_RETVAL_OFF, pack_retval );
+FD_STATIC_ASSERT( FD_PACK_INSERT_REJECT_BLOCK_FAILED>=-FD_PACK_INSERT_RETVAL_OFF, pack_retval );
 FD_STATIC_ASSERT( FD_PACK_INSERT_ACCEPT_NONCE_NONVOTE_REPLACE<FD_PACK_INSERT_RETVAL_CNT-FD_PACK_INSERT_RETVAL_OFF, pack_retval );
 
 /* fd_pack_insert_txn_{init,fini,cancel} execute the process of
@@ -702,42 +703,43 @@ fd_pack_complete_harmonic_txn( fd_pack_t * pack,
    Clears pending transactions and resets decision state. */
 void fd_pack_harmonic_reset( fd_pack_t * pack );
 
-/* fd_pack_harmonic_insert: Attempts to insert a block transaction into
-   the pending_blocks treap.  Returns 1 on success, 0 if pool is full.
-   Transaction data is copied directly into the treap pool (single copy).
-   Uses FIFO ordering via block_txn_idx encoding.
-   
-   block_txn_expected is the total number of transactions expected in this
-   block (used to determine when the block is complete).
-   
-   If block_slot changes, resets harmonic state for the new block. */
-int fd_pack_harmonic_insert( fd_pack_t      * pack,
-                             fd_txn_t const * txn,
-                             uchar const    * payload,
-                             ulong            payload_sz,
-                             uchar const    * alt_accts,
-                             uint             source_ipv4,
-                             uchar            source_tpu,
-                             long             arrival_time_nanos,
-                             ulong            block_slot,
-                             ulong            block_txn_expected );
+/* fd_pack_harmonic_insert_fini: Inserts an already-populated block
+   transaction into the pending_blocks treap.  Takes an fd_txn_e_t from
+   fd_pack_insert_txn_init.  Returns 1 on success, negative
+   FD_PACK_INSERT_REJECT_* code on validation failure.  Uses FIFO
+   ordering via block_txn_idx encoding.
+
+   If block_slot changes, resets harmonic state for the new block.
+
+   On any validation failure, the entire block is failed: all pending
+   block transactions are cleared, harmonic mode transitions to FAILED,
+   and subsequent insert attempts for this slot return immediately. */
+int fd_pack_harmonic_insert_fini( fd_pack_t  * pack,
+                                  fd_txn_e_t * txne,
+                                  ulong        block_slot,
+                                  ulong        block_txn_expected );
 
 /* Harmonic decision state values */
 #define HARMONIC_MODE_UNDECIDED  0
 #define HARMONIC_MODE_HARMONIC   1
 #define HARMONIC_MODE_SPRINT    -1
+#define HARMONIC_MODE_FAILED    -2  /* Block validation failed, skip to sprint */
 
 /* fd_pack_harmonic_state_update: Updates harmonic state machine.
    Called each scheduling iteration to transition between states:
    - UNDECIDED -> HARMONIC: when block transactions arrive
    - UNDECIDED -> SPRINT: when threshold time reached without block txns
-   - HARMONIC -> SPRINT: when all expected block txns have completed */
+   - HARMONIC -> SPRINT: when all expected block txns have completed
+   Note: FAILED state is entered via fd_pack_harmonic_insert_fini when
+   any block transaction fails validation.  FAILED is terminal for the
+   slot and behaves like SPRINT. */
 void fd_pack_harmonic_state_update( fd_pack_t * pack,
                                     long        approx_wallclock_ns,
                                     long        harmonic_threshold_ns );
 
 /* fd_pack_harmonic_decision: Returns the decision state:
-   HARMONIC_MODE_UNDECIDED, HARMONIC_MODE_HARMONIC, or HARMONIC_MODE_SPRINT */
+   HARMONIC_MODE_UNDECIDED, HARMONIC_MODE_HARMONIC, HARMONIC_MODE_SPRINT,
+   or HARMONIC_MODE_FAILED */
 FD_FN_PURE int fd_pack_harmonic_decision( fd_pack_t const * pack );
 
 /* fd_pack_harmonic_set_decision: Sets the decision state. */
