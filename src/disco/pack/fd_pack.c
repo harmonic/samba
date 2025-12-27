@@ -2939,11 +2939,16 @@ fd_pack_harmonic_state_update( fd_pack_t * pack,
       break;
     }
     case HARMONIC_MODE_HARMONIC: {
-      /* Check if harmonic block is complete.
-         Complete when all expected transactions have finished execution. */
+      /* Check if harmonic block scheduling is complete.
+         Complete when all expected transactions have been scheduled (not necessarily executed).
+         We've scheduled all when pending_blocks is empty and inflight+completed >= expected. */
+      ulong pending_cnt = treap_ele_cnt( pack->pending_blocks );
+      ulong scheduled_cnt = pack->harmonic_inflight + pack->harmonic_block_txn_completed;
+      
       if( pack->harmonic_block_txn_expected > 0UL &&
-          pack->harmonic_block_txn_completed >= pack->harmonic_block_txn_expected ) {
-        /* Harmonic block complete - switch to sprint mode to dump votes */
+          pending_cnt == 0UL &&
+          scheduled_cnt >= pack->harmonic_block_txn_expected ) {
+        /* All harmonic block transactions scheduled - switch to sprint mode to dump votes */
         pack->harmonic_decision = HARMONIC_MODE_SPRINT;
       }
       break;
