@@ -129,7 +129,15 @@ typedef struct {
 typedef struct {
   fd_pack_t *  pack;
   fd_txn_e_t * cur_spot;
-  int          is_bundle; /* is the current transaction a bundle */
+
+#define TXN_TYPE_NORMAL  0
+#define TXN_TYPE_BUNDLE  1
+#define TXN_TYPE_BLOCK   2
+  int          txn_type;
+
+  /* Block transaction info (valid when txn_type==TXN_TYPE_BLOCK) */
+  ulong        block_slot;
+  ulong        block_txn_expected;
 
   uchar executed_txn_sig[ 64UL ];
 
@@ -457,7 +465,7 @@ before_credit( fd_pack_ctx_t *     ctx,
                int *               charge_busy ) {
   (void)stem;
 
-  if( FD_UNLIKELY( (ctx->cur_spot!=NULL) & !ctx->is_bundle ) ) {
+  if( FD_UNLIKELY( (ctx->cur_spot!=NULL) & (ctx->txn_type==TXN_TYPE_NORMAL) ) ) {
     *charge_busy = 1;
 
     /* If we were overrun while processing a frag from an in, then
@@ -952,42 +960,26 @@ during_frag( fd_pack_ctx_t * ctx,
 
     /* Handle block transactions (harmonic block mode) */
     int is_block = source_tpu == FD_TXN_M_TPU_SOURCE_BLOCK;
-    if( FD_UNLIKELY( ctx->harmonic && is_block) ) {
-      ulong block_slot         = txnm->block_engine.block_slot;
-      ulong block_txn_expected = txnm->block_engine.bundle_txn_cnt;
+    if( FD_UNLIKELY( ctx->harmonic && is_block ) ) {
+      ctx->txn_type = TXN_TYPE_BLOCK;
+      ctx->block_slot         = txnm->block_engine.block_slot;
+      ctx->block_txn_expected = txnm->block_engine.bundle_txn_cnt;
+      ctx->cur_spot = fd_pack_insert_txn_init( ctx->pack );
 
-      /* If block_slot doesn't match leader_slot, drop */
-      if( FD_UNLIKELY( block_slot != ctx->leader_slot ) ) {
-        FD_LOG_DEBUG(( "HARMONIC: dropping block txn for wrong slot=%lu. cur slot %lu", block_slot, ctx->leader_slot ));
-        return;
-      }
-
-      /* Insert directly into pack's pool (single copy) */
-      long arrival_time_nanos = ctx->approx_wallclock_ns + (long)((double)(fd_tickcount() - ctx->approx_tickcount) / ctx->ticks_per_ns);
-      int inserted = fd_pack_harmonic_insert( ctx->pack,
-                                              txn,
-                                              fd_txn_m_payload( txnm ),
-                                              payload_sz,
-                                              (uchar const *)fd_txn_m_alut( txnm ),
-                                              source_ipv4,
-                                              source_tpu,
-                                              arrival_time_nanos,
-                                              block_slot,
-                                              block_txn_expected );
-      if( FD_UNLIKELY( !inserted ) ) {
-        FD_LOG_DEBUG(( "HARMONIC: failed to insert block txn for slot=%lu (pool full)", block_slot ));
-        return;
-      }
-
-      FD_LOG_DEBUG(( "HARMONIC: inserted block txn for slot=%lu, pending_cnt=%lu, expected=%lu",
-                     block_slot, fd_pack_harmonic_pending_cnt( ctx->pack ), block_txn_expected ));
-      return; /* Block transactions handled separately, skip normal pack flow */
+      fd_memcpy( ctx->cur_spot->txnp->payload, fd_txn_m_payload( txnm ), payload_sz    );
+      fd_memcpy( TXN(ctx->cur_spot->txnp),     txn,                      txn_t_sz      );
+      fd_memcpy( ctx->cur_spot->alt_accts,     fd_txn_m_alut( txnm ),    addr_table_sz );
+      ctx->cur_spot->txnp->scheduler_arrival_time_nanos = ctx->approx_wallclock_ns + (long)((double)(fd_tickcount() - ctx->approx_tickcount) / ctx->ticks_per_ns);
+      ctx->cur_spot->txnp->payload_sz  = payload_sz;
+      ctx->cur_spot->txnp->source_ipv4 = source_ipv4;
+      ctx->cur_spot->txnp->source_tpu  = source_tpu;
+      break;
     }
 
     ulong bundle_id = txnm->block_engine.bundle_id;
     int is_bundle = (source_tpu == FD_TXN_M_TPU_SOURCE_BUNDLE) && bundle_id;
     if( FD_UNLIKELY( is_bundle ) ) {
-      ctx->is_bundle = 1;
+      ctx->txn_type = TXN_TYPE_BUNDLE;
       if( FD_LIKELY( bundle_id!=ctx->current_bundle->id ) ) {
         if( FD_UNLIKELY( ctx->current_bundle->bundle ) ) {
           FD_MCNT_INC( PACK, TRANSACTION_DROPPED_PARTIAL_BUNDLE, ctx->current_bundle->txn_received );
@@ -1011,7 +1003,7 @@ during_frag( fd_pack_ctx_t * ctx,
       ctx->cur_spot                           = ctx->current_bundle->bundle[ ctx->current_bundle->txn_received ];
       ctx->current_bundle->min_blockhash_slot = fd_ulong_min( ctx->current_bundle->min_blockhash_slot, sig );
     } else {
-      ctx->is_bundle = 0;
+      ctx->txn_type = TXN_TYPE_NORMAL;
 #if FD_PACK_USE_EXTRA_STORAGE
       if( FD_LIKELY( ctx->leader_slot!=ULONG_MAX || fd_pack_avail_txn_cnt( ctx->pack )<ctx->max_pending_transactions ) ) {
         ctx->cur_spot = fd_pack_insert_txn_init( ctx->pack );
@@ -1189,13 +1181,36 @@ after_frag( fd_pack_ctx_t *     ctx,
     break;
   }
   case IN_KIND_RESOLV: {
+    /* Block transactions */
+    if( FD_UNLIKELY( ctx->txn_type==TXN_TYPE_BLOCK ) ) {
+      /* Check block slot matches leader slot */
+      if( FD_UNLIKELY( ctx->block_slot != ctx->leader_slot ) ) {
+        FD_LOG_DEBUG(( "HARMONIC: dropping block txn for wrong slot=%lu, cur slot=%lu", ctx->block_slot, ctx->leader_slot ));
+        fd_pack_insert_txn_cancel( ctx->pack, ctx->cur_spot );
+        ctx->cur_spot = NULL;
+        break;
+      }
+
+      long insert_duration = -fd_tickcount();
+      int result = fd_pack_harmonic_insert_fini( ctx->pack, ctx->cur_spot, ctx->block_slot, ctx->block_txn_expected );
+      insert_duration      += fd_tickcount();
+      fd_histf_sample( ctx->insert_duration, (ulong)insert_duration );
+      if( FD_UNLIKELY( !result ) ) {
+        FD_LOG_DEBUG(( "HARMONIC: failed to finalize block txn for slot=%lu (unparseable)", ctx->block_slot ));
+      } else {
+        FD_LOG_DEBUG(( "HARMONIC: inserted block txn for slot=%lu, pending_cnt=%lu", ctx->block_slot, fd_pack_harmonic_pending_cnt( ctx->pack ) ));
+      }
+      ctx->cur_spot = NULL;
+      break;
+    }
+
     /* Normal transaction case */
 #if FD_PACK_USE_EXTRA_STORAGE
     if( FD_LIKELY( !ctx->insert_to_extra ) ) {
 #else
     if( 1 ) {
 #endif
-    if( FD_UNLIKELY( ctx->is_bundle ) ) {
+    if( FD_UNLIKELY( ctx->txn_type==TXN_TYPE_BUNDLE ) ) {
       if( FD_UNLIKELY( ctx->current_bundle->txn_cnt==0UL ) ) return;
       if( FD_UNLIKELY( ++(ctx->current_bundle->txn_received)==ctx->current_bundle->txn_cnt ) ) {
         ulong deleted;
@@ -1379,7 +1394,7 @@ unprivileged_init( fd_topo_t *      topo,
   ctx->harmonic_threshold_ns = 0L;
 
   ctx->cur_spot                      = NULL;
-  ctx->is_bundle                     = 0;
+  ctx->txn_type                      = TXN_TYPE_NORMAL;
   ctx->strategy                      = tile->pack.schedule_strategy;
   ctx->max_pending_transactions      = tile->pack.max_pending_transactions;
   ctx->leader_slot                   = ULONG_MAX;
