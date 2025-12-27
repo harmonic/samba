@@ -494,7 +494,7 @@ struct fd_pack_private {
 
   /* Harmonic block mode state.
      block_txn_idx: monotonically increasing index for FIFO ordering.
-     harmonic_decision: 0=undecided, 1=harmonic mode, -1=sprint mode.
+     harmonic_decision: 0=undecided, 1=harmonic mode, -1=sprint mode, -2=failed.
      harmonic_block_slot: current block's target slot.
      harmonic_inflight: number of block txns currently dispatched to banks.
      harmonic_block_txn_expected: total transactions expected in this block.
@@ -2518,7 +2518,8 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
   /* Harmonic mode gating (when harmonic is on):
      decided == 0 (undecided): don't schedule anything yet
      decided == 1 (harmonic): only schedule from pending_blocks
-     decided == -1 (sprint): normal scheduling */
+     decided == -1 (sprint): normal scheduling
+     decided == -2 (failed): block validation failed, normal scheduling */
   if( FD_UNLIKELY( harmonic && pack->harmonic_decision==HARMONIC_MODE_UNDECIDED ) ) {
     /* Undecided - wait for decision (only when harmonic mode is enabled) */
     return 0UL;
@@ -2530,7 +2531,7 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
     return (result > 0) ? 1UL : 0UL;
   }
 
-  /* Sprint mode (harmonic_decision==HARMONIC_MODE_SPRINT) or harmonic disabled - normal scheduling below */
+  /* Sprint/failed mode (harmonic_decision==HARMONIC_MODE_SPRINT or FAILED) or harmonic disabled - normal scheduling below */
 
   /* TODO: Decide if these are exactly how we want to handle limits */
   total_cus = fd_ulong_min( total_cus, pack->lim->max_cost_per_block - pack->cumulative_block_cost );
@@ -2831,75 +2832,86 @@ fd_pack_harmonic_reset( fd_pack_t * pack ) {
 }
 
 
-/* Insert a block transaction into the pending_blocks treap.
-   Uses FIFO encoding: rewards = UINT_MAX - block_txn_idx, compute_est = 1.
-   This gives higher priority to lower indices (FIFO order). */
-int
-fd_pack_harmonic_insert( fd_pack_t      * pack,
-                         fd_txn_t const * txn,
-                         uchar    const * payload,
-                         ulong            payload_sz,
-                         uchar    const * alt_accts,
-                         uint             source_ipv4,
-                         uchar            source_tpu,
-                         long             arrival_time_nanos,
-                         ulong            block_slot,
-                         ulong            block_txn_expected ) {
+/* Fail the entire harmonic block: release the given transaction, clear
+   all pending block transactions, and transition to FAILED state.
+   Returns reject_reason for convenient chaining in return statements. */
+static inline int
+fd_pack_harmonic_fail_block( fd_pack_t         * pack,
+                             fd_pack_ord_txn_t * ord,
+                             int                 reject_reason ) {
+  trp_pool_ele_release( pack->pool, ord );
+  fd_pack_harmonic_reset( pack );
+  pack->harmonic_decision = HARMONIC_MODE_FAILED;
+  return reject_reason;
+}
 
-  /* 
-    Handle block_slot change: reset state for new block. 
-    Function caller has already verified block_slot==leader_slot.
-    */
+/* Insert a block transaction into the pending_blocks treap.
+   Takes an already-populated fd_txn_e_t from fd_pack_insert_txn_init.
+   Returns 1 on success, negative FD_PACK_INSERT_REJECT_* on failure.
+
+   On any validation failure, the entire block is failed: all pending
+   block transactions are cleared, harmonic mode transitions to FAILED,
+   and no more block transactions will be accepted for this slot. */
+int
+fd_pack_harmonic_insert_fini( fd_pack_t  * pack,
+                              fd_txn_e_t * txne,
+                              ulong        block_slot,
+                              ulong        block_txn_expected ) {
+
+  fd_pack_ord_txn_t * ord  = (fd_pack_ord_txn_t *)txne;
+  fd_pack_ord_txn_t * pool = pack->pool;
+
+  /* Handle block_slot change: reset state for new block. */
   if( FD_UNLIKELY( block_slot != pack->harmonic_block_slot ) ) {
     fd_pack_harmonic_reset( pack );
     pack->harmonic_block_slot          = block_slot;
     pack->harmonic_block_txn_expected  = block_txn_expected;
   }
 
-  /* Acquire slot from pool */
-  fd_pack_ord_txn_t * pool = pack->pool;
-  if( FD_UNLIKELY( trp_pool_free( pool ) == 0UL ) ) return 0; /* Pool exhausted */
+  /* If this block already failed validation, reject all further transactions */
+  if( FD_UNLIKELY( pack->harmonic_decision == HARMONIC_MODE_FAILED ) ) {
+    trp_pool_ele_release( pool, ord );
+    return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
+  }
 
-  ushort txn_idx = (ushort)trp_pool_idx_acquire( pool );
-  fd_pack_ord_txn_t * ord_txn = pool + txn_idx;
+  fd_txn_t * txn     = TXN( txne->txnp );
+  uchar    * payload = txne->txnp->payload;
 
-  /* Copy transaction data directly into pool slot */
-  ulong txn_t_sz      = fd_txn_footprint( txn->instr_cnt, txn->addr_table_lookup_cnt );
-  ulong addr_table_sz = 32UL * txn->addr_table_adtl_cnt;
+  fd_acct_addr_t const * accts   = fd_txn_get_acct_addrs( txn, payload );
+  fd_acct_addr_t const * alt_adj = ord->txn_e->alt_accts - fd_txn_account_cnt( txn, FD_TXN_ACCT_CAT_IMM );
 
-  fd_memcpy( ord_txn->txn_e->txnp->payload, payload,   payload_sz   );
-  fd_memcpy( TXN(ord_txn->txn_e->txnp),     txn,       txn_t_sz     );
-  fd_memcpy( ord_txn->txn_e->alt_accts,     alt_accts, addr_table_sz );
-  ord_txn->txn_e->txnp->payload_sz                   = (ushort)payload_sz;
-  ord_txn->txn_e->txnp->source_ipv4                  = source_ipv4;
-  ord_txn->txn_e->txnp->source_tpu                   = source_tpu;
-  ord_txn->txn_e->txnp->scheduler_arrival_time_nanos = arrival_time_nanos;
+  /* Estimate rewards and compute cost (validates transaction structure) */
+  int est_result = fd_pack_estimate_rewards_and_compute( txne, ord );
+  if( FD_UNLIKELY( !est_result ) ) {
+    return fd_pack_harmonic_fail_block( pack, ord, FD_PACK_INSERT_REJECT_ESTIMATION_FAIL );
+  }
 
-  uint  txn_flags = 0;
-  ulong execution_cost = 0UL;
-  ulong loaded_accounts_data_cost = 0UL;
-  ulong total_cost = fd_pack_compute_cost( txn, payload, &txn_flags, &execution_cost, NULL, NULL, &loaded_accounts_data_cost );
+  /* Validate durable nonce if present */
+  int nonce_result = fd_pack_validate_durable_nonce( txne );
+  if( FD_UNLIKELY( !nonce_result ) ) {
+    return fd_pack_harmonic_fail_block( pack, ord, FD_PACK_INSERT_REJECT_INVALID_NONCE );
+  }
+  int is_durable_nonce = nonce_result==2;
+  ord->txn->flags &= ~FD_TXN_P_FLAGS_DURABLE_NONCE;
+  ord->txn->flags |= fd_uint_if( is_durable_nonce, FD_TXN_P_FLAGS_DURABLE_NONCE, 0U );
 
-  if( FD_UNLIKELY( !total_cost ) ) { trp_pool_idx_release( pool, txn_idx ); return 0; }
-  ord_txn->txn_e->txnp->pack_cu.requested_exec_plus_acct_data_cus = (uint)(execution_cost + loaded_accounts_data_cost);
-  ord_txn->txn_e->txnp->pack_cu.non_execution_cus                 = (uint)(total_cost - execution_cost - loaded_accounts_data_cost);
-  ord_txn->txn_e->txnp->flags                                     = txn_flags;
+  /* Validate transaction (affordability, size, accounts, sysvars).
+     Block transactions are not bundles, so skip bundle blacklist check. */
+  int validation_result = validate_transaction( pack, ord, txn, accts, alt_adj, 0 );
+  if( FD_UNLIKELY( validation_result ) ) {
+    return fd_pack_harmonic_fail_block( pack, ord, validation_result );
+  }
 
-  /* Encode FIFO ordering using the same machinery as bundles.
-     Each block transaction gets its own "bundle index" (block_txn_idx).
-     Use the RC_TO_REL_BUNDLE_IDX encoding so that lower block_txn_idx
-     has higher priority (FIFO order).
-     
-     This mirrors insert_bundle_impl: for a single-txn "bundle", we compute
-     rewards such that RC_TO_REL_BUNDLE_IDX(rewards, compute_est) == block_idx */
+  /* Override rewards with FIFO ordering using bundle machinery.
+     Block transactions are scheduled in arrival order, not by priority. */
   ulong block_idx = pack->block_txn_idx;
   ulong prev_reward = ((BUNDLE_L_PRIME * (BUNDLE_N - block_idx))) - 1UL;
   ulong prev_cost = 1UL<<32;
-  ord_txn->compute_est = (uint)total_cost;
-  ord_txn->rewards     = (uint)(((ulong)ord_txn->compute_est * (prev_reward + 1UL) + prev_cost - 1UL) / prev_cost);
-  ord_txn->root        = FD_ORD_TXN_ROOT_PENDING_BLOCK;
+  ord->rewards = (uint)(((ulong)ord->compute_est * (prev_reward + 1UL) + prev_cost - 1UL) / prev_cost);
+  ord->root    = FD_ORD_TXN_ROOT_PENDING_BLOCK;
 
   /* Insert into pending_blocks treap */
+  ushort txn_idx = (ushort)(ord - pool);
   treap_idx_insert( pack->pending_blocks, txn_idx, pool );
   pack->block_txn_idx++;
 
