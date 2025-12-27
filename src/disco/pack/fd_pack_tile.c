@@ -1155,7 +1155,7 @@ after_frag( fd_pack_ctx_t *     ctx,
     if( FD_UNLIKELY( ctx->harmonic ) ) {
       fd_pack_harmonic_reset( ctx->pack );
       ctx->harmonic_threshold_ns = ctx->_became_leader->slot_end_ns - FD_PACK_HARMONIC_MARGIN_NS;
-      FD_LOG_DEBUG(( "HARMONIC: new leader slot=%lu, threshold_ns=%ld (50ms before end)", ctx->leader_slot, ctx->harmonic_threshold_ns ));
+      FD_LOG_INFO(( "HARMONIC: new leader slot=%lu, threshold_ns=%ld (50ms before end)", ctx->leader_slot, ctx->harmonic_threshold_ns ));
     }
 
     fd_pack_limits_t limits[ 1 ];
@@ -1185,7 +1185,7 @@ after_frag( fd_pack_ctx_t *     ctx,
     if( FD_UNLIKELY( ctx->txn_type==TXN_TYPE_BLOCK ) ) {
       /* Check block slot matches leader slot */
       if( FD_UNLIKELY( ctx->block_slot != ctx->leader_slot ) ) {
-        FD_LOG_DEBUG(( "HARMONIC: dropping block txn for wrong slot=%lu, cur slot=%lu", ctx->block_slot, ctx->leader_slot ));
+        FD_LOG_INFO(( "HARMONIC: dropping block txn for wrong slot=%lu, cur slot=%lu", ctx->block_slot, ctx->leader_slot ));
         fd_pack_insert_txn_cancel( ctx->pack, ctx->cur_spot );
         ctx->cur_spot = NULL;
         break;
@@ -1196,9 +1196,9 @@ after_frag( fd_pack_ctx_t *     ctx,
       insert_duration      += fd_tickcount();
       fd_histf_sample( ctx->insert_duration, (ulong)insert_duration );
       if( FD_UNLIKELY( !result ) ) {
-        FD_LOG_DEBUG(( "HARMONIC: failed to finalize block txn for slot=%lu (unparseable)", ctx->block_slot ));
+        FD_LOG_INFO(( "HARMONIC: failed to finalize block txn for slot=%lu (unparseable)", ctx->block_slot ));
       } else {
-        FD_LOG_DEBUG(( "HARMONIC: inserted block txn for slot=%lu, pending_cnt=%lu", ctx->block_slot, fd_pack_harmonic_pending_cnt( ctx->pack ) ));
+        FD_LOG_INFO(( "HARMONIC: inserted block txn for slot=%lu, pending_cnt=%lu", ctx->block_slot, fd_pack_harmonic_pending_cnt( ctx->pack ) ));
       }
       ctx->cur_spot = NULL;
       break;
