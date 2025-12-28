@@ -754,14 +754,14 @@ after_credit( fd_pack_ctx_t *     ctx,
     
     if( FD_LIKELY( harmonic_decision==HARMONIC_MODE_HARMONIC ) ) {
       /* Currently broadcasting harmonic block - extend slot by 200ms */
-      if( FD_UNLIKELY( ctx->slot_end_ns_buffer==0L ) ) {
+      if( FD_UNLIKELY( ctx->slot_end_ns_buffer==50000000L ) ) {
         ctx->slot_end_ns_buffer = FD_PACK_HARMONIC_EXTENSION_NS;
         FD_LOG_INFO(( "HARMONIC: extending slot end (slot=%lu, decision=%d)", ctx->leader_slot, harmonic_decision ));
       }
     } else {
-      /* Not broadcasting - remove extension */
-      if( FD_UNLIKELY( ctx->slot_end_ns_buffer!=0L ) ) {
-        ctx->slot_end_ns_buffer = 0L;
+      /* Not broadcasting - reset to base buffer */
+      if( FD_UNLIKELY( ctx->slot_end_ns_buffer!=50000000L ) ) {
+        ctx->slot_end_ns_buffer = 50000000L;
         FD_LOG_INFO(( "HARMONIC: removing slot extension (slot=%lu, decision=%d)", ctx->leader_slot, harmonic_decision ));
       }
     }
@@ -791,11 +791,8 @@ after_credit( fd_pack_ctx_t *     ctx,
                                       | fd_int_if( i<pacing_bank_cnt, FD_PACK_SCHEDULE_TXN,    0 );
         break;
       case FD_PACK_STRATEGY_BUNDLE:
-        /* cavey: adding the buffer here is unnecessary as this strategy
-           will not be used during harmonic mode, and the buffer does not
-           exist when not in harmonic mode (re: slot_end_ns_buffer). */
         flags = FD_PACK_SCHEDULE_VOTE | FD_PACK_SCHEDULE_BUNDLE
-                                      | fd_int_if( ctx->slot_end_ns - ctx->approx_wallclock_ns<50000000L, FD_PACK_SCHEDULE_TXN,  0 );
+                                      | fd_int_if( (ctx->slot_end_ns+ctx->slot_end_ns_buffer) - ctx->approx_wallclock_ns<50000000L, FD_PACK_SCHEDULE_TXN,  0 );
         break;
     }
 
@@ -1178,7 +1175,7 @@ after_frag( fd_pack_ctx_t *     ctx,
     update_metric_state( ctx, fd_tickcount(), FD_PACK_METRIC_STATE_LEADER, 1 );
 
     ctx->slot_end_ns = ctx->_became_leader->slot_end_ns;
-    ctx->slot_end_ns_buffer = 0L;
+    ctx->slot_end_ns_buffer = 50000000L * ctx->harmonic;
 
     /* Reset harmonic state for new slot.
        Note: pack's acct_in_use is cleared by fd_pack_end_block, so we don't
