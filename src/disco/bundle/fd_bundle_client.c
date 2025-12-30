@@ -1811,6 +1811,7 @@ fd_bundle_tpu_client_grpc_rx_start( void * app_ctx,
   case FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU:
     ctx->tpu_packet_subscription_live = 1;
     ctx->tpu_packet_subscription_wait = 0;
+    FD_LOG_INFO(( "TPU SubscribePackets stream started" ));
     break;
   default:
     break;
