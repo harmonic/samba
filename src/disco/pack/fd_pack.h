@@ -240,6 +240,10 @@ fd_pack_avail_txn_cnt( fd_pack_t const * pack ) {
   return *((ulong const *)((uchar const *)pack + FD_PACK_PENDING_TXN_CNT_OFF));
 }
 
+/* fd_pack_avail_vote_cnt returns the number of pending vote transactions
+   available to schedule. */
+ulong fd_pack_avail_vote_cnt( fd_pack_t const * pack );
+
 /* fd_pack_current_block_cost returns the number of CUs that have been
    scheduled in the current block, net of any rebates.  It should be
    between 0 and the specified value of max_cost_per_block, but it can
@@ -684,12 +688,9 @@ fd_pack_schedule_next_microblock( fd_pack_t  * pack,
 
 /* Harmonic block scheduling functions.
 
-   fd_pack_try_schedule_block_txn: Attempts to schedule a single block
-   transaction from the pending_blocks treap to the specified bank_tile.
-   Walks the treap in FIFO order (by block_txn_idx), checking for
-   account conflicts.  Returns >0 if scheduled, <0 otherwise:
-     TRY_SCHEDULE_BLOCK_NO_PENDING (-1): no pending block transactions
-     TRY_SCHEDULE_BLOCK_ALL_CONFLICT (-2): all pending txns have conflicts
+   Harmonic scheduling uses fd_pack_schedule_next_microblock with harmonic=1,
+   which internally uses transitive dependency tracking to maintain execution
+   order from the received block.
 
    fd_pack_complete_harmonic_txn: Releases the account locks for a
    harmonic transaction that was previously scheduled to bank_tile.
@@ -709,15 +710,24 @@ void fd_pack_harmonic_reset( fd_pack_t * pack );
    FD_PACK_INSERT_REJECT_* code on validation failure.  Uses FIFO
    ordering via block_txn_idx encoding.
 
+   block_meta points to the bundle metadata (e.g. block_builder_info_t)
+   which is copied into the parallel bundle_meta array.
+
+   is_ib indicates this is the initializer bundle (crank transaction),
+   which gets idx=0 to ensure it's scheduled first.
+
    If block_slot changes, resets harmonic state for the new block.
 
    On any validation failure, the entire block is failed: all pending
    block transactions are cleared, harmonic mode transitions to FAILED,
    and subsequent insert attempts for this slot return immediately. */
-int fd_pack_harmonic_insert_fini( fd_pack_t  * pack,
-                                  fd_txn_e_t * txne,
-                                  ulong        block_slot,
-                                  ulong        block_txn_expected );
+int fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
+                                  fd_txn_e_t   * txne,
+                                  ulong          block_slot,
+                                  ulong          block_txn_expected,
+                                  void   const * block_meta,
+                                  int            is_ib,
+                                  ulong        * opt_delete_cnt );
 
 /* Harmonic decision state values */
 #define HARMONIC_MODE_UNDECIDED  0
@@ -742,9 +752,6 @@ void fd_pack_harmonic_state_update( fd_pack_t * pack,
    or HARMONIC_MODE_FAILED */
 FD_FN_PURE int fd_pack_harmonic_decision( fd_pack_t const * pack );
 
-/* fd_pack_harmonic_set_decision: Sets the decision state. */
-void fd_pack_harmonic_set_decision( fd_pack_t * pack, int decision );
-
 /* fd_pack_harmonic_pending_cnt: Returns number of pending block txns */
 FD_FN_PURE ulong fd_pack_harmonic_pending_cnt( fd_pack_t const * pack );
 
@@ -754,14 +761,22 @@ FD_FN_PURE ulong fd_pack_harmonic_inflight_cnt( fd_pack_t const * pack );
 /* fd_pack_harmonic_pool_full: Returns 1 if treap pool is exhausted */
 FD_FN_PURE int fd_pack_harmonic_pool_full( fd_pack_t const * pack );
 
-/* fd_pack_harmonic_block_slot: Returns current block's target slot */
-FD_FN_PURE ulong fd_pack_harmonic_block_slot( fd_pack_t const * pack );
+/* fd_pack_vote_drain_failed: Returns 1 if we tried to schedule votes but failed.
+   Reset each slot by fd_pack_end_block. */
+FD_FN_PURE int fd_pack_vote_drain_failed( fd_pack_t const * pack );
 
-/* fd_pack_harmonic_block_txn_expected: Returns expected total txn count */
-FD_FN_PURE ulong fd_pack_harmonic_block_txn_expected( fd_pack_t const * pack );
+/* fd_pack_set_vote_drain_failed: Mark that vote scheduling failed. */
+void fd_pack_set_vote_drain_failed( fd_pack_t * pack );
 
-/* fd_pack_harmonic_block_txn_completed: Returns count of completed txns */
-FD_FN_PURE ulong fd_pack_harmonic_block_txn_completed( fd_pack_t const * pack );
+/* fd_pack_harmonic_vote_conflicts: Check if a vote would conflict with pending
+   harmonic transactions. Returns 1 if conflict found, 0 if safe to schedule.
+   Fast path: returns 0 immediately if no harmonic accounts are tracked. */
+int fd_pack_harmonic_vote_conflicts( fd_pack_t       * pack,
+                                     fd_txn_t  const * txn,
+                                     uchar     const * payload );
+
+void const *
+fd_pack_peek_harmonic_meta( fd_pack_t const * pack );
 
 
 /* fd_pack_rebate_cus adjusts the compute unit accounting for the
