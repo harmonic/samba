@@ -851,23 +851,43 @@ fd_bundle_client_handle_packet_batch(
 
 /* Handle a SubscribePacketsResponse from the TPU endpoint.
    Note: The relayer uses tpu.SubscribePacketsResponse which has a oneof msg
-   containing either a heartbeat or a packet batch. */
+   containing either a heartbeat or a packet batch.
+   
+   Nanopb oneof workaround: When decoding a oneof field, nanopb memsets the union
+   to zero if which_msg differs from the incoming field tag, clearing any callbacks.
+   Additionally, pb_decode() calls pb_message_set_to_defaults() which resets which_msg
+   to 0. To preserve our callback on batch.packets:
+   1. Pre-set which_msg to batch_tag so the memset check (which_msg != tag) fails
+   2. Use pb_decode_ex with PB_DECODE_NOINIT to skip the defaults reset
+   If a heartbeat arrives, the memset happens, but we don't need callbacks for those.
+
+   TODO: apparently we should be able to use submsg_callback to have a separate callback
+   function that can set the fields before submessage is decoded, but ¯\_(ツ)_/¯. i'll figure
+   that out later; see case PB_HTYPE_ONEOF in pb_decode.c */
 static void
 fd_bundle_tpu_client_handle_packet_batch(
     fd_bundle_tile_t * ctx,
     pb_istream_t *     istream
 ) {
   tpu_SubscribePacketsResponse res = tpu_SubscribePacketsResponse_init_default;
+  res.which_msg = tpu_SubscribePacketsResponse_batch_tag;
   res.msg.batch.packets = (pb_callback_t) {
     .funcs.decode = fd_bundle_tpu_client_visit_pb_packet,
     .arg          = ctx
   };
-  if( FD_UNLIKELY( !pb_decode( istream, &tpu_SubscribePacketsResponse_msg, &res ) ) ) {
+  
+  if( FD_UNLIKELY( !pb_decode_ex( istream, &tpu_SubscribePacketsResponse_msg, &res, PB_DECODE_NOINIT ) ) ) {
     ctx->metrics.decode_fail_cnt++;
     FD_LOG_WARNING(( "Protobuf decode of TPU (tpu.SubscribePacketsResponse) failed" ));
     return;
   }
-  /* If it was a heartbeat message, nothing else to do (packets callback not invoked) */
+  
+  /* Sample RX delay for batch messages */
+  if( res.which_msg == tpu_SubscribePacketsResponse_batch_tag ) {
+    if( res.has_header ) {
+      fd_bundle_client_sample_rx_delay( ctx, &res.header.ts );
+    }
+  }
 }
 
 /* Handle a BlockBuilderFeeInfoResponse from a GetBlockBuilderFeeInfo
