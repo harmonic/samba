@@ -193,6 +193,7 @@ typedef struct {
 
   ulong send_fec_set_idx[ FD_SHRED_BATCH_FEC_SETS_MAX ];
   ulong send_fec_set_cnt;
+  long  batch_start_tick;  /* tickcount when POH batching started, 0 if not batching */
   ulong tsorig;  /* timestamp of the last packet in compressed form */
 
   /* Includes Ethernet, IP, UDP headers */
@@ -201,6 +202,7 @@ typedef struct {
 
   fd_shred_in_ctx_t in[ 32 ];
   int               in_kind[ 32 ];
+  ulong             poh_in_idx;
 
   fd_wksp_t * net_out_mem;
   ulong       net_out_chunk0;
@@ -611,6 +613,7 @@ during_frag( fd_shred_ctx_t * ctx,
             p_rcvd_join( p_rcvd_new( p_rcvd_delete( p_rcvd_leave( out->parity_shred_rcvd ) ) ) );
 
             ctx->send_fec_set_idx[ ctx->send_fec_set_cnt ] = ctx->shredder_fec_set_idx;
+            if( FD_UNLIKELY( ctx->send_fec_set_cnt==0UL ) ) ctx->batch_start_tick = fd_tickcount();
             ctx->send_fec_set_cnt += 1UL;
             ctx->shredder_fec_set_idx = (ctx->shredder_fec_set_idx+1UL)%ctx->shredder_max_fec_set_idx;
 
@@ -1142,6 +1145,123 @@ after_frag( fd_shred_ctx_t *    ctx,
       for( ulong j=0UL; j<*max_dest_cnt; j++ ) send_shred( ctx, stem, new_shreds[ i ], fd_shred_dest_idx_to_dest( sdest, dests[ j*out_stride+i ]), ctx->tsorig );
     }
   }
+
+  /* Clear the batch state after sending */
+  ctx->send_fec_set_cnt = 0UL;
+  ctx->batch_start_tick = 0L;
+}
+
+/* 5ms timeout in ticks (~3 GHz CPU: 5ms = 15M ticks) */
+#define SHRED_BATCH_TIMEOUT_TICKS (15UL * 1000000UL)
+
+static inline void
+after_credit( fd_shred_ctx_t *    ctx,
+              fd_stem_context_t * stem,
+              int *               opt_poll_in,
+              int *               charge_busy ) {
+  (void)opt_poll_in;
+  (void)charge_busy;
+  if( FD_LIKELY( ctx->send_fec_set_cnt==0UL || ctx->batch_start_tick==0L ) ) return;
+  long elapsed = fd_tickcount() - ctx->batch_start_tick;
+  if( FD_UNLIKELY( elapsed < (long)SHRED_BATCH_TIMEOUT_TICKS ) ) return;
+  /* Timeout expired - send using POH in_idx */
+  ulong in_idx = ctx->poh_in_idx;
+  ulong fanout = 200UL;
+
+  /* Try to distribute shredded txn count across the fec sets.
+     This is an approximation, but it is acceptable. */
+  ulong shredded_txn_cnt_per_fec_set  = ctx->shredded_txn_cnt / ctx->send_fec_set_cnt;
+  ulong shredded_txn_cnt_remain       = ctx->shredded_txn_cnt - shredded_txn_cnt_per_fec_set * ctx->send_fec_set_cnt;
+  ulong shredded_txn_cnt_last_fec_set = shredded_txn_cnt_per_fec_set + shredded_txn_cnt_remain;
+
+  for( ulong fset_k=0; fset_k<ctx->send_fec_set_cnt; fset_k++ ) {
+    fd_fec_set_t * set = ctx->fec_sets + ctx->send_fec_set_idx[ fset_k ];
+    fd_shred34_t * s34 = ctx->shred34 + 4UL*ctx->send_fec_set_idx[ fset_k ];
+    s34[ 0 ].shred_cnt =                         fd_ulong_min( set->data_shred_cnt,   34UL );
+    s34[ 1 ].shred_cnt = set->data_shred_cnt   - fd_ulong_min( set->data_shred_cnt,   34UL );
+    s34[ 2 ].shred_cnt =                         fd_ulong_min( set->parity_shred_cnt, 34UL );
+    s34[ 3 ].shred_cnt = set->parity_shred_cnt - fd_ulong_min( set->parity_shred_cnt, 34UL );
+    ulong s34_cnt     = 2UL + !!(s34[ 1 ].shred_cnt) + !!(s34[ 3 ].shred_cnt);
+    ulong txn_per_s34 = fd_ulong_if( fset_k<( ctx->send_fec_set_cnt - 1UL ), shredded_txn_cnt_per_fec_set, shredded_txn_cnt_last_fec_set ) / s34_cnt;
+    for( ulong j=0UL; j<4UL; j++ ) s34[ j ].est_txn_cnt = fd_ulong_if( s34[ j ].shred_cnt>0UL, txn_per_s34, 0UL );
+    s34[ fd_ulong_if( s34[ 3 ].shred_cnt>0UL, 3, 2 ) ].est_txn_cnt += ctx->shredded_txn_cnt - txn_per_s34*s34_cnt;
+    ulong sz0 = sizeof(fd_shred34_t) - (34UL - s34[ 0 ].shred_cnt)*FD_SHRED_MAX_SZ;
+    ulong sz1 = sizeof(fd_shred34_t) - (34UL - s34[ 1 ].shred_cnt)*FD_SHRED_MAX_SZ;
+    ulong sz2 = sizeof(fd_shred34_t) - (34UL - s34[ 2 ].shred_cnt)*FD_SHRED_MAX_SZ;
+    ulong sz3 = sizeof(fd_shred34_t) - (34UL - s34[ 3 ].shred_cnt)*FD_SHRED_MAX_SZ;
+    fd_shred_t const * last = (fd_shred_t const *)fd_type_pun_const( set->data_shreds[ set->data_shred_cnt - 1 ] );
+    if( FD_LIKELY( ctx->store ) ) {
+      long shacq_start, shacq_end, shrel_end;
+      fd_store_fec_t * fec = NULL;
+      FD_STORE_SHARED_LOCK( ctx->store, shacq_start, shacq_end, shrel_end ) {
+        fec = fd_store_insert( ctx->store, ctx->round_robin_id, (fd_hash_t *)fd_type_pun( &ctx->out_merkle_roots[fset_k] ) );
+      } FD_STORE_SHARED_LOCK_END;
+      if( FD_UNLIKELY( !fec ) ) return;
+      for( ulong i=0UL; i<set->data_shred_cnt; i++ ) {
+        fd_shred_t * data_shred = (fd_shred_t *)fd_type_pun( set->data_shreds[i] );
+        ulong        payload_sz = fd_shred_payload_sz( data_shred );
+        if( FD_UNLIKELY( fec->data_sz + payload_sz > FD_STORE_DATA_MAX ) ) {
+          FD_LOG_CRIT(( "Shred tile %lu: completed FEC set %lu %u data_sz: %lu exceeds FD_STORE_DATA_MAX: %lu. Ignoring FEC set.", ctx->round_robin_id, data_shred->slot, data_shred->fec_set_idx, fec->data_sz + payload_sz, FD_STORE_DATA_MAX ));
+        }
+        fd_memcpy( fec->data + fec->data_sz, fd_shred_data_payload( data_shred ), payload_sz );
+        fec->data_sz += payload_sz;
+      }
+      fd_histf_sample( ctx->metrics->store_insert_wait, (ulong)fd_long_max(shacq_end - shacq_start, 0) );
+      fd_histf_sample( ctx->metrics->store_insert_work, (ulong)fd_long_max(shrel_end - shacq_end,   0) );
+    }
+    if( FD_LIKELY( ctx->shred_out_idx!=ULONG_MAX ) ) {
+      int is_leader_fec = ctx->in_kind[ in_idx ]==IN_KIND_POH;
+      ulong   sig   = fd_disco_shred_out_fec_sig( last->slot, last->fec_set_idx, (uint)set->data_shred_cnt, last->data.flags & FD_SHRED_DATA_FLAG_SLOT_COMPLETE, last->data.flags & FD_SHRED_DATA_FLAG_DATA_COMPLETE );
+      uchar * chunk = fd_chunk_to_laddr( ctx->shred_out_mem, ctx->shred_out_chunk );
+      memcpy( chunk,                                                         last,                                                FD_SHRED_DATA_HEADER_SZ );
+      memcpy( chunk+FD_SHRED_DATA_HEADER_SZ,                                 ctx->out_merkle_roots[fset_k].hash,                  FD_SHRED_MERKLE_ROOT_SZ );
+      memcpy( chunk+FD_SHRED_DATA_HEADER_SZ +  FD_SHRED_MERKLE_ROOT_SZ,      (uchar *)last + fd_shred_chain_off( last->variant ), FD_SHRED_MERKLE_ROOT_SZ );
+      memcpy( chunk+FD_SHRED_DATA_HEADER_SZ + (FD_SHRED_MERKLE_ROOT_SZ*2UL), &is_leader_fec,                                      sizeof(int));
+      ulong sz    = FD_SHRED_DATA_HEADER_SZ + FD_SHRED_MERKLE_ROOT_SZ * 2 + sizeof(int);
+      ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
+      fd_stem_publish( stem, ctx->shred_out_idx, sig, ctx->shred_out_chunk, sz, 0UL, ctx->tsorig, tspub );
+      ctx->shred_out_chunk = fd_dcache_compact_next( ctx->shred_out_chunk, sz, ctx->shred_out_chunk0, ctx->shred_out_wmark );
+    } else if( FD_UNLIKELY( ctx->store_out_idx != ULONG_MAX ) ) {
+      ulong new_sig = ctx->in_kind[ in_idx ]!=IN_KIND_NET;
+      ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
+      fd_stem_publish( stem, 0UL, new_sig, fd_laddr_to_chunk( ctx->store_out_mem, s34+0UL ), sz0, 0UL, ctx->tsorig, tspub );
+      if( FD_UNLIKELY( s34[ 1 ].shred_cnt ) ) fd_stem_publish( stem, 0UL, new_sig, fd_laddr_to_chunk( ctx->store_out_mem, s34+1UL ), sz1, 0UL, ctx->tsorig, tspub );
+      if( FD_UNLIKELY( s34[ 2 ].shred_cnt ) ) fd_stem_publish( stem, 0UL, new_sig, fd_laddr_to_chunk( ctx->store_out_mem, s34+2UL), sz2, 0UL, ctx->tsorig, tspub );
+      if( FD_UNLIKELY( s34[ 3 ].shred_cnt ) ) fd_stem_publish( stem, 0UL, new_sig, fd_laddr_to_chunk( ctx->store_out_mem, s34+3UL ), sz3, 0UL, ctx->tsorig, tspub );
+    }
+    fd_shred_t const * new_shreds[ FD_REEDSOL_DATA_SHREDS_MAX+FD_REEDSOL_PARITY_SHREDS_MAX ];
+    ulong k=0UL;
+    for( ulong i=0UL; i<set->data_shred_cnt; i++ )
+      if( !d_rcvd_test( set->data_shred_rcvd,   i ) )  new_shreds[ k++ ] = (fd_shred_t const *)set->data_shreds  [ i ];
+    for( ulong i=0UL; i<set->parity_shred_cnt; i++ )
+      if( !p_rcvd_test( set->parity_shred_rcvd, i ) )  new_shreds[ k++ ] = (fd_shred_t const *)set->parity_shreds[ i ];
+    if( FD_UNLIKELY( !k ) ) return;
+    fd_shred_dest_t * sdest = fd_stake_ci_get_sdest_for_slot( ctx->stake_ci, new_shreds[ 0 ]->slot );
+    if( FD_UNLIKELY( !sdest ) ) return;
+    ulong out_stride;
+    ulong max_dest_cnt[1];
+    fd_shred_dest_idx_t * dests;
+    if( FD_LIKELY( ctx->in_kind[ in_idx ]==IN_KIND_NET ) ) {
+      for( ulong i=0UL; i<k; i++ ) {
+        for( ulong j=0UL; j<ctx->adtl_dests_retransmit_cnt; j++ ) send_shred( ctx, stem, new_shreds[ i ], ctx->adtl_dests_retransmit+j, ctx->tsorig );
+      }
+      out_stride = k;
+      dests = fd_shred_dest_compute_children( sdest, new_shreds, k, ctx->scratchpad_dests, k, fanout, fanout, max_dest_cnt );
+    } else {
+      for( ulong i=0UL; i<k; i++ ) {
+        for( ulong j=0UL; j<ctx->adtl_dests_leader_cnt; j++ ) send_shred( ctx, stem, new_shreds[ i ], ctx->adtl_dests_leader+j, ctx->tsorig );
+      }
+      out_stride = 1UL;
+      *max_dest_cnt = 1UL;
+      dests = fd_shred_dest_compute_first   ( sdest, new_shreds, k, ctx->scratchpad_dests );
+    }
+    if( FD_UNLIKELY( !dests ) ) return;
+    for( ulong i=0UL; i<k; i++ ) {
+      for( ulong j=0UL; j<*max_dest_cnt; j++ ) send_shred( ctx, stem, new_shreds[ i ], fd_shred_dest_idx_to_dest( sdest, dests[ j*out_stride+i ]), ctx->tsorig );
+    }
+  }
+  ctx->send_fec_set_cnt = 0UL;
+  ctx->batch_start_tick = 0L;
 }
 
 static void
@@ -1355,6 +1475,8 @@ unprivileged_init( fd_topo_t *      topo,
 
     else FD_LOG_ERR(( "shred tile has unexpected input link %lu %s", i, link->name ));
 
+    if( FD_UNLIKELY( ctx->in_kind[ i ]==IN_KIND_POH ) ) ctx->poh_in_idx = i;
+
     if( FD_LIKELY( !!link->mtu ) ) {
       ctx->in[ i ].mem    = link_wksp->wksp;
       ctx->in[ i ].chunk0 = fd_dcache_compact_chunk0( ctx->in[ i ].mem, link->dcache );
@@ -1404,6 +1526,7 @@ unprivileged_init( fd_topo_t *      topo,
 
   for( ulong i=0UL; i<FD_SHRED_BATCH_FEC_SETS_MAX; i++ ) { ctx->send_fec_set_idx[ i ] = ULONG_MAX; }
   ctx->send_fec_set_cnt = 0UL;
+  ctx->batch_start_tick = 0L;
 
   ctx->shred_buffer_sz  = 0UL;
   memset( ctx->shred_buffer, 0xFF, FD_NET_MTU );
@@ -1494,6 +1617,7 @@ populate_allowed_fds( fd_topo_t const *      topo,
 
 #define STEM_CALLBACK_DURING_HOUSEKEEPING during_housekeeping
 #define STEM_CALLBACK_METRICS_WRITE       metrics_write
+#define STEM_CALLBACK_AFTER_CREDIT        after_credit
 #define STEM_CALLBACK_BEFORE_FRAG         before_frag
 #define STEM_CALLBACK_DURING_FRAG         during_frag
 #define STEM_CALLBACK_AFTER_FRAG          after_frag
