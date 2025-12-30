@@ -426,6 +426,30 @@ typedef struct fd_pack_penalty_treap fd_pack_penalty_treap_t;
 #define MAP_KEY_HASH(key)     ((uint)fd_ulong_hash( fd_ulong_load_8( (key).b ) ))
 #include "../../util/tmpl/fd_map_dynamic.c"
 
+/* harmonic_acct_map: Maps accounts used by harmonic block transactions
+   to their reference counts. Used to allow vote scheduling during
+   harmonic mode by checking for conflicts. */
+struct fd_pack_harmonic_acct {
+  fd_acct_addr_t key;
+  ulong          ref_cnt;
+};
+typedef struct fd_pack_harmonic_acct fd_pack_harmonic_acct_t;
+
+#define MAP_NAME              harmonic_acct_map
+#define MAP_T                 fd_pack_harmonic_acct_t
+#define MAP_KEY_T             fd_acct_addr_t
+#define MAP_KEY_NULL          null_addr
+#if FD_HAS_AVX
+# define MAP_KEY_INVAL(k)     _mm256_testz_si256( wb_ldu( (k).b ), wb_ldu( (k).b ) )
+#else
+# define MAP_KEY_INVAL(k)     MAP_KEY_EQUAL(k, null_addr)
+#endif
+#define MAP_KEY_EQUAL(k0,k1)  (!memcmp((k0).b,(k1).b, FD_TXN_ACCT_ADDR_SZ))
+#define MAP_KEY_EQUAL_IS_SLOW 1
+#define MAP_MEMOIZE           0
+#define MAP_KEY_HASH(key)     ((uint)fd_ulong_hash( fd_ulong_load_8( (key).b ) ))
+#include "../../util/tmpl/fd_map_dynamic.c"
+
 /* PENALTY_TREAP_THRESHOLD: How many references to an account do we
    allow before subsequent transactions that write to the account go to
    the penalty treap. */
@@ -498,13 +522,20 @@ struct fd_pack_private {
      harmonic_block_slot: current block's target slot.
      harmonic_inflight: number of block txns currently dispatched to banks.
      harmonic_block_txn_expected: total transactions expected in this block.
-     harmonic_block_txn_completed: transactions that have completed execution. */
+     harmonic_block_txn_completed: transactions that have completed execution.
+     vote_drain_failed: set when we have pending votes but failed to schedule any.
+     harmonic_accts: maps accounts used by harmonic txns to ref counts for vote conflict checking.
+     harmonic_acct_cnt: number of entries in harmonic_accts (0 means no conflicts possible). */
   ulong block_txn_idx;
   int   harmonic_decision;
   ulong harmonic_block_slot;
   ulong harmonic_inflight;
   ulong harmonic_block_txn_expected;
   ulong harmonic_block_txn_completed;
+  int   vote_drain_failed;
+  fd_pack_harmonic_acct_t * harmonic_accts;
+  ulong harmonic_acct_cnt;
+  int   harmonic_accts_overflow;  /* If set, map overflowed - block all votes until harmonic done */
 
   /* penalty_treaps: an fd_map_dynamic mapping hotly contended account
      addresses to treaps of transactions that write to them.  We try not
@@ -663,7 +694,6 @@ FD_STATIC_ASSERT( offsetof(fd_pack_t, pending_txn_cnt)==FD_PACK_PENDING_TXN_CNT_
 /* Forward-declare some helper functions */
 static ulong delete_transaction( fd_pack_t * pack, fd_pack_ord_txn_t * txn, int delete_full_bundle, int move_from_penalty_treap );
 static inline void insert_bundle_impl( fd_pack_t * pack, ulong bundle_idx, ulong txn_cnt, fd_pack_ord_txn_t * * bundle, ulong expires_at );
-static inline int fd_pack_try_schedule_block_txn( fd_pack_t * pack, ulong bank_tile, fd_txn_p_t * out );
 
 FD_FN_PURE ulong
 fd_pack_footprint( ulong                    pack_depth,
@@ -690,27 +720,29 @@ fd_pack_footprint( ulong                    pack_depth,
   ulong nonce_chain_cnt    = noncemap_chain_cnt_est( pack_depth );
 
   /* log base 2, but with a 2* so that the hash table stays sparse */
-  int lg_uses_tbl_sz = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_flight                        ) );
-  int lg_max_writers = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_w_per_block                           ) );
-  int lg_acct_in_trp = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_treap                         ) );
-  int lg_penalty_trp = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_treap/PENALTY_TREAP_THRESHOLD ) );
-  int lg_bundle_temp = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*bundle_temp_accts                         ) );
+  int lg_uses_tbl_sz   = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_flight                        ) );
+  int lg_max_writers   = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_w_per_block                           ) );
+  int lg_acct_in_trp   = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_treap                         ) );
+  int lg_penalty_trp   = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_treap/PENALTY_TREAP_THRESHOLD ) );
+  int lg_bundle_temp   = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*bundle_temp_accts                         ) );
+  int lg_harmonic_acct = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_treap                         ) );
 
   l = FD_LAYOUT_INIT;
-  l = FD_LAYOUT_APPEND( l, FD_PACK_ALIGN,       sizeof(fd_pack_t)                               );
-  l = FD_LAYOUT_APPEND( l, trp_pool_align (),   trp_pool_footprint ( pack_depth+extra_depth   ) ); /* pool           */
-  l = FD_LAYOUT_APPEND( l, penalty_map_align(), penalty_map_footprint( lg_penalty_trp         ) ); /* penalty_treaps */
-  l = FD_LAYOUT_APPEND( l, expq_align     (),   expq_footprint     ( pack_depth               ) ); /* expiration prq */
-  l = FD_LAYOUT_APPEND( l, acct_uses_align(),   acct_uses_footprint( lg_uses_tbl_sz           ) ); /* acct_in_use    */
-  l = FD_LAYOUT_APPEND( l, acct_uses_align(),   acct_uses_footprint( lg_max_writers           ) ); /* writer_costs   */
-  l = FD_LAYOUT_APPEND( l, 32UL,                sizeof(fd_pack_addr_use_t*)*written_list_max    ); /* written_list   */
-  l = FD_LAYOUT_APPEND( l, noncemap_align (),   noncemap_footprint ( nonce_chain_cnt          ) ); /* noncemap       */
-  l = FD_LAYOUT_APPEND( l, sig2txn_align  (),   sig2txn_footprint  ( sig_chain_cnt            ) ); /* signature_map  */
-  l = FD_LAYOUT_APPEND( l, acct_uses_align(),   acct_uses_footprint( lg_bundle_temp           ) ); /* bundle_temp_map*/
-  l = FD_LAYOUT_APPEND( l, 32UL,                sizeof(fd_pack_addr_use_t)*max_acct_in_flight   ); /* use_by_bank    */
-  l = FD_LAYOUT_APPEND( l, 32UL,                sizeof(ulong)*max_txn_in_flight                 ); /* use_by_bank_txn*/
-  l = FD_LAYOUT_APPEND( l, bitset_map_align(),  bitset_map_footprint( lg_acct_in_trp          ) ); /* acct_to_bitset */
-  l = FD_LAYOUT_APPEND( l, 64UL,                (pack_depth+extra_depth)*bundle_meta_sz         ); /* bundle_meta */
+  l = FD_LAYOUT_APPEND( l, FD_PACK_ALIGN,              sizeof(fd_pack_t)                               );
+  l = FD_LAYOUT_APPEND( l, trp_pool_align (),          trp_pool_footprint ( pack_depth+extra_depth   ) ); /* pool           */
+  l = FD_LAYOUT_APPEND( l, penalty_map_align(),        penalty_map_footprint( lg_penalty_trp         ) ); /* penalty_treaps */
+  l = FD_LAYOUT_APPEND( l, expq_align     (),          expq_footprint     ( pack_depth               ) ); /* expiration prq */
+  l = FD_LAYOUT_APPEND( l, acct_uses_align(),          acct_uses_footprint( lg_uses_tbl_sz           ) ); /* acct_in_use    */
+  l = FD_LAYOUT_APPEND( l, acct_uses_align(),          acct_uses_footprint( lg_max_writers           ) ); /* writer_costs   */
+  l = FD_LAYOUT_APPEND( l, 32UL,                       sizeof(fd_pack_addr_use_t*)*written_list_max    ); /* written_list   */
+  l = FD_LAYOUT_APPEND( l, noncemap_align (),          noncemap_footprint ( nonce_chain_cnt          ) ); /* noncemap       */
+  l = FD_LAYOUT_APPEND( l, sig2txn_align  (),          sig2txn_footprint  ( sig_chain_cnt            ) ); /* signature_map  */
+  l = FD_LAYOUT_APPEND( l, acct_uses_align(),          acct_uses_footprint( lg_bundle_temp           ) ); /* bundle_temp_map*/
+  l = FD_LAYOUT_APPEND( l, 32UL,                       sizeof(fd_pack_addr_use_t)*max_acct_in_flight   ); /* use_by_bank    */
+  l = FD_LAYOUT_APPEND( l, 32UL,                       sizeof(ulong)*max_txn_in_flight                 ); /* use_by_bank_txn*/
+  l = FD_LAYOUT_APPEND( l, bitset_map_align(),         bitset_map_footprint( lg_acct_in_trp          ) ); /* acct_to_bitset */
+  l = FD_LAYOUT_APPEND( l, 64UL,                       (pack_depth+extra_depth)*bundle_meta_sz         ); /* bundle_meta    */
+  l = FD_LAYOUT_APPEND( l, harmonic_acct_map_align(),  harmonic_acct_map_footprint( lg_harmonic_acct ) ); /* harmonic_accts */
   return FD_LAYOUT_FINI( l, FD_PACK_ALIGN );
 }
 
@@ -738,11 +770,12 @@ fd_pack_new( void                   * mem,
   ulong nonce_chain_cnt    = noncemap_chain_cnt_est( pack_depth );
 
   /* log base 2, but with a 2* so that the hash table stays sparse */
-  int lg_uses_tbl_sz = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_flight                        ) );
-  int lg_max_writers = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_w_per_block                           ) );
-  int lg_acct_in_trp = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_treap                         ) );
-  int lg_penalty_trp = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_treap/PENALTY_TREAP_THRESHOLD ) );
-  int lg_bundle_temp = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*bundle_temp_accts                         ) );
+  int lg_uses_tbl_sz   = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_flight                        ) );
+  int lg_max_writers   = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_w_per_block                           ) );
+  int lg_acct_in_trp   = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_treap                         ) );
+  int lg_penalty_trp   = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_treap/PENALTY_TREAP_THRESHOLD ) );
+  int lg_bundle_temp   = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*bundle_temp_accts                         ) );
+  int lg_harmonic_acct = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_treap                         ) );
 
   FD_SCRATCH_ALLOC_INIT( l, mem );
   fd_pack_t * pack    = FD_SCRATCH_ALLOC_APPEND( l,  FD_PACK_ALIGN,       sizeof(fd_pack_t)                             );
@@ -759,8 +792,9 @@ fd_pack_new( void                   * mem,
   void * _bundle_temp = FD_SCRATCH_ALLOC_APPEND( l,  acct_uses_align(),   acct_uses_footprint( lg_bundle_temp         ) );
   void * _use_by_bank = FD_SCRATCH_ALLOC_APPEND( l,  32UL,                sizeof(fd_pack_addr_use_t)*max_acct_in_flight );
   void * _use_by_txn  = FD_SCRATCH_ALLOC_APPEND( l,  32UL,                sizeof(ulong)*max_txn_in_flight               );
-  void * _acct_bitset = FD_SCRATCH_ALLOC_APPEND( l,  bitset_map_align(),  bitset_map_footprint( lg_acct_in_trp        ) );
-  void * bundle_meta  = FD_SCRATCH_ALLOC_APPEND( l,  64UL,                (pack_depth+extra_depth)*bundle_meta_sz       );
+  void * _acct_bitset = FD_SCRATCH_ALLOC_APPEND( l,  bitset_map_align(),         bitset_map_footprint( lg_acct_in_trp        ) );
+  void * bundle_meta  = FD_SCRATCH_ALLOC_APPEND( l,  64UL,                        (pack_depth+extra_depth)*bundle_meta_sz       );
+  void * _harm_accts  = FD_SCRATCH_ALLOC_APPEND( l,  harmonic_acct_map_align(),   harmonic_acct_map_footprint( lg_harmonic_acct ) );
 
   pack->pack_depth                  = pack_depth;
   pack->bundle_meta_sz              = bundle_meta_sz;
@@ -852,6 +886,8 @@ fd_pack_new( void                   * mem,
 
   bitset_map_new( _acct_bitset, lg_acct_in_trp );
 
+  harmonic_acct_map_new( _harm_accts, lg_harmonic_acct );
+
   fd_chkdup_new( pack->chkdup, rng );
 
   pack->bundle_meta = bundle_meta;
@@ -863,7 +899,10 @@ fd_pack_new( void                   * mem,
   pack->harmonic_block_slot          = 0UL;
   pack->harmonic_inflight            = 0UL;
   pack->harmonic_block_txn_expected  = 0UL;
+  pack->vote_drain_failed            = 0;
   pack->harmonic_block_txn_completed = 0UL;
+  pack->harmonic_acct_cnt            = 0UL;
+  pack->harmonic_accts_overflow      = 0;
 
   return mem;
 }
@@ -890,11 +929,12 @@ fd_pack_join( void * mem ) {
   ulong sig_chain_cnt      = sig2txn_chain_cnt_est( pack_depth );
   ulong nonce_chain_cnt    = noncemap_chain_cnt_est( pack_depth );
 
-  int lg_uses_tbl_sz = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_flight                        ) );
-  int lg_max_writers = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_w_per_block                           ) );
-  int lg_acct_in_trp = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_treap                         ) );
-  int lg_penalty_trp = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_treap/PENALTY_TREAP_THRESHOLD ) );
-  int lg_bundle_temp = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*bundle_temp_accts                         ) );
+  int lg_uses_tbl_sz   = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_flight                        ) );
+  int lg_max_writers   = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_w_per_block                           ) );
+  int lg_acct_in_trp   = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_treap                         ) );
+  int lg_penalty_trp   = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_treap/PENALTY_TREAP_THRESHOLD ) );
+  int lg_bundle_temp   = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*bundle_temp_accts                         ) );
+  int lg_harmonic_acct = fd_ulong_find_msb( fd_ulong_pow2_up( 2UL*max_acct_in_treap                         ) );
 
 
   pack->pool          = trp_pool_join(   FD_SCRATCH_ALLOC_APPEND( l, trp_pool_align(),   trp_pool_footprint   ( pack_depth+extra_depth  ) ) );
@@ -910,6 +950,7 @@ fd_pack_join( void * mem ) {
   /* */                                  FD_SCRATCH_ALLOC_APPEND( l, 32UL,               sizeof(ulong)*max_txn_in_flight                    );
   pack->acct_to_bitset= bitset_map_join( FD_SCRATCH_ALLOC_APPEND( l, bitset_map_align(), bitset_map_footprint( lg_acct_in_trp           ) ) );
   /* */                                  FD_SCRATCH_ALLOC_APPEND( l, 64UL,               (pack_depth+extra_depth)*pack->bundle_meta_sz      );
+  pack->harmonic_accts= harmonic_acct_map_join( FD_SCRATCH_ALLOC_APPEND( l, harmonic_acct_map_align(), harmonic_acct_map_footprint( lg_harmonic_acct ) ) );
 
   FD_MGAUGE_SET( PACK, PENDING_TRANSACTIONS_HEAP_SIZE, pack->pack_depth );
   memset( pack->top_writers, 0, sizeof(pack->top_writers) );
@@ -1726,6 +1767,17 @@ fd_pack_peek_bundle_meta( fd_pack_t const * pack ) {
   return (void const *)((uchar const *)pack->bundle_meta + (ulong)_cur * pack->bundle_meta_sz);
 }
 
+void const *
+fd_pack_peek_harmonic_meta( fd_pack_t const * pack ) {
+  int ib_state = pack->initializer_bundle_state;
+  if( FD_UNLIKELY( (ib_state==FD_PACK_IB_STATE_PENDING) | (ib_state==FD_PACK_IB_STATE_FAILED) ) ) return NULL;
+
+  treap_rev_iter_t _cur=treap_rev_iter_init( pack->pending_blocks, pack->pool );
+  if( FD_UNLIKELY( treap_rev_iter_done( _cur ) ) ) return NULL; /* empty */
+
+  return (void const *)((uchar const *)pack->bundle_meta + (ulong)_cur * pack->bundle_meta_sz);
+}
+
 void
 fd_pack_set_initializer_bundles_ready( fd_pack_t * pack ) {
   pack->initializer_bundle_state = FD_PACK_IB_STATE_READY;
@@ -1745,6 +1797,11 @@ fd_pack_metrics_write( fd_pack_t const * pack ) {
   FD_MGAUGE_SET( PACK, SMALLEST_PENDING_TRANSACTION,       pack->pending_smallest->cus );
 
   FD_MCNT_ENUM_COPY( PACK, TRANSACTION_SCHEDULE, pack->sched_results );
+}
+
+ulong
+fd_pack_avail_vote_cnt( fd_pack_t const * pack ) {
+  return treap_ele_cnt( pack->pending_votes );
 }
 
 void
@@ -1789,16 +1846,64 @@ typedef struct {
   ulong bytes_scheduled;
 } sched_return_t;
 
+/* Structure to track accounts from blocked transactions.
+   Used for transitive dependency checking: if B is blocked and C
+   conflicts with B, C must also be blocked even if C doesn't
+   conflict with in-flight transactions. */
+struct fd_blocked_acct {
+  fd_acct_addr_t acct;
+  int            writable;  /* 1 if writable, 0 if readonly */
+};
+typedef struct fd_blocked_acct fd_blocked_acct_t;
+
+/* Max accounts we can track from blocked transactions.
+   64 accounts/txn * 32 blocked txns = 2048 */
+#define FD_PACK_BLOCKED_ACCT_MAX 2048UL
+
+/* fd_pack_harmonic_add_blocked: Add all accounts from a transaction to the
+   blocked set for transitive dependency tracking.  Returns the new blocked_cnt,
+   or FD_PACK_BLOCKED_ACCT_MAX+1 if overflow occurred. */
+static inline ulong
+fd_pack_harmonic_add_blocked( fd_txn_t const           * txn,
+                              fd_acct_addr_t const     * accts,
+                              fd_acct_addr_t const     * alt_adj,
+                              fd_blocked_acct_t        * blocked,
+                              ulong                      blocked_cnt ) {
+  for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_WRITABLE );
+       iter!=fd_txn_acct_iter_end(); iter=fd_txn_acct_iter_next( iter ) ) {
+    if( FD_UNLIKELY( blocked_cnt >= FD_PACK_BLOCKED_ACCT_MAX ) ) return FD_PACK_BLOCKED_ACCT_MAX + 1UL;
+    ulong idx = fd_txn_acct_iter_idx( iter );
+    fd_acct_addr_t const * acct = fd_ptr_if( idx<fd_txn_account_cnt( txn, FD_TXN_ACCT_CAT_IMM ), accts, alt_adj ) + idx;
+    blocked[ blocked_cnt ].acct     = *acct;
+    blocked[ blocked_cnt ].writable = 1;
+    blocked_cnt++;
+  }
+  for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_READONLY );
+       iter!=fd_txn_acct_iter_end(); iter=fd_txn_acct_iter_next( iter ) ) {
+    ulong idx = fd_txn_acct_iter_idx( iter );
+    fd_acct_addr_t const * acct = fd_ptr_if( idx<fd_txn_account_cnt( txn, FD_TXN_ACCT_CAT_IMM ), accts, alt_adj ) + idx;
+    if( fd_pack_unwritable_contains( acct ) ) continue;
+    if( FD_UNLIKELY( blocked_cnt >= FD_PACK_BLOCKED_ACCT_MAX ) ) return FD_PACK_BLOCKED_ACCT_MAX + 1UL;
+    blocked[ blocked_cnt ].acct     = *acct;
+    blocked[ blocked_cnt ].writable = 0;
+    blocked_cnt++;
+  }
+  return blocked_cnt;
+}
+
 static inline sched_return_t
-fd_pack_schedule_impl( fd_pack_t          * pack,
-                       treap_t            * sched_from,
-                       ulong                cu_limit,
-                       ulong                txn_limit,
-                       ulong                byte_limit,
-                       ulong                bank_tile,
-                       fd_pack_smallest_t * smallest_in_treap,
-                       ulong              * use_by_bank_txn,
-                       fd_txn_p_t         * out ) {
+fd_pack_schedule_impl( fd_pack_t               * pack,
+                       treap_t                 * sched_from,
+                       ulong                     cu_limit,
+                       ulong                     txn_limit,
+                       ulong                     byte_limit,
+                       ulong                     bank_tile,
+                       fd_pack_smallest_t      * smallest_in_treap,
+                       ulong                   * use_by_bank_txn,
+                       fd_txn_p_t              * out,
+                       int                       harmonic,
+                       fd_pack_harmonic_acct_t * blocked_accts,
+                       ulong                     blocked_acct_cnt ) {
 
   fd_pack_ord_txn_t  * pool         = pack->pool;
   fd_pack_addr_use_t * acct_in_use  = pack->acct_in_use;
@@ -1820,6 +1925,13 @@ fd_pack_schedule_impl( fd_pack_t          * pack,
 
   ushort compressed_slot_number = pack->compressed_slot_number;
 
+  /* Harmonic mode enables transitive dependency tracking: when a transaction
+     conflicts, all subsequent transactions that touch its accounts are also
+     blocked.  This is needed for harmonic block scheduling. */
+  int transitive_deps = harmonic;
+  fd_blocked_acct_t blocked[ FD_PACK_BLOCKED_ACCT_MAX ];
+  ulong             blocked_cnt = 0UL;
+
   ulong txns_scheduled  = 0UL;
   ulong cus_scheduled   = 0UL;
   ulong bytes_scheduled = 0UL;
@@ -1836,9 +1948,12 @@ fd_pack_schedule_impl( fd_pack_t          * pack,
   ulong min_cus   = ULONG_MAX;
   ulong min_bytes = ULONG_MAX;
 
-  if( FD_UNLIKELY( (cu_limit<smallest_in_treap->cus) | (txn_limit==0UL) | (byte_limit<smallest_in_treap->bytes) ) ) {
-    sched_return_t to_return = { .cus_scheduled = 0UL, .txns_scheduled = 0UL, .bytes_scheduled = 0UL };
-    return to_return;
+  /* Skip early-exit optimization for harmonic mode (no smallest_in_treap tracking) */
+  if( FD_LIKELY( !harmonic ) ) {
+    if( FD_UNLIKELY( (cu_limit<smallest_in_treap->cus) | (txn_limit==0UL) | (byte_limit<smallest_in_treap->bytes) ) ) {
+      sched_return_t to_return = { .cus_scheduled = 0UL, .txns_scheduled = 0UL, .bytes_scheduled = 0UL };
+      return to_return;
+    }
   }
 
   treap_rev_iter_t prev = treap_idx_null();
@@ -1892,6 +2007,9 @@ fd_pack_schedule_impl( fd_pack_t          * pack,
     fd_txn_t const * txn = TXN(cur->txn);
     fd_acct_addr_t const * accts   = fd_txn_get_acct_addrs( txn, cur->txn->payload );
     fd_acct_addr_t const * alt_adj = cur->txn_e->alt_accts - fd_txn_account_cnt( txn, FD_TXN_ACCT_CAT_IMM );
+
+    ulong blocked_conflict = 0UL;
+
     /* Check conflicts between this transaction's writable accounts and
        current readers */
     for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_WRITABLE );
@@ -1908,7 +2026,16 @@ fd_pack_schedule_impl( fd_pack_t          * pack,
 
       fd_pack_addr_use_t * use = acct_uses_query( acct_in_use, acct, NULL );
       if( FD_UNLIKELY( use ) ) conflicts |= use->in_use_by; /* break? */
+
+      /* Transitive deps: check against blocked accounts (any use = conflict) */
+      if( FD_UNLIKELY( transitive_deps ) ) {
+        for( ulong i=0UL; i<blocked_cnt; i++ ) {
+          if( FD_UNLIKELY( !memcmp( blocked[i].acct.b, acct.b, 32 ) ) ) { blocked_conflict = 1UL; break; }
+        }
+      }
     }
+
+    int has_conflict = 0;
 
     if( FD_UNLIKELY( conflicts==ULONG_MAX ) ) {
       /* The logic for how to adjust skip is a bit complicated, and we
@@ -1929,28 +2056,59 @@ fd_pack_schedule_impl( fd_pack_t          * pack,
       cur->skip = (ushort)(1+fd_ushort_min( (ushort)(compressed_slot_number-1),
                                             (ushort)(fd_ushort_min( cur->skip, FD_PACK_SKIP_CNT )-2) ) );
       write_limit_c++;
-      continue;
+      has_conflict = 1;
     }
 
-    if( FD_UNLIKELY( conflicts ) ) {
+    if( FD_LIKELY( !has_conflict ) && FD_UNLIKELY( conflicts | blocked_conflict ) ) {
       slow_path++;
-      continue;
+      has_conflict = 1;
     }
 
     /* Check conflicts between this transaction's readonly accounts and
        current writers */
-    for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_READONLY );
-        iter!=fd_txn_acct_iter_end(); iter=fd_txn_acct_iter_next( iter ) ) {
+    if( FD_LIKELY( !has_conflict ) ) {
+      for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_READONLY );
+          iter!=fd_txn_acct_iter_end(); iter=fd_txn_acct_iter_next( iter ) ) {
 
-      fd_acct_addr_t const * acct = ACCT_ITER_TO_PTR( iter );
-      if( fd_pack_unwritable_contains( acct ) ) continue; /* No need to track sysvars because they can't be writable */
+        fd_acct_addr_t const * acct = ACCT_ITER_TO_PTR( iter );
+        if( fd_pack_unwritable_contains( acct ) ) continue; /* No need to track sysvars because they can't be writable */
 
-      fd_pack_addr_use_t * use = acct_uses_query( acct_in_use,  *acct, NULL );
-      if( use ) conflicts |= (use->in_use_by & FD_PACK_IN_USE_WRITABLE) ? use->in_use_by : 0UL;
+        fd_pack_addr_use_t * use = acct_uses_query( acct_in_use,  *acct, NULL );
+        if( use ) conflicts |= (use->in_use_by & FD_PACK_IN_USE_WRITABLE) ? use->in_use_by : 0UL;
+
+        /* Transitive deps: check against blocked accounts (only writers = conflict) */
+        if( FD_UNLIKELY( transitive_deps ) ) {
+          for( ulong i=0UL; i<blocked_cnt; i++ ) {
+            if( FD_UNLIKELY( blocked[i].writable && !memcmp( blocked[i].acct.b, acct->b, 32 ) ) ) { blocked_conflict = 1UL; break; }
+          }
+        }
+      }
+
+      if( FD_UNLIKELY( conflicts | blocked_conflict ) ) {
+        slow_path++;
+        has_conflict = 1;
+      }
     }
 
-    if( FD_UNLIKELY( conflicts ) ) {
-      slow_path++;
+    /* Check against blocked_accts map (e.g. pending harmonic accounts for vote scheduling) */
+    if( FD_LIKELY( !has_conflict ) && FD_UNLIKELY( blocked_acct_cnt > 0UL ) ) {
+      for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_ALL );
+          iter!=fd_txn_acct_iter_end(); iter=fd_txn_acct_iter_next( iter ) ) {
+        fd_acct_addr_t acct = *ACCT_ITER_TO_PTR( iter );
+        if( FD_UNLIKELY( harmonic_acct_map_query( blocked_accts, acct, NULL ) ) ) {
+          slow_path++;
+          has_conflict = 1;
+          break;
+        }
+      }
+    }
+
+    /* Handle conflict: add to blocked set for transitive deps, then continue */
+    if( FD_UNLIKELY( has_conflict ) ) {
+      if( FD_UNLIKELY( transitive_deps ) ) {
+        blocked_cnt = fd_pack_harmonic_add_blocked( txn, accts, alt_adj, blocked, blocked_cnt );
+        if( FD_UNLIKELY( blocked_cnt > FD_PACK_BLOCKED_ACCT_MAX ) ) break; /* Overflow - stop scheduling */
+      }
       continue;
     }
 
@@ -2064,16 +2222,40 @@ fd_pack_schedule_impl( fd_pack_t          * pack,
 
     *(use_by_bank_txn++) = use_by_bank_cnt;
 
-    if( FD_UNLIKELY( cur->txn->flags & FD_TXN_P_FLAGS_DURABLE_NONCE ) ) noncemap_ele_remove_fast( pack->noncemap, cur, pack->pool );
-    sig2txn_ele_remove_fast( pack->signature_map, cur, pool );
+    /* Cleanup differs based on transaction type */
+    if( FD_LIKELY( cur->root != FD_ORD_TXN_ROOT_PENDING_BLOCK ) ) {
+      /* Normal transaction cleanup */
+      if( FD_UNLIKELY( cur->txn->flags & FD_TXN_P_FLAGS_DURABLE_NONCE ) ) noncemap_ele_remove_fast( pack->noncemap, cur, pack->pool );
+      sig2txn_ele_remove_fast( pack->signature_map, cur, pool );
+      expq_remove( pack->expiration_q, cur->expq_idx );
+      pack->pending_txn_cnt--;
+    } else {
+      /* Block transaction cleanup - track inflight for harmonic mode */
+      pack->harmonic_inflight++;
+      /* Decrement harmonic account refcounts */
+      for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_ALL );
+          iter!=fd_txn_acct_iter_end(); iter=fd_txn_acct_iter_next( iter ) ) {
+        fd_acct_addr_t acct = *ACCT_ITER_TO_PTR( iter );
+        fd_pack_harmonic_acct_t * entry = harmonic_acct_map_query( pack->harmonic_accts, acct, NULL );
+        if( FD_LIKELY( entry ) ) {
+          if( --entry->ref_cnt == 0UL ) {
+            harmonic_acct_map_remove( pack->harmonic_accts, entry );
+            pack->harmonic_acct_cnt--;
+          }
+        }
+      }
+    }
 
     cur->root = FD_ORD_TXN_ROOT_FREE;
-    expq_remove( pack->expiration_q, cur->expq_idx );
     treap_idx_remove( sched_from, _cur, pool );
     trp_pool_idx_release( pool, _cur );
-    pack->pending_txn_cnt--;
 
-    if( FD_UNLIKELY( (cu_limit<smallest_in_treap->cus) | (txn_limit==0UL) | (byte_limit<smallest_in_treap->bytes) ) ) break;
+    /* For harmonic, we schedule one at a time so txn_limit==0 is the exit.
+       For normal, also check against smallest_in_treap optimization. */
+    if( FD_UNLIKELY( txn_limit==0UL ) ) break;
+    if( FD_LIKELY( !harmonic ) ) {
+      if( FD_UNLIKELY( (cu_limit<smallest_in_treap->cus) | (byte_limit<smallest_in_treap->bytes) ) ) break;
+    }
   }
 
   pack->sched_results[ FD_METRICS_ENUM_PACK_TXN_SCHEDULE_V_TAKEN_IDX      ] += txns_scheduled;
@@ -2085,8 +2267,8 @@ fd_pack_schedule_impl( fd_pack_t          * pack,
   pack->sched_results[ FD_METRICS_ENUM_PACK_TXN_SCHEDULE_V_DEFER_SKIP_IDX ] += skip_c;
 
   /* If we scanned the whole treap and didn't break early, we now have a
-     better estimate of the smallest. */
-  if( FD_UNLIKELY( treap_rev_iter_done( prev ) ) ) {
+     better estimate of the smallest.  Skip for harmonic mode. */
+  if( FD_LIKELY( !harmonic ) && FD_UNLIKELY( treap_rev_iter_done( prev ) ) ) {
     smallest_in_treap->cus   = min_cus;
     smallest_in_treap->bytes = min_bytes;
   }
@@ -2164,9 +2346,9 @@ fd_pack_microblock_complete( fd_pack_t * pack,
       FD_PACK_BITSET_CLEARN( bitset_rw_in_use, q->bit );
 
       /* Because this account is no longer in use, it might be possible
-         to schedule a transaction that writes to it.  Check its
-         penalty treap if it has one, and potentially move it to the
-         main treap. */
+        to schedule a transaction that writes to it.  Check its
+        penalty treap if it has one, and potentially move it to the
+        main treap. */
       fd_pack_penalty_treap_t * p_trp = penalty_map_query( pack->penalty_treaps, base[i].key, NULL );
       if( FD_UNLIKELY( p_trp ) ) {
         fd_pack_ord_txn_t * best_in_trp = treap_rev_iter_ele( treap_rev_iter_init( p_trp->penalty_treap, pack->pool ), pack->pool );
@@ -2263,9 +2445,11 @@ fd_pack_try_schedule_bundle( fd_pack_t  * pack,
   int has_conflict = 0;
   ulong txn_cnt = 0UL;
 
-  ulong cu_limit         = pack->lim->max_cost_per_block        - pack->cumulative_block_cost;
-  ulong byte_limit       = pack->lim->max_data_bytes_per_block  - pack->data_bytes_consumed;
-  ulong microblock_limit = pack->lim->max_microblocks_per_block - pack->microblock_cnt;
+  /* cavey: use saturating subtraction to handle harmonic blocks that may push
+     REQUESTED costs above limits prior to rebates arriving. */
+  ulong cu_limit         = fd_ulong_sat_sub( pack->lim->max_cost_per_block,        pack->cumulative_block_cost );
+  ulong byte_limit       = fd_ulong_sat_sub( pack->lim->max_data_bytes_per_block,  pack->data_bytes_consumed   );
+  ulong microblock_limit = fd_ulong_sat_sub( pack->lim->max_microblocks_per_block, pack->microblock_cnt        );
 
   FD_PACK_BITSET_DECLARE( bitset_rw_in_use );
   FD_PACK_BITSET_DECLARE( bitset_w_in_use  );
@@ -2526,17 +2710,82 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
   }
 
   if( FD_UNLIKELY( harmonic && pack->harmonic_decision==HARMONIC_MODE_HARMONIC ) ) {
-    /* Harmonic mode - schedule from pending_blocks treap only */
-    int result = fd_pack_try_schedule_block_txn( pack, bank_tile, out );
-    return (result > 0) ? 1UL : 0UL;
+    /* Harmonic mode - schedule from pending_blocks treap with transitive deps.
+       We schedule one transaction at a time (txn_limit=1). */
+    ulong * use_by_bank_txn = pack->use_by_bank_txn[ bank_tile ];
+    sched_return_t status = fd_pack_schedule_impl( pack, pack->pending_blocks,
+                                                   ULONG_MAX, 1UL, ULONG_MAX,
+                                                   bank_tile, NULL, use_by_bank_txn, out, 1,
+                                                   NULL, 0UL );
+    ulong nonempty = status.txns_scheduled;
+    if( nonempty ) {
+      pack->cumulative_block_cost       += status.cus_scheduled;
+      pack->data_bytes_consumed         += status.bytes_scheduled + MICROBLOCK_DATA_OVERHEAD;
+      pack->microblock_cnt              += 1UL;
+      pack->outstanding_microblock_mask |= 1UL << bank_tile;
+      return nonempty;
+    }
+
+    /* If no harmonic txn scheduled this iteration, try to schedule votes
+       that don't conflict with pending harmonic transactions.
+       Only do this AFTER the full harmonic block is received (including crank).
+       block_txn_idx starts at 1 and increments per insert, so (block_txn_idx - 1) = received count.
+       Fast path: if harmonic_acct_cnt==0, no conflicts possible.
+       If overflow, block all votes until harmonic done. */
+    if( FD_LIKELY( schedule_flags & FD_PACK_SCHEDULE_VOTE ) ) {
+      /* Must have received all expected harmonic txns (including crank) before checking conflicts */
+      int all_received = (pack->block_txn_idx - 1UL) >= pack->harmonic_block_txn_expected;
+      if( FD_UNLIKELY( !all_received ) ) return 0UL;
+
+      if( FD_UNLIKELY( pack->harmonic_accts_overflow ) ) return 0UL;
+
+      ulong vote_cus = fd_ulong_sat_sub( pack->lim->max_vote_cost_per_block, pack->cumulative_vote_cost );
+      ulong vote_txns = fd_ulong_min( vote_cus/FD_PACK_SIMPLE_VOTE_COST, pack->lim->max_txn_per_microblock );
+      ulong byte_limit = fd_ulong_sat_sub( fd_ulong_sat_sub( pack->lim->max_data_bytes_per_block, pack->data_bytes_consumed ), MICROBLOCK_DATA_OVERHEAD );
+
+      /* Fast path: if harmonic_acct_cnt==0, all pending txns are scheduled, schedule votes freely */
+      if( FD_LIKELY( pack->harmonic_acct_cnt == 0UL ) ) {
+        sched_return_t vstatus = fd_pack_schedule_impl( pack, pack->pending_votes,
+                                                        vote_cus, vote_txns, byte_limit,
+                                                        bank_tile, pack->pending_votes_smallest, use_by_bank_txn, out, 0,
+                                                        NULL, 0UL );
+        if( vstatus.txns_scheduled > 0UL ) {
+          pack->cumulative_vote_cost        += vstatus.cus_scheduled;
+          pack->cumulative_block_cost       += vstatus.cus_scheduled;
+          pack->data_bytes_consumed         += vstatus.bytes_scheduled + MICROBLOCK_DATA_OVERHEAD;
+          pack->microblock_cnt              += 1UL;
+          pack->outstanding_microblock_mask |= 1UL << bank_tile;
+          return vstatus.txns_scheduled;
+        }
+      } else {
+        /* Slow path: harmonic accounts present. Pass blocked_accts to schedule_impl
+           so it can skip votes that conflict with pending harmonic transactions. */
+        sched_return_t vstatus = fd_pack_schedule_impl( pack, pack->pending_votes,
+                                                        vote_cus, vote_txns, byte_limit,
+                                                        bank_tile, pack->pending_votes_smallest, use_by_bank_txn, out, 0,
+                                                        pack->harmonic_accts, pack->harmonic_acct_cnt );
+        if( vstatus.txns_scheduled > 0UL ) {
+          pack->cumulative_vote_cost        += vstatus.cus_scheduled;
+          pack->cumulative_block_cost       += vstatus.cus_scheduled;
+          pack->data_bytes_consumed         += vstatus.bytes_scheduled + MICROBLOCK_DATA_OVERHEAD;
+          pack->microblock_cnt              += 1UL;
+          pack->outstanding_microblock_mask |= 1UL << bank_tile;
+          return vstatus.txns_scheduled;
+        }
+      }
+    }
+    return 0UL;
   }
 
   /* Sprint/failed mode (harmonic_decision==HARMONIC_MODE_SPRINT or FAILED) or harmonic disabled - normal scheduling below */
 
-  /* TODO: Decide if these are exactly how we want to handle limits */
-  total_cus = fd_ulong_min( total_cus, pack->lim->max_cost_per_block - pack->cumulative_block_cost );
+  /* TODO: Decide if these are exactly how we want to handle limits.
+     
+    cavey: use saturating subtraction to handle harmonic blocks that may push
+    REQUESTED costs above limits prior to rebates arriving. */
+  total_cus = fd_ulong_min( total_cus, fd_ulong_sat_sub( pack->lim->max_cost_per_block, pack->cumulative_block_cost ) );
   ulong vote_cus = fd_ulong_min( (ulong)((float)total_cus * vote_fraction),
-                                 pack->lim->max_vote_cost_per_block - pack->cumulative_vote_cost );
+                                 fd_ulong_sat_sub( pack->lim->max_vote_cost_per_block, pack->cumulative_vote_cost ) );
   ulong vote_reserved_txns = fd_ulong_min( vote_cus/FD_PACK_SIMPLE_VOTE_COST,
                                            (ulong)((float)pack->lim->max_txn_per_microblock * vote_fraction) );
 
@@ -2555,13 +2804,13 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
   ulong cu_limit  = total_cus - vote_cus;
   ulong txn_limit = pack->lim->max_txn_per_microblock - vote_reserved_txns;
   ulong scheduled = 0UL;
-  ulong byte_limit = pack->lim->max_data_bytes_per_block - pack->data_bytes_consumed - MICROBLOCK_DATA_OVERHEAD;
+  ulong byte_limit = fd_ulong_sat_sub( fd_ulong_sat_sub( pack->lim->max_data_bytes_per_block, pack->data_bytes_consumed ), MICROBLOCK_DATA_OVERHEAD );
 
   sched_return_t status = {0}, status1 = {0};
 
   if( FD_LIKELY( schedule_flags & FD_PACK_SCHEDULE_VOTE ) ) {
     /* Schedule vote transactions */
-    status1= fd_pack_schedule_impl( pack, pack->pending_votes, vote_cus, vote_reserved_txns, byte_limit, bank_tile, pack->pending_votes_smallest, use_by_bank_txn, out+scheduled );
+    status1= fd_pack_schedule_impl( pack, pack->pending_votes, vote_cus, vote_reserved_txns, byte_limit, bank_tile, pack->pending_votes_smallest, use_by_bank_txn, out+scheduled, 0, NULL, 0UL );
 
     scheduled                   += status1.txns_scheduled;
     pack->cumulative_vote_cost  += status1.cus_scheduled;
@@ -2579,7 +2828,7 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
   if( FD_UNLIKELY( !!(schedule_flags & FD_PACK_SCHEDULE_BUNDLE) & (status1.txns_scheduled==0UL) ) ) {
     int bundle_result = fd_pack_try_schedule_bundle( pack, bank_tile, out );
     if( FD_UNLIKELY( bundle_result>0                         ) ) return (ulong)bundle_result;
-    if( FD_UNLIKELY( bundle_result==TRY_BUNDLE_HAS_CONFLICTS ) ) return 0UL;
+    // if( FD_UNLIKELY( bundle_result==TRY_BUNDLE_HAS_CONFLICTS ) ) return 0UL;
     /* in the NO_READY_BUNDLES or DOES_NOT_FIT case, we schedule like
        normal. */
     /* We have the early returns here because try_schedule_bundle does
@@ -2590,7 +2839,7 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
 
   /* Fill any remaining space with non-vote transactions */
   if( FD_LIKELY( schedule_flags & FD_PACK_SCHEDULE_TXN ) ) {
-    status = fd_pack_schedule_impl( pack, pack->pending,       cu_limit, txn_limit,          byte_limit, bank_tile, pack->pending_smallest,       use_by_bank_txn, out+scheduled );
+    status = fd_pack_schedule_impl( pack, pack->pending,       cu_limit, txn_limit,          byte_limit, bank_tile, pack->pending_smallest,       use_by_bank_txn, out+scheduled, 0, NULL, 0UL );
 
     scheduled                   += status.txns_scheduled;
     pack->cumulative_block_cost += status.cus_scheduled;
@@ -2617,186 +2866,6 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
 }
 
 
-/* Harmonic block scheduling: Walk the pending_blocks treap in FIFO order
-   (highest priority = lowest block_txn_idx) to find a non-conflicting
-   transaction.  Returns 1 if scheduled, 0 if none found.
-
-   Uses the same account lock checking as normal scheduling via acct_in_use. */
-#define TRY_SCHEDULE_BLOCK_NO_PENDING       (-1)
-#define TRY_SCHEDULE_BLOCK_ALL_CONFLICT     (-2)
-#define TRY_SCHEDULE_BLOCK_SUCCESS(n)       ( n)
-
-/* Local structure to track accounts from blocked transactions.
-   Used for transitive dependency checking: if B is blocked and C
-   conflicts with B, C must also be blocked even if C doesn't
-   conflict with in-flight transactions. */
-struct fd_blocked_acct {
-  fd_acct_addr_t acct;
-  int            writable;  /* 1 if writable, 0 if readonly */
-};
-typedef struct fd_blocked_acct fd_blocked_acct_t;
-
-/* Max accounts we can track from blocked transactions.
-   64 accounts/txn * 32 blocked txns = 2048 */
-#define FD_PACK_BLOCKED_ACCT_MAX 2048UL
-
-
-static inline int
-fd_pack_try_schedule_block_txn( fd_pack_t  * pack,
-                                ulong        bank_tile,
-                                fd_txn_p_t * out ) {
-
-  fd_pack_ord_txn_t * pool   = pack->pool;
-  treap_t           * blocks = pack->pending_blocks;
-
-  if( FD_UNLIKELY( treap_ele_cnt( blocks ) == 0UL ) ) return TRY_SCHEDULE_BLOCK_NO_PENDING;
-
-  fd_pack_addr_use_t * acct_in_use   = pack->acct_in_use;
-  fd_pack_addr_use_t * use_by_bank   = pack->use_by_bank    [ bank_tile ];
-  ulong              * use_by_bank_txn = pack->use_by_bank_txn[ bank_tile ];
-  ulong                use_by_bank_cnt = pack->use_by_bank_cnt[ bank_tile ];
-  ulong                bank_tile_mask  = 1UL << bank_tile;
-
-  /* Track accounts from blocked transactions for transitive dependencies
-
-    cavey TODO: this linear search is disgusting. figure something else
-    out that is faster and persistent across scheduling iterations. */
-  fd_blocked_acct_t blocked[ FD_PACK_BLOCKED_ACCT_MAX ];
-  ulong             blocked_cnt = 0UL;
-
-  /* Walk pending_blocks in FIFO order (highest priority first via rev_iter) */
-  treap_rev_iter_t _cur = treap_rev_iter_init( blocks, pool );
-  while( !treap_rev_iter_done( _cur ) ) {
-    fd_pack_ord_txn_t * cur = treap_rev_iter_ele( _cur, pool );
-    fd_txn_e_t * txn_e = cur->txn_e;
-    fd_txn_t const * txn = TXN( txn_e->txnp );
-    fd_acct_addr_t const * accts   = fd_txn_get_acct_addrs( txn, txn_e->txnp->payload );
-    fd_acct_addr_t const * alt_adj = txn_e->alt_accts - fd_txn_account_cnt( txn, FD_TXN_ACCT_CAT_IMM );
-
-    int has_conflict = 0;
-
-    /* Check writable accounts against in-flight (any use = conflict) */
-    for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_WRITABLE );
-         iter!=fd_txn_acct_iter_end(); iter=fd_txn_acct_iter_next( iter ) ) {
-      fd_acct_addr_t acct = *ACCT_ITER_TO_PTR( iter );
-      fd_pack_addr_use_t * use = acct_uses_query( acct_in_use, acct, NULL );
-      if( use && use->in_use_by ) { has_conflict = 1; break; }
-    }
-
-    /* Check readonly accounts against in-flight (only writers = conflict) */
-    if( !has_conflict ) {
-      for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_READONLY );
-           iter!=fd_txn_acct_iter_end(); iter=fd_txn_acct_iter_next( iter ) ) {
-        fd_acct_addr_t const * acct = ACCT_ITER_TO_PTR( iter );
-        if( fd_pack_unwritable_contains( acct ) ) continue;
-        fd_pack_addr_use_t * use = acct_uses_query( acct_in_use, *acct, NULL );
-        if( use && (use->in_use_by & FD_PACK_IN_USE_WRITABLE) ) { has_conflict = 1; break; }
-      }
-    }
-
-    /* Check writable accounts against blocked transactions (any use = conflict) */
-    if( !has_conflict ) {
-      for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_WRITABLE );
-           iter!=fd_txn_acct_iter_end() && !has_conflict; iter=fd_txn_acct_iter_next( iter ) ) {
-        fd_acct_addr_t acct = *ACCT_ITER_TO_PTR( iter );
-        for( ulong i=0UL; i<blocked_cnt; i++ ) {
-          if( FD_UNLIKELY( !memcmp( blocked[i].acct.b, acct.b, 32 ) ) ) { has_conflict = 1; break; }
-        }
-      }
-    }
-
-    /* Check readonly accounts against blocked transactions (only writers = conflict) */
-    if( !has_conflict ) {
-      for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_READONLY );
-           iter!=fd_txn_acct_iter_end() && !has_conflict; iter=fd_txn_acct_iter_next( iter ) ) {
-        fd_acct_addr_t const * acct = ACCT_ITER_TO_PTR( iter );
-        if( fd_pack_unwritable_contains( acct ) ) continue;
-        for( ulong i=0UL; i<blocked_cnt; i++ ) {
-          if( FD_UNLIKELY( blocked[i].writable && !memcmp( blocked[i].acct.b, acct->b, 32 ) ) ) { has_conflict = 1; break; }
-        }
-      }
-    }
-
-    if( has_conflict ) {
-      /* Add this transaction's accounts to blocked set for transitive deps.
-         If we overflow, stop searching - can't track more dependencies. */
-      for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_WRITABLE );
-           iter!=fd_txn_acct_iter_end(); iter=fd_txn_acct_iter_next( iter ) ) {
-        if( FD_UNLIKELY( blocked_cnt >= FD_PACK_BLOCKED_ACCT_MAX ) ) return TRY_SCHEDULE_BLOCK_ALL_CONFLICT;
-        blocked[ blocked_cnt ].acct     = *ACCT_ITER_TO_PTR( iter );
-        blocked[ blocked_cnt ].writable = 1;
-        blocked_cnt++;
-      }
-      for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_READONLY );
-           iter!=fd_txn_acct_iter_end(); iter=fd_txn_acct_iter_next( iter ) ) {
-        fd_acct_addr_t const * acct = ACCT_ITER_TO_PTR( iter );
-        if( fd_pack_unwritable_contains( acct ) ) continue;
-        if( FD_UNLIKELY( blocked_cnt >= FD_PACK_BLOCKED_ACCT_MAX ) ) return TRY_SCHEDULE_BLOCK_ALL_CONFLICT;
-        blocked[ blocked_cnt ].acct     = *acct;
-        blocked[ blocked_cnt ].writable = 0;
-        blocked_cnt++;
-      }
-      _cur = treap_rev_iter_next( _cur, pool );
-      continue;
-    }
-
-    /* No conflict - schedule this transaction */
-
-    /* Add locks for writable accounts */
-    for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_WRITABLE );
-         iter!=fd_txn_acct_iter_end(); iter=fd_txn_acct_iter_next( iter ) ) {
-      fd_acct_addr_t acct = *ACCT_ITER_TO_PTR( iter );
-      fd_pack_addr_use_t * use = acct_uses_query( acct_in_use, acct, NULL );
-      if( !use ) { use = acct_uses_insert( acct_in_use, acct ); use->in_use_by = 0UL; }
-      use->in_use_by |= bank_tile_mask | FD_PACK_IN_USE_WRITABLE;
-      use_by_bank[ use_by_bank_cnt++ ] = *use;
-    }
-
-    /* Add locks for readonly accounts */
-    for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_READONLY );
-         iter!=fd_txn_acct_iter_end(); iter=fd_txn_acct_iter_next( iter ) ) {
-      fd_acct_addr_t acct = *ACCT_ITER_TO_PTR( iter );
-      if( fd_pack_unwritable_contains( &acct ) ) continue;
-      fd_pack_addr_use_t * use = acct_uses_query( acct_in_use, acct, NULL );
-      if( !use ) { use = acct_uses_insert( acct_in_use, acct ); use->in_use_by = 0UL; }
-      if( !(use->in_use_by & bank_tile_mask) ) use_by_bank[ use_by_bank_cnt++ ] = *use;
-      use->in_use_by |= bank_tile_mask;
-    }
-
-    pack->use_by_bank_cnt    [ bank_tile ] = use_by_bank_cnt;
-    *use_by_bank_txn = use_by_bank_cnt;
-    pack->outstanding_microblock_mask |= bank_tile_mask;
-
-    /* Copy transaction to output */
-    fd_memcpy( out->payload, txn_e->txnp->payload, txn_e->txnp->payload_sz );
-    fd_memcpy( TXN(out), txn, fd_txn_footprint( txn->instr_cnt, txn->addr_table_lookup_cnt ) );
-    out->payload_sz                   = txn_e->txnp->payload_sz;
-    out->pack_cu.requested_exec_plus_acct_data_cus = txn_e->txnp->pack_cu.requested_exec_plus_acct_data_cus;
-    out->pack_cu.non_execution_cus    = txn_e->txnp->pack_cu.non_execution_cus;
-    out->scheduler_arrival_time_nanos = txn_e->txnp->scheduler_arrival_time_nanos;
-    out->source_tpu                   = txn_e->txnp->source_tpu;
-    out->source_ipv4                  = txn_e->txnp->source_ipv4;
-    out->flags                        = txn_e->txnp->flags & ~(FD_TXN_P_FLAGS_BUNDLE | FD_TXN_P_FLAGS_INITIALIZER_BUNDLE);
-
-    /* Update block accounting */
-    ulong compute = txn_e->txnp->pack_cu.requested_exec_plus_acct_data_cus + txn_e->txnp->pack_cu.non_execution_cus;
-    pack->cumulative_block_cost += compute;
-    pack->data_bytes_consumed   += txn_e->txnp->payload_sz + MICROBLOCK_DATA_OVERHEAD;
-    pack->microblock_cnt++;
-
-    /* Remove from treap and pool, update inflight */
-    treap_idx_remove( blocks, treap_idx_fast( cur, pool ), pool );
-    cur->root = FD_ORD_TXN_ROOT_FREE;
-    trp_pool_idx_release( pool, (ushort)(cur - pool) );
-    pack->harmonic_inflight++;
-
-    return TRY_SCHEDULE_BLOCK_SUCCESS(1);
-  }
-
-  return TRY_SCHEDULE_BLOCK_ALL_CONFLICT;
-}
-
-
 /* Release account locks for a completed harmonic transaction.
    Uses the standard fd_pack_microblock_complete. */
 void
@@ -2814,21 +2883,57 @@ fd_pack_harmonic_reset( fd_pack_t * pack ) {
   fd_pack_ord_txn_t * pool   = pack->pool;
   treap_t           * blocks = pack->pending_blocks;
 
-  /* Delete all transactions from pending_blocks treap */
+  FD_PACK_BITSET_DECLARE( bitset_rw_in_use );
+  FD_PACK_BITSET_DECLARE( bitset_w_in_use  );
+  FD_PACK_BITSET_COPY( bitset_rw_in_use, pack->bitset_rw_in_use );
+  FD_PACK_BITSET_COPY( bitset_w_in_use,  pack->bitset_w_in_use  );
+
+  /* Delete all transactions from pending_blocks treap, releasing bitset references */
   while( treap_ele_cnt( blocks ) > 0UL ) {
     treap_rev_iter_t _cur = treap_rev_iter_init( blocks, pool );
     fd_pack_ord_txn_t * cur = treap_rev_iter_ele( _cur, pool );
+
+    /* Release bitset references for this transaction's accounts */
+    fd_txn_t * txn = TXN( cur->txn );
+    uchar * payload = cur->txn->payload;
+    fd_acct_addr_t const * accts   = fd_txn_get_acct_addrs( txn, payload );
+    fd_acct_addr_t const * alt_adj = cur->txn_e->alt_accts - fd_txn_account_cnt( txn, FD_TXN_ACCT_CAT_IMM );
+
+    for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_WRITABLE );
+        iter!=fd_txn_acct_iter_end(); iter=fd_txn_acct_iter_next( iter ) ) {
+      release_result_t ret = release_bit_reference( pack, ACCT_ITER_TO_PTR( iter ) );
+      FD_PACK_BITSET_CLEARN( bitset_rw_in_use, ret.clear_rw_bit );
+      FD_PACK_BITSET_CLEARN( bitset_w_in_use,  ret.clear_w_bit  );
+    }
+
+    for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_READONLY );
+        iter!=fd_txn_acct_iter_end(); iter=fd_txn_acct_iter_next( iter ) ) {
+      if( FD_UNLIKELY( fd_pack_unwritable_contains( ACCT_ITER_TO_PTR( iter ) ) ) ) continue;
+      release_result_t ret = release_bit_reference( pack, ACCT_ITER_TO_PTR( iter ) );
+      FD_PACK_BITSET_CLEARN( bitset_rw_in_use, ret.clear_rw_bit );
+      FD_PACK_BITSET_CLEARN( bitset_w_in_use,  ret.clear_w_bit  );
+    }
+
     treap_idx_remove( blocks, treap_idx_fast( cur, pool ), pool );
     cur->root = FD_ORD_TXN_ROOT_FREE;
     trp_pool_idx_release( pool, (ushort)(cur - pool) );
   }
 
-  pack->block_txn_idx                = 0UL;
+  FD_PACK_BITSET_COPY( pack->bitset_rw_in_use, bitset_rw_in_use );
+  FD_PACK_BITSET_COPY( pack->bitset_w_in_use,  bitset_w_in_use  );
+
+  pack->block_txn_idx                = 1UL;  /* Reserve idx=0 for crank */
   pack->harmonic_decision             = 0;
   pack->harmonic_block_slot          = 0UL;
   pack->harmonic_inflight            = 0UL;
   pack->harmonic_block_txn_expected  = 0UL;
+  pack->vote_drain_failed            = 0;
   pack->harmonic_block_txn_completed = 0UL;
+
+  /* Clear harmonic account tracking map */
+  harmonic_acct_map_clear( pack->harmonic_accts );
+  pack->harmonic_acct_cnt       = 0UL;
+  pack->harmonic_accts_overflow = 0;
 }
 
 
@@ -2839,6 +2944,8 @@ static inline int
 fd_pack_harmonic_fail_block( fd_pack_t         * pack,
                              fd_pack_ord_txn_t * ord,
                              int                 reject_reason ) {
+  FD_BASE58_ENCODE_32_BYTES( ord->txn_e->txnp->payload+1, signature );
+  FD_LOG_INFO(( "HARMONIC: failing block due to transaction %s; reason=%d", signature, reject_reason ));
   trp_pool_ele_release( pack->pool, ord );
   fd_pack_harmonic_reset( pack );
   pack->harmonic_decision = HARMONIC_MODE_FAILED;
@@ -2853,25 +2960,31 @@ fd_pack_harmonic_fail_block( fd_pack_t         * pack,
    block transactions are cleared, harmonic mode transitions to FAILED,
    and no more block transactions will be accepted for this slot. */
 int
-fd_pack_harmonic_insert_fini( fd_pack_t  * pack,
-                              fd_txn_e_t * txne,
-                              ulong        block_slot,
-                              ulong        block_txn_expected ) {
+fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
+                              fd_txn_e_t   * txne,
+                              ulong          block_slot,
+                              ulong          block_txn_expected,
+                              void   const * block_meta,
+                              int            is_ib,
+                              ulong        * opt_delete_cnt ) {
 
   fd_pack_ord_txn_t * ord  = (fd_pack_ord_txn_t *)txne;
   fd_pack_ord_txn_t * pool = pack->pool;
+
+  /* If already in SPRINT or FAILED, reject block transactions entirely.
+     This check must happen BEFORE the slot-change reset below, otherwise
+     a late block arrival would reset us back to UNDECIDED and bypass rejection. */
+  if( FD_UNLIKELY( pack->harmonic_decision == HARMONIC_MODE_FAILED
+                || pack->harmonic_decision == HARMONIC_MODE_SPRINT ) ) {
+    trp_pool_ele_release( pool, ord );
+    return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
+  }
 
   /* Handle block_slot change: reset state for new block. */
   if( FD_UNLIKELY( block_slot != pack->harmonic_block_slot ) ) {
     fd_pack_harmonic_reset( pack );
     pack->harmonic_block_slot          = block_slot;
     pack->harmonic_block_txn_expected  = block_txn_expected;
-  }
-
-  /* If this block already failed validation, reject all further transactions */
-  if( FD_UNLIKELY( pack->harmonic_decision == HARMONIC_MODE_FAILED ) ) {
-    trp_pool_ele_release( pool, ord );
-    return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
   }
 
   fd_txn_t * txn     = TXN( txne->txnp );
@@ -2892,7 +3005,9 @@ fd_pack_harmonic_insert_fini( fd_pack_t  * pack,
     return fd_pack_harmonic_fail_block( pack, ord, FD_PACK_INSERT_REJECT_INVALID_NONCE );
   }
   int is_durable_nonce = nonce_result==2;
-  ord->txn->flags &= ~FD_TXN_P_FLAGS_DURABLE_NONCE;
+  /* Clear bundle flags - harmonic transactions are NOT bundles.
+     They should be treated as regular non-vote transactions. */
+  ord->txn->flags &= ~(FD_TXN_P_FLAGS_BUNDLE | FD_TXN_P_FLAGS_INITIALIZER_BUNDLE | FD_TXN_P_FLAGS_DURABLE_NONCE);
   ord->txn->flags |= fd_uint_if( is_durable_nonce, FD_TXN_P_FLAGS_DURABLE_NONCE, 0U );
 
   /* Validate transaction (affordability, size, accounts, sysvars).
@@ -2903,17 +3018,112 @@ fd_pack_harmonic_insert_fini( fd_pack_t  * pack,
   }
 
   /* Override rewards with FIFO ordering using bundle machinery.
-     Block transactions are scheduled in arrival order, not by priority. */
-  ulong block_idx = pack->block_txn_idx;
+     Block transactions are scheduled in arrival order, not by priority.
+     Initializer bundle (crank) uses idx=0 to be scheduled first. */
+  ulong block_idx = fd_ulong_if( is_ib, 0UL, pack->block_txn_idx );
   ulong prev_reward = ((BUNDLE_L_PRIME * (BUNDLE_N - block_idx))) - 1UL;
   ulong prev_cost = 1UL<<32;
   ord->rewards = (uint)(((ulong)ord->compute_est * (prev_reward + 1UL) + prev_cost - 1UL) / prev_cost);
   ord->root    = FD_ORD_TXN_ROOT_PENDING_BLOCK;
+  if( FD_LIKELY( is_ib ) ) ord->txn->flags |= FD_TXN_P_FLAGS_INITIALIZER_BUNDLE;
+
+  /* Initialize bitsets for fast conflict detection.
+     This enables the bitset fast-path in fd_pack_try_schedule_block_txn.
+     We skip penalty treap logic since block transactions use FIFO ordering. */
+  FD_PACK_BITSET_CLEAR( ord->rw_bitset );
+  FD_PACK_BITSET_CLEAR( ord->w_bitset  );
+
+  for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_WRITABLE );
+      iter!=fd_txn_acct_iter_end(); iter=fd_txn_acct_iter_next( iter ) ) {
+    fd_acct_addr_t acct = *ACCT_ITER_TO_PTR( iter );
+    fd_pack_bitset_acct_mapping_t * q = bitset_map_query( pack->acct_to_bitset, acct, NULL );
+    if( FD_UNLIKELY( q==NULL ) ) {
+      q = bitset_map_insert( pack->acct_to_bitset, acct );
+      q->ref_cnt                  = 0UL;
+      q->first_instance           = ord;
+      q->first_instance_was_write = 1;
+      q->bit                      = FD_PACK_BITSET_FIRST_INSTANCE;
+    } else if( FD_UNLIKELY( q->bit == FD_PACK_BITSET_FIRST_INSTANCE ) ) {
+      q->bit = pack->bitset_avail[ pack->bitset_avail_cnt ];
+      pack->bitset_avail_cnt = fd_ulong_if( !!pack->bitset_avail_cnt, pack->bitset_avail_cnt-1UL, 0UL );
+      FD_PACK_BITSET_SETN( q->first_instance->rw_bitset, q->bit );
+      if( q->first_instance_was_write ) FD_PACK_BITSET_SETN( q->first_instance->w_bitset, q->bit );
+    }
+    q->ref_cnt++;
+    FD_PACK_BITSET_SETN( ord->rw_bitset, q->bit );
+    FD_PACK_BITSET_SETN( ord->w_bitset,  q->bit );
+  }
+
+  for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_READONLY );
+      iter!=fd_txn_acct_iter_end(); iter=fd_txn_acct_iter_next( iter ) ) {
+    fd_acct_addr_t acct = *ACCT_ITER_TO_PTR( iter );
+    if( FD_UNLIKELY( fd_pack_unwritable_contains( &acct ) ) ) continue;
+    fd_pack_bitset_acct_mapping_t * q = bitset_map_query( pack->acct_to_bitset, acct, NULL );
+    if( FD_UNLIKELY( q==NULL ) ) {
+      q = bitset_map_insert( pack->acct_to_bitset, acct );
+      q->ref_cnt                  = 0UL;
+      q->first_instance           = ord;
+      q->first_instance_was_write = 0;
+      q->bit                      = FD_PACK_BITSET_FIRST_INSTANCE;
+    } else if( FD_UNLIKELY( q->bit == FD_PACK_BITSET_FIRST_INSTANCE ) ) {
+      q->bit = pack->bitset_avail[ pack->bitset_avail_cnt ];
+      pack->bitset_avail_cnt = fd_ulong_if( !!pack->bitset_avail_cnt, pack->bitset_avail_cnt-1UL, 0UL );
+      FD_PACK_BITSET_SETN( q->first_instance->rw_bitset, q->bit );
+      if( q->first_instance_was_write ) FD_PACK_BITSET_SETN( q->first_instance->w_bitset, q->bit );
+    }
+    q->ref_cnt++;
+    FD_PACK_BITSET_SETN( ord->rw_bitset, q->bit );
+  }
+
+  /* Capacity check: harmonic txns are high priority, delete from regular treaps to make room.
+     We don't count harmonic txns in pending_txn_cnt, but we need pool slots for them.
+     Delete worst regular txns if pack is at capacity. The pool has extra_depth slots
+     beyond pack_depth, but we should try to keep regular txn count within pack_depth. */
+  ulong delete_cnt = 0UL;
+  while( FD_UNLIKELY( pack->pending_txn_cnt > 0UL && pack->pending_txn_cnt >= pack->pack_depth ) ) {
+    ulong _delete_cnt = delete_worst( pack, FLT_MAX, 0 );
+    delete_cnt += _delete_cnt;
+    if( FD_UNLIKELY( !_delete_cnt ) ) break; /* No more regular txns to delete, use extra space */
+  }
+  if( opt_delete_cnt ) *opt_delete_cnt = delete_cnt;
 
   /* Insert into pending_blocks treap */
   ushort txn_idx = (ushort)(ord - pool);
   treap_idx_insert( pack->pending_blocks, txn_idx, pool );
   pack->block_txn_idx++;
+
+  /* Store the block metadata in the parallel bundle_meta array */
+  if( FD_LIKELY( block_meta && pack->bundle_meta_sz ) ) {
+    memcpy( (uchar *)pack->bundle_meta + (ulong)txn_idx * pack->bundle_meta_sz,
+            block_meta, pack->bundle_meta_sz );
+  }
+
+  /* If this is the initializer bundle (crank), set IB state to pending */
+  if( FD_UNLIKELY( is_ib ) ) {
+    pack->initializer_bundle_state = FD_PACK_IB_STATE_PENDING;
+  }
+
+  /* Track accounts used by this harmonic transaction for vote conflict checking.
+     If map overflows, set overflow flag to block all votes until harmonic done. */
+  if( FD_LIKELY( !pack->harmonic_accts_overflow ) ) {
+    for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_ALL );
+        iter!=fd_txn_acct_iter_end(); iter=fd_txn_acct_iter_next( iter ) ) {
+      fd_acct_addr_t acct = *ACCT_ITER_TO_PTR( iter );
+      fd_pack_harmonic_acct_t * entry = harmonic_acct_map_query( pack->harmonic_accts, acct, NULL );
+      if( FD_LIKELY( entry ) ) {
+        entry->ref_cnt++;
+      } else {
+        entry = harmonic_acct_map_insert( pack->harmonic_accts, acct );
+        if( FD_UNLIKELY( !entry ) ) {
+          /* Map overflow - set flag to block all votes */
+          pack->harmonic_accts_overflow = 1;
+          break;
+        }
+        entry->ref_cnt = 1UL;
+        pack->harmonic_acct_cnt++;
+      }
+    }
+  }
 
   return 1;
 }
@@ -2930,12 +3140,16 @@ fd_pack_harmonic_state_update( fd_pack_t * pack,
                                long        harmonic_threshold_ns ) {
   switch( pack->harmonic_decision ) {
     case HARMONIC_MODE_UNDECIDED: {
-      if( treap_ele_cnt( pack->pending_blocks ) > 0UL ) {
+      ulong pending_cnt = treap_ele_cnt( pack->pending_blocks );
+      if( pending_cnt > 0UL ) {
         /* Block transactions arrived - enter harmonic mode */
         pack->harmonic_decision = HARMONIC_MODE_HARMONIC;
+        FD_LOG_INFO(( "HARMONIC: UNDECIDED -> HARMONIC (pending=%lu, expected=%lu)",
+                      pending_cnt, pack->harmonic_block_txn_expected ));
       } else if( approx_wallclock_ns >= harmonic_threshold_ns ) {
         /* Timeout reached without block transactions - enter sprint mode */
         pack->harmonic_decision = HARMONIC_MODE_SPRINT;
+        FD_LOG_INFO(( "HARMONIC: UNDECIDED -> SPRINT (threshold reached, no block txns)" ));
       }
       break;
     }
@@ -2951,26 +3165,57 @@ fd_pack_harmonic_state_update( fd_pack_t * pack,
           scheduled_cnt >= pack->harmonic_block_txn_expected ) {
         /* All harmonic block transactions scheduled - switch to sprint mode to dump votes */
         pack->harmonic_decision = HARMONIC_MODE_SPRINT;
+        FD_LOG_INFO(( "HARMONIC: HARMONIC -> SPRINT (block complete: scheduled=%lu, expected=%lu, inflight=%lu, completed=%lu)",
+                      scheduled_cnt, pack->harmonic_block_txn_expected,
+                      pack->harmonic_inflight, pack->harmonic_block_txn_completed ));
       }
       break;
     }
     case HARMONIC_MODE_SPRINT:
-    default:
+    case HARMONIC_MODE_FAILED:
       /* Already in sprint mode, nothing to do */
+      break;
+    default:
+      FD_LOG_ERR(( "HARMONIC: invalid decision state: %d", pack->harmonic_decision ));
       break;
   }
 }
 
 
 /* Harmonic state accessors */
-int   fd_pack_harmonic_decision           ( fd_pack_t const * pack ) {  return pack->harmonic_decision;                 }
-void  fd_pack_harmonic_set_decision       ( fd_pack_t * pack, int decision ) { pack->harmonic_decision = decision;      }
-ulong fd_pack_harmonic_pending_cnt        ( fd_pack_t const * pack ) {  return treap_ele_cnt( pack->pending_blocks );   }
-ulong fd_pack_harmonic_inflight_cnt       ( fd_pack_t const * pack ) {  return pack->harmonic_inflight;                 }
-int   fd_pack_harmonic_pool_full          ( fd_pack_t const * pack ) {  return trp_pool_free( pack->pool ) == 0UL;      }
-ulong fd_pack_harmonic_block_slot         ( fd_pack_t const * pack ) {  return pack->harmonic_block_slot;               }
-ulong fd_pack_harmonic_block_txn_expected ( fd_pack_t const * pack ) {  return pack->harmonic_block_txn_expected;       }
-ulong fd_pack_harmonic_block_txn_completed( fd_pack_t const * pack ) {  return pack->harmonic_block_txn_completed;      }
+int   fd_pack_harmonic_decision   ( fd_pack_t const * pack ) { return pack->harmonic_decision;               }
+ulong fd_pack_harmonic_pending_cnt( fd_pack_t const * pack ) { return treap_ele_cnt( pack->pending_blocks ); }
+ulong fd_pack_harmonic_inflight_cnt( fd_pack_t const * pack ) { return pack->harmonic_inflight;              }
+int   fd_pack_harmonic_pool_full  ( fd_pack_t const * pack ) { return trp_pool_free( pack->pool ) == 0UL;    }
+int   fd_pack_vote_drain_failed   ( fd_pack_t const * pack ) { return pack->vote_drain_failed;               }
+void  fd_pack_set_vote_drain_failed( fd_pack_t * pack )      { pack->vote_drain_failed = 1;                  }
+
+/* Check if a vote would conflict with pending harmonic transactions.
+   Returns 1 if the vote conflicts and should not be scheduled, 0 if safe.
+   Fast path: if map is empty (cnt==0), no conflicts possible. */
+int
+fd_pack_harmonic_vote_conflicts( fd_pack_t * pack,
+                                 fd_txn_t  const * txn,
+                                 uchar     const * payload ) {
+  /* If map overflowed, worst-case: block all votes */
+  if( FD_UNLIKELY( pack->harmonic_accts_overflow ) ) return 1;
+
+  /* Fast path: if no harmonic accounts tracked, no conflicts */
+  if( FD_LIKELY( pack->harmonic_acct_cnt == 0UL ) ) return 0;
+
+  /* Check all accounts in the vote transaction */
+  fd_acct_addr_t const * accts = fd_txn_get_acct_addrs( txn, payload );
+  for( fd_txn_acct_iter_t iter=fd_txn_acct_iter_init( txn, FD_TXN_ACCT_CAT_ALL );
+      iter!=fd_txn_acct_iter_end(); iter=fd_txn_acct_iter_next( iter ) ) {
+    ulong idx = fd_txn_acct_iter_idx( iter );
+    fd_acct_addr_t const * acct = &accts[ idx ];
+    if( FD_UNLIKELY( harmonic_acct_map_query( pack->harmonic_accts, *acct, NULL ) ) ) {
+      return 1;  /* Conflict found */
+    }
+  }
+
+  return 0;  /* No conflicts */
+}
 
 
 ulong fd_pack_bank_tile_cnt     ( fd_pack_t const * pack ) { return pack->bank_tile_cnt;         }
@@ -3085,6 +3330,7 @@ fd_pack_end_block( fd_pack_t * pack ) {
   pack->cumulative_vote_cost        = 0UL;
   pack->cumulative_rebated_cus      = 0UL;
   pack->outstanding_microblock_mask = 0UL;
+  pack->vote_drain_failed           = 0;
 
   pack->initializer_bundle_state = FD_PACK_IB_STATE_NOT_INITIALIZED;
 
