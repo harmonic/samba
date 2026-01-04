@@ -729,28 +729,34 @@ int fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
                                   int            is_ib,
                                   ulong        * opt_delete_cnt );
 
-/* Harmonic decision state values */
+/* Harmonic state machine states.
+   UNDECIDED: Waiting for harmonic block transactions to arrive.
+   HARMONIC:  Received block transactions, scheduling them.
+   SPRINT:    Harmonic block complete (or skipped), scheduling votes/normal txns.
+   FAILED:    Block validation failed, behaves like SPRINT.
+   DONE:      Slot is ending, block_end_reason indicates why. */
 #define HARMONIC_MODE_UNDECIDED  0
 #define HARMONIC_MODE_HARMONIC   1
 #define HARMONIC_MODE_SPRINT    -1
-#define HARMONIC_MODE_FAILED    -2  /* Block validation failed, skip to sprint */
+#define HARMONIC_MODE_FAILED    -2
+#define HARMONIC_MODE_DONE      -3
 
-/* fd_pack_harmonic_state_update: Updates harmonic state machine.
-   Called each scheduling iteration to transition between states:
-   - UNDECIDED -> HARMONIC: when block transactions arrive
-   - UNDECIDED -> SPRINT: when threshold time reached without block txns
-   - HARMONIC -> SPRINT: when all expected block txns have completed
-   Note: FAILED state is entered via fd_pack_harmonic_insert_fini when
-   any block transaction fails validation.  FAILED is terminal for the
-   slot and behaves like SPRINT. */
-void fd_pack_harmonic_state_update( fd_pack_t * pack,
-                                    long        approx_wallclock_ns,
-                                    long        harmonic_threshold_ns );
+/* Slot end buffer values for harmonic mode.
+   BASE: default buffer when harmonic mode enabled but not actively broadcasting
+   EXTENSION: extended buffer while broadcasting harmonic block (HARMONIC state)
+   (most of the time will go unused, this is just for worst case) */
+#define FD_PACK_HARMONIC_BUFFER_NS    (100000000L)  /* 100ms base buffer */
+#define FD_PACK_HARMONIC_EXTENSION_NS (200000000L)  /* 200ms extension */
 
-/* fd_pack_harmonic_decision: Returns the decision state:
-   HARMONIC_MODE_UNDECIDED, HARMONIC_MODE_HARMONIC, HARMONIC_MODE_SPRINT,
-   or HARMONIC_MODE_FAILED */
-FD_FN_PURE int fd_pack_harmonic_decision( fd_pack_t const * pack );
+/* fd_pack_harmonic_state: Returns the current harmonic state. */
+FD_FN_PURE int fd_pack_harmonic_state( fd_pack_t const * pack );
+
+/* fd_pack_harmonic_slot_end_buffer: Returns the recommended slot_end_ns_buffer.
+   Updated by the state machine crank based on current state. */
+FD_FN_PURE long fd_pack_harmonic_slot_end_buffer( fd_pack_t const * pack );
+
+/* fd_pack_harmonic_done: Returns 1 if in DONE state (slot should end), 0 otherwise. */
+FD_FN_PURE int fd_pack_harmonic_done( fd_pack_t const * pack );
 
 /* fd_pack_harmonic_pending_cnt: Returns number of pending block txns */
 FD_FN_PURE ulong fd_pack_harmonic_pending_cnt( fd_pack_t const * pack );
@@ -761,12 +767,36 @@ FD_FN_PURE ulong fd_pack_harmonic_inflight_cnt( fd_pack_t const * pack );
 /* fd_pack_harmonic_pool_full: Returns 1 if treap pool is exhausted */
 FD_FN_PURE int fd_pack_harmonic_pool_full( fd_pack_t const * pack );
 
-/* fd_pack_vote_drain_failed: Returns 1 if we tried to schedule votes but failed.
-   Reset each slot by fd_pack_end_block. */
-FD_FN_PURE int fd_pack_vote_drain_failed( fd_pack_t const * pack );
+/* Block end failure flags (bitset).  Success is implied when flags==0.
+   Multiple failures can occur (e.g., harmonic timeout followed by vote drain failure). */
+#define FD_PACK_END_FLAG_HARMONIC_TIMEOUT (1<<0)  /* Harmonic block never fully arrived */
+#define FD_PACK_END_FLAG_VOTE_DRAIN       (1<<1)  /* Post-harmonic vote scheduling failed */
 
-/* fd_pack_set_vote_drain_failed: Mark that vote scheduling failed. */
-void fd_pack_set_vote_drain_failed( fd_pack_t * pack );
+/* fd_pack_harmonic_end_flags: Returns bitset of failure flags, or 0 for success.
+   Reset by fd_pack_end_block. */
+FD_FN_PURE int fd_pack_harmonic_end_flags( fd_pack_t const * pack );
+
+/* fd_pack_harmonic_state_crank: Crank the harmonic state machine.
+   Called once after each scheduling attempt to handle all state transitions:
+   - UNDECIDED -> HARMONIC: block transactions arrived
+   - UNDECIDED -> SPRINT: threshold reached without blocks
+   - HARMONIC -> SPRINT: all expected blocks scheduled
+   - SPRINT/FAILED -> DONE: slot ended (sets end reason)
+   - HARMONIC/UNDECIDED -> DONE: stuck + timeout (sets HARMONIC_TIMEOUT)
+   
+   approx_wallclock_ns:   current wall clock time
+   harmonic_threshold_ns: deadline for receiving harmonic blocks
+   past_end_time:         1 if past slot_end_ns + buffer
+   pending_votes:         number of pending votes remaining
+   schedule_cnt:          number of transactions scheduled this iteration
+   tried_votes:           1 if this scheduling attempt included votes */
+void fd_pack_harmonic_state_crank( fd_pack_t * pack,
+                                     long        approx_wallclock_ns,
+                                     long        harmonic_threshold_ns,
+                                     int         past_end_time,
+                                     ulong       pending_votes,
+                                     ulong       schedule_cnt,
+                                     int         tried_votes );
 
 /* fd_pack_harmonic_vote_conflicts: Check if a vote would conflict with pending
    harmonic transactions. Returns 1 if conflict found, 0 if safe to schedule.
