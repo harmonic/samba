@@ -487,6 +487,7 @@ struct fd_pack_private {
 
   ulong      cumulative_block_cost;
   ulong      cumulative_vote_cost;
+  ulong      full_max_vote_cost_per_block; /* Original vote limit, restored after harmonic */
 
   /* expire_before: Any transactions with expires_at strictly less than
      the current expire_before are removed from the available pending
@@ -2952,7 +2953,8 @@ fd_pack_harmonic_fail_block( fd_pack_t         * pack,
   FD_BASE58_ENCODE_32_BYTES( ord->txn_e->txnp->payload+1, signature );
   FD_LOG_INFO(( "HARMONIC: failing block due to transaction %s; reason=%d", signature, reject_reason ));
   trp_pool_ele_release( pack->pool, ord );
-  pack->harmonic_decision = HARMONIC_MODE_FAILED;
+  pack->harmonic_decision            = HARMONIC_MODE_FAILED;
+  pack->lim->max_vote_cost_per_block = pack->full_max_vote_cost_per_block;
   return reject_reason;
 }
 
@@ -3228,8 +3230,9 @@ fd_pack_harmonic_state_crank( fd_pack_t * pack,
       } else if( approx_wallclock_ns >= harmonic_threshold_ns ) {
         /* Timeout reached without block transactions - enter sprint mode
            Set HARMONIC_TIMEOUT flag since we never received the block */
-        pack->block_end_flags   |= FD_PACK_END_FLAG_HARMONIC_TIMEOUT;
-        pack->harmonic_decision  = HARMONIC_MODE_SPRINT;
+        pack->block_end_flags              |= FD_PACK_END_FLAG_HARMONIC_TIMEOUT;
+        pack->harmonic_decision             = HARMONIC_MODE_SPRINT;
+        pack->lim->max_vote_cost_per_block  = pack->full_max_vote_cost_per_block;
         FD_LOG_INFO(( "HARMONIC: UNDECIDED -> SPRINT (threshold reached, no block txns)" ));
       }
       break;
@@ -3249,17 +3252,19 @@ fd_pack_harmonic_state_crank( fd_pack_t * pack,
           pending_cnt == 0UL &&
           scheduled_cnt >= pack->harmonic_block_txn_expected ) {
         /* All harmonic block transactions scheduled - switch to sprint mode, reset buffer */
-        pack->harmonic_decision  = HARMONIC_MODE_SPRINT;
-        pack->slot_end_ns_buffer = FD_PACK_HARMONIC_BUFFER_NS;
+        pack->harmonic_decision              = HARMONIC_MODE_SPRINT;
+        pack->slot_end_ns_buffer             = FD_PACK_HARMONIC_BUFFER_NS;
+        pack->lim->max_vote_cost_per_block   = pack->full_max_vote_cost_per_block;
         FD_LOG_INFO(( "HARMONIC: HARMONIC -> SPRINT (block complete: scheduled=%lu, expected=%lu)",
                       scheduled_cnt, pack->harmonic_block_txn_expected ));
       } else if( FD_UNLIKELY( past_end_time ) ) {
         /* Slot ending while still in harmonic mode */
         if( pending_cnt == 0UL && pack->harmonic_inflight == 0UL ) {
           /* Stuck - no pending blocks and nothing inflight, block was incomplete */
-          pack->block_end_flags    |= FD_PACK_END_FLAG_HARMONIC_TIMEOUT;
-          pack->harmonic_decision   = HARMONIC_MODE_DONE;
-          pack->slot_end_ns_buffer  = FD_PACK_HARMONIC_BUFFER_NS;
+          pack->block_end_flags              |= FD_PACK_END_FLAG_HARMONIC_TIMEOUT;
+          pack->harmonic_decision             = HARMONIC_MODE_DONE;
+          pack->slot_end_ns_buffer            = FD_PACK_HARMONIC_BUFFER_NS;
+          pack->lim->max_vote_cost_per_block  = pack->full_max_vote_cost_per_block;
           FD_LOG_INFO(( "HARMONIC: HARMONIC -> DONE (flags=%d)", pack->block_end_flags ));
         }
         /* else: Still have blocks to process - don't end yet */
@@ -3336,10 +3341,11 @@ fd_pack_set_block_limits( fd_pack_t * pack, fd_pack_limits_t const * limits ) {
   FD_TEST( limits->max_vote_cost_per_block >= FD_PACK_HARMONIC_VOTE_COST_PER_BLOCK        );
   FD_TEST( limits->max_write_cost_per_acct >= FD_PACK_MAX_WRITE_COST_PER_ACCT_LOWER_BOUND );
 
+  pack->full_max_vote_cost_per_block   = limits->max_vote_cost_per_block;
   pack->lim->max_microblocks_per_block = limits->max_microblocks_per_block;
   pack->lim->max_data_bytes_per_block  = limits->max_data_bytes_per_block;
   pack->lim->max_cost_per_block        = limits->max_cost_per_block;
-  pack->lim->max_vote_cost_per_block   = limits->max_vote_cost_per_block;
+  pack->lim->max_vote_cost_per_block   = FD_PACK_HARMONIC_VOTE_COST_PER_BLOCK;
   pack->lim->max_write_cost_per_acct   = limits->max_write_cost_per_acct;
 }
 
