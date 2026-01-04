@@ -1229,7 +1229,6 @@ after_frag( fd_pack_ctx_t *     ctx,
     limits->max_data_bytes_per_block = ctx->slot_max_data;
     limits->max_microblocks_per_block = ctx->slot_max_microblocks;
     limits->max_vote_cost_per_block = ctx->limits.slot_max_vote_cost;
-    limits->max_vote_cost_per_block = (4UL*1000UL*1000UL);
     limits->max_write_cost_per_acct = ctx->limits.slot_max_write_cost_per_acct;
     limits->max_txn_per_microblock = ULONG_MAX; /* unused */
     fd_pack_set_block_limits( ctx->pack, limits );
