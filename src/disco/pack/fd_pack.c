@@ -1985,10 +1985,19 @@ fd_pack_schedule_impl( fd_pack_t               * pack,
     /* Likely? Unlikely? */
     if( FD_LIKELY( !FD_PACK_BITSET_INTERSECT4_EMPTY( bitset_rw_in_use, bitset_w_in_use, cur->w_bitset, cur->rw_bitset ) ) ) {
       fast_path++;
+      /* Harmonic: track blocked accounts for transitive dependency ordering */
+      if( FD_UNLIKELY( transitive_deps ) ) {
+        fd_txn_t const * txn = TXN(cur->txn);
+        fd_acct_addr_t const * accts = fd_txn_get_acct_addrs( txn, cur->txn->payload );
+        fd_acct_addr_t const * alt_adj = cur->txn_e->alt_accts - fd_txn_account_cnt( txn, FD_TXN_ACCT_CAT_IMM );
+        blocked_cnt = fd_pack_harmonic_add_blocked( txn, accts, alt_adj, blocked, blocked_cnt );
+        if( FD_UNLIKELY( blocked_cnt > FD_PACK_BLOCKED_ACCT_MAX ) ) break;
+      }
       continue;
     }
 
-    if( FD_UNLIKELY( cur->skip==compressed_slot_number ) ) {
+    /* harmonic: don't want any skips */
+    if( FD_UNLIKELY( cur->skip==compressed_slot_number && !harmonic ) ) {
       skip_c++;
       continue;
     }
@@ -2055,7 +2064,9 @@ fd_pack_schedule_impl( fd_pack_t               * pack,
              1                1  USHORT_MAX    csn-1    csn
            x in [2, psc]      x     x-2         x-2     x-1
            x where x>psc     psc   psc-2       psc-2   psc-1
-         So B+1 is the desired value. */
+         So B+1 is the desired value. 
+         
+         For harmonic, this is still set but unused. */
       cur->skip = (ushort)(1+fd_ushort_min( (ushort)(compressed_slot_number-1),
                                             (ushort)(fd_ushort_min( cur->skip, FD_PACK_SKIP_CNT )-2) ) );
       write_limit_c++;
