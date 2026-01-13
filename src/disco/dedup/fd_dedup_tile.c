@@ -16,6 +16,11 @@
 #define IN_KIND_VERIFY       (1UL)
 #define IN_KIND_EXECUTED_TXN (2UL)
 
+/* Block tcache depth - sized to fit a whole block while letting old
+   keys fall off quickly. Using slot in hash key means we on't need
+   to reset, just let old entries age out. */
+#define BLOCK_TCACHE_DEPTH   (65536UL)
+
 /* fd_dedup_in_ctx_t is a context object for each in (producer) mcache
    connected to the dedup tile. */
 
@@ -80,7 +85,7 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   ulong l = FD_LAYOUT_INIT;
   l = FD_LAYOUT_APPEND( l, alignof( fd_dedup_ctx_t ), sizeof( fd_dedup_ctx_t ) );
   l = FD_LAYOUT_APPEND( l, fd_tcache_align(), fd_tcache_footprint( tile->dedup.tcache_depth, 0UL ) );
-  l = FD_LAYOUT_APPEND( l, fd_tcache_align(), fd_tcache_footprint( tile->dedup.tcache_depth, 0UL ) ); /* harmonic dedicated block_tcache */
+  l = FD_LAYOUT_APPEND( l, fd_tcache_align(), fd_tcache_footprint( BLOCK_TCACHE_DEPTH, 0UL ) ); /* harmonic dedicated block_tcache */
   return FD_LAYOUT_FINI( l, scratch_align() );
 }
 
@@ -191,12 +196,12 @@ after_frag( fd_dedup_ctx_t *    ctx,
     return;
   }
 
-  /* Block tracking (similar to bundles but no length restriction) */
+  /* Block tracking (similar to bundles but no length restriction).
+     We include the slot in the hash key so different blocks have different
+     keys, avoiding the need to reset the tcache on slot change. */
   if( FD_UNLIKELY( is_block && (txnm->block_engine.block_slot!=ctx->block_slot) ) ) {
     ctx->block_failed = 0;
     ctx->block_slot   = txnm->block_engine.block_slot;
-    /* Reset block tcache for new block */
-    *ctx->block_tcache_sync = fd_tcache_reset( ctx->block_tcache_ring, ctx->block_tcache_depth, ctx->block_tcache_map, ctx->block_tcache_map_cnt );
   }
 
   if( FD_UNLIKELY( is_block && ctx->block_failed ) ) {
@@ -238,9 +243,13 @@ after_frag( fd_dedup_ctx_t *    ctx,
     if( FD_UNLIKELY( ctx->bundle_idx==4UL ) ) ctx->bundle_idx++;
     else fd_memcpy( ctx->bundle_signatures[ ctx->bundle_idx++ ], fd_txn_m_payload( txnm )+txn->signature_off, 64UL );
   } else /* block */ {
-    /* Blocks: treated like bundles but without length restriction.
-       Use dedicated block tcache for duplicate detection within the block. */
-    ulong ha_dedup_tag = fd_hash( ctx->hashmap_seed, fd_txn_m_payload( txnm )+txn->signature_off, 64UL );
+    /* Blocks: dedup within the block using hash(signature || slot).
+       Including slot in the hash means different blocks naturally have
+       different keys, so no tcache reset is needed on slot change. */
+    uchar sig_slot[ 72 ]; /* 64 byte signature + 8 byte slot */
+    fd_memcpy( sig_slot, fd_txn_m_payload( txnm )+txn->signature_off, 64UL );
+    FD_STORE( ulong, sig_slot+64, ctx->block_slot );
+    ulong ha_dedup_tag = fd_hash( ctx->hashmap_seed, sig_slot, 72UL );
     FD_TCACHE_INSERT( is_dup, *ctx->block_tcache_sync, ctx->block_tcache_ring, ctx->block_tcache_depth, ctx->block_tcache_map, ctx->block_tcache_map_cnt, ha_dedup_tag );
   }
 
@@ -277,7 +286,7 @@ unprivileged_init( fd_topo_t *      topo,
   fd_dedup_ctx_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof( fd_dedup_ctx_t ), sizeof( fd_dedup_ctx_t ) );
   fd_tcache_t * tcache = fd_tcache_join( fd_tcache_new( FD_SCRATCH_ALLOC_APPEND( l, fd_tcache_align(), fd_tcache_footprint( tile->dedup.tcache_depth, 0) ), tile->dedup.tcache_depth, 0 ) );
   if( FD_UNLIKELY( !tcache ) ) FD_LOG_ERR(( "fd_tcache_new failed" ));
-  fd_tcache_t * block_tcache = fd_tcache_join( fd_tcache_new( FD_SCRATCH_ALLOC_APPEND( l, fd_tcache_align(), fd_tcache_footprint( tile->dedup.tcache_depth, 0) ), tile->dedup.tcache_depth, 0 ) );
+  fd_tcache_t * block_tcache = fd_tcache_join( fd_tcache_new( FD_SCRATCH_ALLOC_APPEND( l, fd_tcache_align(), fd_tcache_footprint( BLOCK_TCACHE_DEPTH, 0) ), BLOCK_TCACHE_DEPTH, 0 ) );
   if( FD_UNLIKELY( !block_tcache ) ) FD_LOG_ERR(( "fd_tcache_new failed for block_tcache" ));
 
   ctx->bundle_failed = 0;
