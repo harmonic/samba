@@ -987,6 +987,7 @@ fd_bundle_client_grpc_rx_msg(
     fd_bundle_client_handle_builder_fee_info( ctx, &istream );
     break;
   case FD_BUNDLE_CLIENT_REQ_SubscribeBlocks:
+    FD_LOG_NOTICE(( "CAVEY DEBUG: Block message received: %lu bytes", protobuf_sz ));
     fd_bundle_client_handle_block_batch( ctx, &istream );
     break;
   case FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo: {
@@ -1406,6 +1407,9 @@ fd_harmonic_block_client_visit_pb_block_uuid(
     FD_LOG_WARNING(( "Protobuf decode of block (bundle.BundleUuid) failed (internal error): %s", istream->errmsg ));
     return false;
   }
+
+  FD_LOG_NOTICE(( "CAVEY DEBUG: bundle published all %lu block txns for slot=%lu",
+                  ctx->harmonic_block_txn_cnt, ctx->harmonic_block_slot ));
 
   return true;
 }

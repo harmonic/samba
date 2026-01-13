@@ -2891,9 +2891,13 @@ fd_pack_complete_harmonic_txn( fd_pack_t * pack,
 }
 
 
-/* Reset harmonic state for a new slot - delete all pending block transactions */
+/* Reset harmonic state for a new leader slot - delete all pending block transactions.
+   leader_slot is the slot we're now leading for. Block txns for other slots will be dropped. */
 void
-fd_pack_harmonic_reset( fd_pack_t * pack ) {
+fd_pack_harmonic_reset( fd_pack_t * pack,
+                        ulong       leader_slot ) {
+  long reset_t0 = fd_log_wallclock();
+
   fd_pack_ord_txn_t * pool   = pack->pool;
   treap_t           * blocks = pack->pending_blocks;
 
@@ -2901,6 +2905,8 @@ fd_pack_harmonic_reset( fd_pack_t * pack ) {
   FD_PACK_BITSET_DECLARE( bitset_w_in_use  );
   FD_PACK_BITSET_COPY( bitset_rw_in_use, pack->bitset_rw_in_use );
   FD_PACK_BITSET_COPY( bitset_w_in_use,  pack->bitset_w_in_use  );
+
+  ulong treap_cnt = treap_ele_cnt( blocks );
 
   /* Delete all transactions from pending_blocks treap, releasing bitset references */
   while( treap_ele_cnt( blocks ) > 0UL ) {
@@ -2936,9 +2942,11 @@ fd_pack_harmonic_reset( fd_pack_t * pack ) {
   FD_PACK_BITSET_COPY( pack->bitset_rw_in_use, bitset_rw_in_use );
   FD_PACK_BITSET_COPY( pack->bitset_w_in_use,  bitset_w_in_use  );
 
+  long reset_t1 = fd_log_wallclock();
+
   pack->block_txn_idx                = 1UL;  /* Reserve idx=0 for crank */
   pack->harmonic_decision            = 0;
-  pack->harmonic_block_slot          = 0UL;
+  pack->harmonic_block_slot          = leader_slot;  /* Set to leader slot - mismatched block txns will be dropped */
   pack->harmonic_inflight            = 0UL;
   pack->harmonic_block_txn_expected  = 0UL;
   pack->block_end_flags              = 0;
@@ -2949,6 +2957,10 @@ fd_pack_harmonic_reset( fd_pack_t * pack ) {
   harmonic_acct_map_clear( pack->harmonic_accts );
   pack->harmonic_acct_cnt       = 0UL;
   pack->harmonic_accts_overflow = 0;
+
+  long reset_t2 = fd_log_wallclock();
+  FD_LOG_NOTICE(( "CAVEY DEBUG: pack harmonic_reset for slot=%lu, treap_cleanup=%ld ns (cnt=%lu), acct_map_clear=%ld ns, total=%ld ns",
+                  leader_slot, reset_t1 - reset_t0, treap_cnt, reset_t2 - reset_t1, reset_t2 - reset_t0 ));
 }
 
 
@@ -2997,11 +3009,15 @@ fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
     return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
   }
 
-  /* Handle block_slot change: reset state for new block. */
+  /* Drop block txns for wrong slot - harmonic_block_slot was set on became_leader */
   if( FD_UNLIKELY( block_slot != pack->harmonic_block_slot ) ) {
-    fd_pack_harmonic_reset( pack );
-    pack->harmonic_block_slot          = block_slot;
-    pack->harmonic_block_txn_expected  = block_txn_expected;
+    trp_pool_ele_release( pool, ord );
+    return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
+  }
+
+  /* Update expected count (first txn sets it, subsequent txns verify) */
+  if( FD_UNLIKELY( pack->harmonic_block_txn_expected==0UL ) ) {
+    pack->harmonic_block_txn_expected = block_txn_expected;
   }
 
   fd_txn_t * txn     = TXN( txne->txnp );
