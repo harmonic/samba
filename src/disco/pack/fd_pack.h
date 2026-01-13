@@ -700,9 +700,10 @@ void
 fd_pack_complete_harmonic_txn( fd_pack_t * pack,
                                ulong       bank_tile );
 
-/* fd_pack_harmonic_reset: Resets harmonic state for a new slot.
-   Clears pending transactions and resets decision state. */
-void fd_pack_harmonic_reset( fd_pack_t * pack );
+/* fd_pack_harmonic_reset: Resets harmonic state for a new leader slot.
+   Clears pending transactions, resets decision state, and sets harmonic_block_slot
+   to leader_slot. Block txns for other slots will be dropped. */
+void fd_pack_harmonic_reset( fd_pack_t * pack, ulong leader_slot );
 
 /* fd_pack_harmonic_insert_fini: Inserts an already-populated block
    transaction into the pending_blocks treap.  Takes an fd_txn_e_t from
