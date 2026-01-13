@@ -1217,9 +1217,10 @@ after_frag( fd_pack_ctx_t *     ctx,
 
     /* Reset harmonic state for new slot.
        Note: pack's acct_in_use is cleared by fd_pack_end_block, so we don't
-       need to explicitly clear account locks here. */
+       need to explicitly clear account locks here.
+       Set harmonic_block_slot to leader_slot so block txns for other slots are dropped. */
     if( FD_UNLIKELY( ctx->harmonic ) ) {
-      fd_pack_harmonic_reset( ctx->pack );
+      fd_pack_harmonic_reset( ctx->pack, leader_slot );
       ctx->harmonic_threshold_ns = (ctx->slot_end_ns+ctx->slot_end_ns_buffer) - FD_PACK_HARMONIC_DEADLINE_NS;
       FD_LOG_INFO(( "HARMONIC: new leader slot=%lu, threshold_ns=%ld (50ms before end)", ctx->leader_slot, ctx->harmonic_threshold_ns ));
     }
