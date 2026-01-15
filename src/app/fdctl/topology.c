@@ -204,6 +204,10 @@ fd_topo_initialize( config_t * config ) {
     FOR(bank_tile_cnt) fd_topob_tile_in(  topo, "pack",   0UL,           "metric_in", "bank_pack",    i,            FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
   /**/                 fd_topob_tile_in(  topo, "poh",    0UL,           "metric_in", "stake_out",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   /**/                 fd_topob_tile_in(  topo, "poh",    0UL,           "metric_in", "pack_poh",     0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
+  /* Harmonic Optimistic Broadcast: PoH reads harmonic txns directly from resolv_pack to record */
+  if( FD_UNLIKELY( config->tiles.bundle.harmonic_block_mode ) ) {
+  /**/                 fd_topob_tile_in(  topo, "poh",    0UL,           "metric_in", "resolv_pack",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
+  }
   /**/                 fd_topob_tile_out( topo, "poh",    0UL,                        "poh_shred",    0UL                                                );
   /**/                 fd_topob_tile_out( topo, "poh",    0UL,                        "poh_pack",     0UL                                                );
   FOR(shred_tile_cnt) for( ulong j=0UL; j<net_tile_cnt; j++ )

@@ -719,6 +719,16 @@ void fd_pack_harmonic_reset( fd_pack_t * pack, ulong leader_slot );
 
    If block_slot changes, resets harmonic state for the new block.
 
+   txn_arrival_ns is the tspub timestamp (nanoseconds) of when this
+   transaction was published. harmonic_threshold_ns is the deadline
+   for entering harmonic mode. For the FIRST block txn while in
+   UNDECIDED state:
+     - If txn_arrival_ns < harmonic_threshold_ns: enter HARMONIC mode
+     - If txn_arrival_ns >= harmonic_threshold_ns: enter SPRINT, reject
+   
+   harmonic_cutoff_ns is the hard timeout (slot_end_ns + buffer).
+   Transactions with txn_arrival_ns > harmonic_cutoff_ns are rejected.
+
    On any validation failure, the entire block is failed: all pending
    block transactions are cleared, harmonic mode transitions to FAILED,
    and subsequent insert attempts for this slot return immediately. */
@@ -728,6 +738,9 @@ int fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
                                   ulong          block_txn_expected,
                                   void   const * block_meta,
                                   int            is_ib,
+                                  long           txn_arrival_ns,
+                                  long           harmonic_threshold_ns,
+                                  long           harmonic_cutoff_ns,
                                   ulong        * opt_delete_cnt );
 
 /* Harmonic state machine states.
@@ -748,6 +761,7 @@ int fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
    (most of the time will go unused, this is just for worst case) */
 #define FD_PACK_HARMONIC_BUFFER_NS    (100000000L)  /* 100ms base buffer */
 #define FD_PACK_HARMONIC_EXTENSION_NS (200000000L)  /* 200ms extension */
+#define FD_PACK_HARMONIC_DEADLINE_NS  ( 20000000L)  /* 20ms before slot end */
 
 /* fd_pack_harmonic_state: Returns the current harmonic state. */
 FD_FN_PURE int fd_pack_harmonic_state( fd_pack_t const * pack );
