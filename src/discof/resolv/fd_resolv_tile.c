@@ -504,9 +504,9 @@ after_frag( fd_resolv_ctx_t *   ctx,
 
   /* Check transaction type using source_tpu:
      - Bundles: FD_TXN_M_TPU_SOURCE_BUNDLE with bundle_id
-     - Blocks: FD_TXN_M_TPU_SOURCE_BLOCK with block_slot */
+     - Blocks: FD_TXN_M_TPU_SOURCE_HARMONIC with block_slot */
   int is_bundle = (txnm->source_tpu == FD_TXN_M_TPU_SOURCE_BUNDLE) && txnm->block_engine.bundle_id;
-  int is_block  = (txnm->source_tpu == FD_TXN_M_TPU_SOURCE_BLOCK) && txnm->block_engine.block_slot;
+  int is_block  = (txnm->source_tpu == FD_TXN_M_TPU_SOURCE_HARMONIC) && txnm->block_engine.block_slot;
 
   /* Bundle tracking */
   if( FD_UNLIKELY( is_bundle && (txnm->block_engine.bundle_id!=ctx->bundle_id) ) ) {
@@ -592,9 +592,19 @@ after_frag( fd_resolv_ctx_t *   ctx,
     }
   }
 
+  /* Harmonic: For block transactions, record arrival time in the message payload.
+     Both pack and POH read this exact value to make inclusion decisions without
+     additional coordination */
+  if( FD_UNLIKELY( is_block ) ) {
+    txnm->block_engine.arrival_ns = fd_log_wallclock();
+  }
+
   ulong realized_sz = fd_txn_m_realized_footprint( txnm, 1, 1 );
   ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
-  fd_stem_publish( stem, 0UL, txnm->reference_slot, ctx->out_pack->chunk, realized_sz, 0UL, tsorig, tspub );
+  /* Set the block flag in sig if this is a block transaction, so downstream
+     tiles can identify it in before_frag without peeking at chunk data. */
+  ulong out_sig = txnm->reference_slot | (is_block ? FD_TXN_M_SIG_BLOCK_FLAG : 0UL);
+  fd_stem_publish( stem, 0UL, out_sig, ctx->out_pack->chunk, realized_sz, 0UL, tsorig, tspub );
   ctx->out_pack->chunk = fd_dcache_compact_next( ctx->out_pack->chunk, realized_sz, ctx->out_pack->chunk0, ctx->out_pack->wmark );
 }
 

@@ -1679,7 +1679,7 @@ fd_gui_printf_slot_transactions_request( fd_gui_t * gui,
                   break;
                 }
                 /* cavey: harmonic */
-                case FD_TXN_M_TPU_SOURCE_BLOCK: {
+                case FD_TXN_M_TPU_SOURCE_HARMONIC: {
                   jsonp_string( gui->http, NULL, "harmonic");
                   break;
                 }
