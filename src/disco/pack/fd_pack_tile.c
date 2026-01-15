@@ -132,12 +132,13 @@ typedef struct {
 
 #define TXN_TYPE_NORMAL  0
 #define TXN_TYPE_BUNDLE  1
-#define TXN_TYPE_BLOCK   2
+#define TXN_TYPE_HARMONIC   2
   int          txn_type;
 
-  /* Block transaction info (valid when txn_type==TXN_TYPE_BLOCK) */
+  /* Harmonic transaction info (valid when txn_type==TXN_TYPE_HARMONIC) */
   ulong        block_slot;
   ulong        block_txn_expected;
+  long         block_arrival_ns;  /* From txnm->block_engine.arrival_ns */
 
   uchar executed_txn_sig[ 64UL ];
 
@@ -216,6 +217,11 @@ typedef struct {
      Almost all blocks will not use this extra time; this is just here to
      accommodate the worst case scenario. */
   long slot_end_ns_buffer;
+
+  /* Hard cutoff for harmonic txns (slot_end_ns + buffer).
+     Txns with tspub > harmonic_cutoff_ns are rejected.
+     This matches PoH's harmonic_cutoff_ns for coordination-free decisions. */
+  long harmonic_cutoff_ns;
 
   /* pacer and ticks_per_ns are used for pacing CUs through the slot,
      i.e. deciding when to schedule a microblock given the number of CUs
@@ -325,7 +331,6 @@ typedef struct {
   long harmonic_threshold_ns;
   int  harmonic; /* If set, processes harmonic blocks */
 
-#define FD_PACK_HARMONIC_DEADLINE_NS (20000000L) /* before slot end */
 
   /* Used between during_frag and after_frag */
   ulong pending_rebate_sz;
@@ -745,8 +750,11 @@ after_credit( fd_pack_ctx_t *     ctx,
         if( !harmonic_crank ) {
           retval = fd_pack_insert_bundle_fini( ctx->pack, bundle, 1UL, ctx->leader_slot-1UL, 1, NULL, &deleted );
         } else {
+          /* For locally-generated crank, use current wallclock as arrival time */
+          long crank_arrival_ns = ctx->approx_wallclock_ns + (long)((double)(fd_tickcount() - ctx->approx_tickcount) / ctx->ticks_per_ns);
           FD_LOG_INFO(( "HARMONIC: inserting crank for slot=%lu, block_txn_expected=%lu", ctx->block_slot, ctx->block_txn_expected ));
-          retval = fd_pack_harmonic_insert_fini( ctx->pack, bundle[0], ctx->block_slot, ctx->block_txn_expected, ctx->blk_engine_cfg, 1, &deleted );
+          retval = fd_pack_harmonic_insert_fini( ctx->pack, bundle[0], ctx->block_slot, ctx->block_txn_expected, ctx->blk_engine_cfg, 1,
+                                                  crank_arrival_ns, ctx->harmonic_threshold_ns, ctx->harmonic_cutoff_ns, &deleted );
           ctx->block_txn_expected++;
         }
         FD_MCNT_INC( PACK, TRANSACTION_DELETED, deleted );
@@ -1005,7 +1013,10 @@ during_frag( fd_pack_ctx_t * ctx,
     ulong addr_table_sz = 32UL*txn->addr_table_adtl_cnt;
     FD_TEST( addr_table_sz<=32UL*FD_TXN_ACCT_ADDR_MAX );
 
-    if( FD_UNLIKELY( (ctx->leader_slot==ULONG_MAX) & (sig>ctx->highest_observed_slot) ) ) {
+    /* Harmonic: Mask off the block flag to get the reference slot. Block
+       txns from resolv have FD_TXN_M_SIG_BLOCK_FLAG set in the high bit. */
+    ulong reference_slot = sig & ~FD_TXN_M_SIG_BLOCK_FLAG;
+    if( FD_UNLIKELY( (ctx->leader_slot==ULONG_MAX) & (reference_slot>ctx->highest_observed_slot) ) ) {
       /* Using the resolv tile's knowledge of the current slot is a bit
          of a hack, since we don't get any info if there are no
          transactions and we're not leader.  We're actually in exactly
@@ -1014,17 +1025,18 @@ during_frag( fd_pack_ctx_t * ctx,
          drop new but low-fee-paying transactions when pack is clogged
          with expired but high-fee-paying transactions.  That can only
          happen if we are getting transactions. */
-      ctx->highest_observed_slot = sig;
+      ctx->highest_observed_slot = reference_slot;
       ulong exp_cnt = fd_pack_expire_before( ctx->pack, fd_ulong_max( ctx->highest_observed_slot, TRANSACTION_LIFETIME_SLOTS )-TRANSACTION_LIFETIME_SLOTS );
       FD_MCNT_INC( PACK, TRANSACTION_EXPIRED, exp_cnt );
     }
 
     /* Handle block transactions (harmonic block mode) */
-    int is_block = source_tpu == FD_TXN_M_TPU_SOURCE_BLOCK;
+    int is_block = source_tpu == FD_TXN_M_TPU_SOURCE_HARMONIC;
     if( FD_UNLIKELY( ctx->harmonic && is_block ) ) {
-      ctx->txn_type = TXN_TYPE_BLOCK;
+      ctx->txn_type = TXN_TYPE_HARMONIC;
       ctx->block_slot         = txnm->block_engine.block_slot;
       ctx->block_txn_expected = txnm->block_engine.bundle_txn_cnt;
+      ctx->block_arrival_ns   = txnm->block_engine.arrival_ns;
       ctx->cur_spot = fd_pack_insert_txn_init( ctx->pack );
 
       /* Extract block builder commission info */
@@ -1214,6 +1226,7 @@ after_frag( fd_pack_ctx_t *     ctx,
 
     ctx->slot_end_ns = ctx->_became_leader->slot_end_ns;
     ctx->slot_end_ns_buffer = FD_PACK_HARMONIC_BUFFER_NS * ctx->harmonic;
+    ctx->harmonic_cutoff_ns = ctx->slot_end_ns + FD_PACK_HARMONIC_BUFFER_NS;
 
     /* Reset harmonic state for new slot.
        Note: pack's acct_in_use is cleared by fd_pack_end_block, so we don't
@@ -1221,8 +1234,9 @@ after_frag( fd_pack_ctx_t *     ctx,
        Set harmonic_block_slot to leader_slot so block txns for other slots are dropped. */
     if( FD_UNLIKELY( ctx->harmonic ) ) {
       fd_pack_harmonic_reset( ctx->pack, leader_slot );
-      ctx->harmonic_threshold_ns = (ctx->slot_end_ns+ctx->slot_end_ns_buffer) - FD_PACK_HARMONIC_DEADLINE_NS;
-      FD_LOG_INFO(( "HARMONIC: new leader slot=%lu, threshold_ns=%ld (50ms before end)", ctx->leader_slot, ctx->harmonic_threshold_ns ));
+      ctx->harmonic_threshold_ns = ctx->harmonic_cutoff_ns - FD_PACK_HARMONIC_DEADLINE_NS;
+      FD_LOG_INFO(( "HARMONIC: new leader slot=%lu, threshold_ns=%ld, cutoff_ns=%ld", 
+                    ctx->leader_slot, ctx->harmonic_threshold_ns, ctx->harmonic_cutoff_ns ));
     }
 
     fd_pack_limits_t limits[ 1 ];
@@ -1248,7 +1262,7 @@ after_frag( fd_pack_ctx_t *     ctx,
   }
   case IN_KIND_RESOLV: {
     /* Block transactions */
-    if( FD_UNLIKELY( ctx->txn_type==TXN_TYPE_BLOCK ) ) {
+    if( FD_UNLIKELY( ctx->txn_type==TXN_TYPE_HARMONIC ) ) {
       /* Check block slot matches leader slot */
       if( FD_UNLIKELY( ctx->block_slot != ctx->leader_slot ) ) {
         FD_LOG_INFO(( "HARMONIC: dropping block txn for wrong slot=%lu, cur slot=%lu", ctx->block_slot, ctx->leader_slot ));
@@ -1257,16 +1271,27 @@ after_frag( fd_pack_ctx_t *     ctx,
         break;
       }
 
+      /* Opticast: Pass arrival_ns to fd_pack_harmonic_insert_fini.
+         For the FIRST block txn in UNDECIDED state, this determines whether
+         we enter HARMONIC mode (arrival < threshold) or SPRINT mode (arrival >= threshold).
+         Subsequent txns are processed normally while in HARMONIC mode.
+         Txns arriving after harmonic_cutoff_ns are rejected as timeout.
+         
+         Both Pack and PoH read the same arrival_ns from the message payload,
+         guaranteeing identical coordination-free decisions. */
+      long txn_arrival_ns = ctx->block_arrival_ns;
       ulong deleted;
       long insert_duration = -fd_tickcount();
-      int result = fd_pack_harmonic_insert_fini( ctx->pack, ctx->cur_spot, ctx->block_slot, ctx->block_txn_expected, ctx->blk_engine_cfg, 0, &deleted );
+      int result = fd_pack_harmonic_insert_fini( ctx->pack, ctx->cur_spot, ctx->block_slot, ctx->block_txn_expected, ctx->blk_engine_cfg, 0,
+                                                  txn_arrival_ns, ctx->harmonic_threshold_ns, ctx->harmonic_cutoff_ns, &deleted );
       insert_duration      += fd_tickcount();
       fd_histf_sample( ctx->insert_duration, (ulong)insert_duration );
       FD_MCNT_INC( PACK, TRANSACTION_DELETED, deleted );
-      if( FD_UNLIKELY( !result ) ) {
-        FD_LOG_INFO(( "HARMONIC: failed to finalize block txn for slot=%lu (unparseable)", ctx->block_slot ));
+      if( FD_UNLIKELY( result < 0 ) ) {
+        FD_LOG_INFO(( "HARMONIC: failed to insert block txn for slot=%lu (result=%d)", ctx->block_slot, result ));
       } else {
-        FD_LOG_INFO(( "HARMONIC: inserted block txn for slot=%lu, pending_cnt=%lu", ctx->block_slot, fd_pack_harmonic_pending_cnt( ctx->pack ) ));
+        FD_LOG_INFO(( "HARMONIC: inserted block txn for slot=%lu, pending_cnt=%lu (arrival_ns=%ld)", 
+                      ctx->block_slot, fd_pack_harmonic_pending_cnt( ctx->pack ), txn_arrival_ns ));
       }
       ctx->cur_spot = NULL;
       break;
