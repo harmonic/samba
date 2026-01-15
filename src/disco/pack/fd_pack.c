@@ -5,6 +5,7 @@
 #include "fd_pack_unwritable.h"
 #include "fd_chkdup.h"
 #include "fd_pack_tip_prog_blacklist.h"
+#include "../../ballet/base58/fd_base58.h"
 #include <math.h> /* for sqrt */
 #include <stddef.h> /* for offsetof */
 #include "../metrics/fd_metrics.h"
@@ -2958,7 +2959,7 @@ fd_pack_harmonic_reset( fd_pack_t * pack,
   pack->harmonic_accts_overflow = 0;
 
   long reset_t2 = fd_log_wallclock();
-  FD_LOG_NOTICE(( "CAVEY DEBUG: pack harmonic_reset for slot=%lu, treap_cleanup=%ld ns (cnt=%lu), acct_map_clear=%ld ns, total=%ld ns",
+  FD_LOG_DEBUG(( "CAVEY_DEBUG: pack harmonic_reset for slot=%lu, treap_cleanup=%ld ns (cnt=%lu), acct_map_clear=%ld ns, total=%ld ns",
                   leader_slot, reset_t1 - reset_t0, treap_cnt, reset_t2 - reset_t1, reset_t2 - reset_t0 ));
 }
 
@@ -2994,10 +2995,22 @@ fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
                               ulong          block_txn_expected,
                               void   const * block_meta,
                               int            is_ib,
+                              long           txn_arrival_ns,
+                              long           harmonic_threshold_ns,
+                              long           harmonic_cutoff_ns,
                               ulong        * opt_delete_cnt ) {
 
   fd_pack_ord_txn_t * ord  = (fd_pack_ord_txn_t *)txne;
   fd_pack_ord_txn_t * pool = pack->pool;
+
+  /* Timeout check: reject if transaction arrived after cutoff (slot_end + buffer).
+     This matches PoH's harmonic_cutoff_ns for coordination-free decisions. */
+  if( FD_UNLIKELY( txn_arrival_ns > harmonic_cutoff_ns ) ) {
+    FD_LOG_INFO(( "HARMONIC: rejecting block txn, arrived after cutoff (arrival=%ld, cutoff=%ld)",
+                  txn_arrival_ns, harmonic_cutoff_ns ));
+    trp_pool_ele_release( pool, ord );
+    return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
+  }
 
   /* If already in SPRINT or FAILED, reject block transactions entirely.
      This check must happen BEFORE the slot-change reset below, otherwise
@@ -3017,6 +3030,29 @@ fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
   /* Update expected count (first txn sets it, subsequent txns verify) */
   if( FD_UNLIKELY( pack->harmonic_block_txn_expected==0UL ) ) {
     pack->harmonic_block_txn_expected = block_txn_expected;
+  }
+  
+  /* Opticast: If still UNDECIDED and this is the first block txn, use tspub
+     to decide whether to enter HARMONIC or SPRINT mode. Both Pack and PoH
+     use the same tspub from the message, so they make the same decision
+     without explicit coordination. */
+  if( FD_UNLIKELY( pack->harmonic_decision == HARMONIC_MODE_UNDECIDED ) ) {
+    if( txn_arrival_ns < harmonic_threshold_ns ) {
+      /* Block txn arrived in time - enter HARMONIC mode */
+      pack->harmonic_decision  = HARMONIC_MODE_HARMONIC;
+      pack->slot_end_ns_buffer = FD_PACK_HARMONIC_EXTENSION_NS;
+      FD_LOG_INFO(( "HARMONIC: UNDECIDED -> HARMONIC (arrival=%ld < threshold=%ld)",
+                    txn_arrival_ns, harmonic_threshold_ns ));
+    } else {
+      /* Block txn arrived too late - enter SPRINT mode, reject this and all future block txns */
+      pack->block_end_flags              |= FD_PACK_END_FLAG_HARMONIC_TIMEOUT;
+      pack->harmonic_decision             = HARMONIC_MODE_SPRINT;
+      pack->lim->max_vote_cost_per_block  = pack->full_max_vote_cost_per_block;
+      FD_LOG_INFO(( "HARMONIC: UNDECIDED -> SPRINT (arrival=%ld >= threshold=%ld)",
+                    txn_arrival_ns, harmonic_threshold_ns ));
+      trp_pool_ele_release( pool, ord );
+      return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
+    }
   }
 
   fd_txn_t * txn     = TXN( txne->txnp );
@@ -3130,9 +3166,11 @@ fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
             block_meta, pack->bundle_meta_sz );
   }
 
-  /* If this is the initializer bundle (crank), set IB state to pending */
+  /* If this is the initializer bundle (crank), set IB state to pending
+     and increment expected count (crank is an additional harmonic txn) */
   if( FD_UNLIKELY( is_ib ) ) {
     pack->initializer_bundle_state = FD_PACK_IB_STATE_PENDING;
+    pack->harmonic_block_txn_expected++;
   }
 
   /* Track accounts used by this harmonic transaction for vote conflict checking.
@@ -3156,6 +3194,8 @@ fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
       }
     }
   }
+
+  FD_LOG_DEBUG(( "HARMONIC: pack inserted block txn ib=%d slot=%lu", is_ib, block_slot ));
 
   return 1;
 }
@@ -3242,20 +3282,25 @@ fd_pack_harmonic_state_crank( fd_pack_t * pack,
   switch( pack->harmonic_decision ) {
 
     /* allowed transitions: 
-      UNDECIDED -> HARMONIC: block transactions arrived within threshold
-      UNDECIDED -> SPRINT:   block transactions did not arrive within threshold */
+      UNDECIDED -> HARMONIC: handled in fd_pack_harmonic_insert_fini on first block txn
+      UNDECIDED -> SPRINT:   block transactions did not arrive within threshold
+      
+      Note: The UNDECIDED -> HARMONIC transition is now triggered by the first block
+      txn in fd_pack_harmonic_insert_fini, using tspub for the decision. This ensures
+      both Pack and PoH make the same decision based on the same timestamp. */
     case HARMONIC_MODE_UNDECIDED: {
-      /* block_txn_idx starts at 1 (reserving 0 for crank), so >1 means we received block txns */
+      /* block_txn_idx starts at 1 (reserving 0 for crank), so >1 means we received block txns.
+         If we're here with received txns, it means insert_fini already transitioned us,
+         so this is just a sanity check. */
       ulong received_cnt = pack->block_txn_idx - 1UL;
-      if( received_cnt > 0UL ) {
-        /* Block transactions arrived - enter harmonic mode, extend slot buffer */
-        pack->harmonic_decision  = HARMONIC_MODE_HARMONIC;
-        pack->slot_end_ns_buffer = FD_PACK_HARMONIC_EXTENSION_NS;
-        FD_LOG_INFO(( "HARMONIC: UNDECIDED -> HARMONIC (received=%lu, expected=%lu)",
-                      received_cnt, pack->harmonic_block_txn_expected ));
-      } else if( approx_wallclock_ns >= harmonic_threshold_ns ) {
-        /* Timeout reached without block transactions - enter sprint mode
-           Set HARMONIC_TIMEOUT flag since we never received the block */
+      if( FD_UNLIKELY( received_cnt > 0UL ) ) {
+        /* This shouldn't happen - insert_fini should have transitioned us */
+        FD_LOG_WARNING(( "HARMONIC: UNDECIDED with received=%lu, should have transitioned", received_cnt ));
+      }
+      
+      /* Timeout check: if threshold reached without any block txns, enter SPRINT.
+         Use wallclock here since we have no block txn tspub to check. */
+      if( approx_wallclock_ns >= harmonic_threshold_ns ) {
         pack->block_end_flags              |= FD_PACK_END_FLAG_HARMONIC_TIMEOUT;
         pack->harmonic_decision             = HARMONIC_MODE_SPRINT;
         pack->lim->max_vote_cost_per_block  = pack->full_max_vote_cost_per_block;
