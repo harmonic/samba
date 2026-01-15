@@ -948,7 +948,7 @@ test_harmonic_block_slot_parsing( fd_wksp_t * wksp ) {
   fd_txn_m_t * txnm0 = fd_chunk_to_laddr( env->out_dcache, 0UL );
   FD_TEST( txnm0->reference_slot==0UL );  /* resolv will populate from blockhash */
   FD_TEST( txnm0->block_engine.block_slot==12345678UL );
-  FD_TEST( txnm0->source_tpu==FD_TXN_M_TPU_SOURCE_BLOCK );
+  FD_TEST( txnm0->source_tpu==FD_TXN_M_TPU_SOURCE_HARMONIC );
 
   FD_LOG_NOTICE(( "Harmonic block slot parsing test passed (slot=12345678)" ));
   test_bundle_env_destroy( env );
@@ -980,7 +980,7 @@ test_harmonic_block_rx_many_txns( fd_wksp_t * wksp ) {
   fd_txn_m_t * txnm0 = fd_chunk_to_laddr( env->out_dcache, 0UL );
   FD_TEST( txnm0->reference_slot==0UL );  /* resolv will populate from blockhash */
   FD_TEST( txnm0->block_engine.block_slot==99999999UL );
-  FD_TEST( txnm0->source_tpu==FD_TXN_M_TPU_SOURCE_BLOCK );
+  FD_TEST( txnm0->source_tpu==FD_TXN_M_TPU_SOURCE_HARMONIC );
 
   FD_LOG_NOTICE(( "Harmonic block rx many txns test passed (6 txns ok, slot=99999999)" ));
   test_bundle_env_destroy( env );
@@ -1264,7 +1264,7 @@ test_harmonic_block_oversized( fd_wksp_t * wksp ) {
   fd_txn_m_t * txnm0 = fd_chunk_to_laddr( env->out_dcache, 0UL );
   FD_TEST( txnm0->reference_slot==0UL );  /* resolv will populate from blockhash */
   FD_TEST( txnm0->block_engine.block_slot==slot );
-  FD_TEST( txnm0->source_tpu==FD_TXN_M_TPU_SOURCE_BLOCK );
+  FD_TEST( txnm0->source_tpu==FD_TXN_M_TPU_SOURCE_HARMONIC );
   FD_TEST( txnm0->payload_sz==txn_sz );
 
   FD_LOG_NOTICE(( "Oversized harmonic block test passed (%lu txns x %lu bytes, slot=%lu)", txn_cnt, txn_sz, slot ));

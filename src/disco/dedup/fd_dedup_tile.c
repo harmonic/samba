@@ -17,7 +17,7 @@
 #define IN_KIND_EXECUTED_TXN (2UL)
 
 /* Block tcache depth - sized to fit a whole block while letting old
-   keys fall off quickly. Using slot in hash key means we on't need
+   keys fall off quickly. Using slot in hash key means we don't need
    to reset, just let old entries age out. */
 #define BLOCK_TCACHE_DEPTH   (65536UL)
 
@@ -179,9 +179,9 @@ after_frag( fd_dedup_ctx_t *    ctx,
 
   /* Check transaction type using source_tpu:
      - Bundles: FD_TXN_M_TPU_SOURCE_BUNDLE with bundle_id
-     - Blocks: FD_TXN_M_TPU_SOURCE_BLOCK with block_slot
+     - Blocks: FD_TXN_M_TPU_SOURCE_HARMONIC with block_slot
      - Others: Use normal tcache dedup */
-  int is_block  = (txnm->source_tpu == FD_TXN_M_TPU_SOURCE_BLOCK);
+  int is_block  = (txnm->source_tpu == FD_TXN_M_TPU_SOURCE_HARMONIC);
   int is_bundle = (txnm->source_tpu == FD_TXN_M_TPU_SOURCE_BUNDLE) && txnm->block_engine.bundle_id;
 
   /* Bundle tracking */

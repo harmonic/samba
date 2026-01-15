@@ -6,13 +6,19 @@
 
 #include "../ballet/txn/fd_txn.h"
 
-#define FD_TXN_M_TPU_SOURCE_QUIC   (1UL)
-#define FD_TXN_M_TPU_SOURCE_UDP    (2UL)
-#define FD_TXN_M_TPU_SOURCE_GOSSIP (3UL)
-#define FD_TXN_M_TPU_SOURCE_BUNDLE (4UL)
-#define FD_TXN_M_TPU_SOURCE_SEND   (5UL)
-#define FD_TXN_M_TPU_SOURCE_BLOCK  (6UL)
-#define FD_TXN_M_TPU_SOURCE_HTPU   (7UL)
+#define FD_TXN_M_TPU_SOURCE_QUIC     (1UL)
+#define FD_TXN_M_TPU_SOURCE_UDP      (2UL)
+#define FD_TXN_M_TPU_SOURCE_GOSSIP   (3UL)
+#define FD_TXN_M_TPU_SOURCE_BUNDLE   (4UL)
+#define FD_TXN_M_TPU_SOURCE_SEND     (5UL)
+#define FD_TXN_M_TPU_SOURCE_HARMONIC (6UL)
+#define FD_TXN_M_TPU_SOURCE_HTPU     (7UL)
+
+/* Sig flag: set in the high bit of the sig field when publishing block
+   transactions from resolv->pack. This allows downstream tiles to identify
+   block transactions from the sig alone (in before_frag where chunk data
+   is not yet available). Slots won't reach 2^63 for an extremely long time. */
+#define FD_TXN_M_SIG_BLOCK_FLAG    (1UL<<63)
 
 struct fd_txn_m {
   /* The computed slot that this transaction is referencing, aka. the
@@ -54,18 +60,25 @@ struct fd_txn_m {
        These fields are only provided on the first transaction in a
        bundle.
 
-       For block transactions (source_tpu == FD_TXN_M_TPU_SOURCE_BLOCK),
+       For harmonic transactions (source_tpu==FD_TXN_M_TPU_SOURCE_HARMONIC),
        block_slot contains the intended slot from the block server.
        Use source_tpu to determine which union member applies. */
     union {
       ulong bundle_id;   /* For bundles: sequential bundle ID */
       ulong block_slot;  /* For blocks: intended slot from server */
     };
-    ulong bundle_txn_cnt;
+
+    /* Arrival time in nanoseconds (fd_log_wallclock). For block transactions,
+       this is set by resolv when the transaction is received. Both pack and
+       POH read this same value to make coordination-free threshold decisions.
+       No compression/decompression needed - guaranteed identical. */
+    long arrival_ns;
+
+    ushort bundle_txn_cnt; /* Harmonic: shrunk from ulong - never exceeds 65535 */
     uchar commission;
     uchar commission_pubkey[ 32 ];
 
-    /* alignof is 8, so 7 bytes of padding here */
+    /* alignof is 8, so 5 bytes of padding here */
 
   } block_engine;
 

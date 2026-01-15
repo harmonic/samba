@@ -548,7 +548,7 @@ fd_bundle_tile_publish_bundle_txn(
     .source_tpu       = FD_TXN_M_TPU_SOURCE_BUNDLE,
     .block_engine   = {
       .bundle_id      = ctx->bundle_seq,
-      .bundle_txn_cnt = bundle_txn_cnt,
+      .bundle_txn_cnt = (ushort)bundle_txn_cnt,
       .commission     = (uchar)ctx->builder_commission
     },
   };
@@ -987,7 +987,7 @@ fd_bundle_client_grpc_rx_msg(
     fd_bundle_client_handle_builder_fee_info( ctx, &istream );
     break;
   case FD_BUNDLE_CLIENT_REQ_SubscribeBlocks:
-    FD_LOG_NOTICE(( "CAVEY DEBUG: Block message received: %lu bytes", protobuf_sz ));
+    FD_LOG_DEBUG(( "CAVEY DEBUG: Block message received: %lu bytes", protobuf_sz ));
     fd_bundle_client_handle_block_batch( ctx, &istream );
     break;
   case FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo: {
@@ -1265,10 +1265,10 @@ fd_harmonic_block_tile_publish_block_txn(
     .payload_sz     = (ushort)txn_sz,
     .txn_t_sz       = 0U,
     .source_ipv4    = source_ipv4,
-    .source_tpu     = FD_TXN_M_TPU_SOURCE_BLOCK,
+    .source_tpu     = FD_TXN_M_TPU_SOURCE_HARMONIC,
     .block_engine   = {
       .block_slot     = ctx->harmonic_block_slot,  /* Intended landing slot */
-      .bundle_txn_cnt = block_txn_cnt,
+      .bundle_txn_cnt = (ushort)block_txn_cnt,
       .commission     = (uchar)ctx->builder_commission
     },
   };
@@ -1402,13 +1402,21 @@ fd_harmonic_block_client_visit_pb_block_uuid(
   FD_LOG_DEBUG(( "Received block slot=%lu, %lu packets",
                  ctx->harmonic_block_slot, ctx->harmonic_block_txn_cnt ));
 
+  /* Harmonic: bundle_txn_cnt is a ushort. Reject blocks exceeding USHORT_MAX.
+     In practice, blocks typically have O(≈1000) txns */
+  if( FD_UNLIKELY( ctx->harmonic_block_txn_cnt > USHORT_MAX ) ) {
+    FD_LOG_WARNING(( "HARMONIC: rejecting block slot=%lu with txn_cnt %lu (exceeds USHORT_MAX)",
+                     ctx->harmonic_block_slot, ctx->harmonic_block_txn_cnt ));
+    return true;  /* Skip this block but continue processing */
+  }
+
   if( FD_UNLIKELY( !pb_decode( istream, &bundle_BundleUuid_msg, &bundle ) ) ) {
     ctx->metrics.decode_fail_cnt++;
     FD_LOG_WARNING(( "Protobuf decode of block (bundle.BundleUuid) failed (internal error): %s", istream->errmsg ));
     return false;
   }
 
-  FD_LOG_NOTICE(( "CAVEY DEBUG: bundle published all %lu block txns for slot=%lu",
+  FD_LOG_DEBUG(( "CAVEY DEBUG: bundle published all %lu block txns for slot=%lu",
                   ctx->harmonic_block_txn_cnt, ctx->harmonic_block_slot ));
 
   return true;
