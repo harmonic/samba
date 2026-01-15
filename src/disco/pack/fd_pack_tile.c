@@ -546,11 +546,12 @@ after_credit( fd_pack_ctx_t *     ctx,
   ulong bank_cnt = ctx->bank_cnt;
 
 
-  /* If any banks are busy, check one of the busy ones see if it is
-     still busy. */
+  /* If any banks are busy, check up to min(outstanding, 8) of them to
+     see if they are still busy. */
   if( FD_LIKELY( ctx->bank_idle_bitset!=fd_ulong_mask_lsb( (int)bank_cnt ) ) ) {
     int   poll_cursor = ctx->poll_cursor;
     ulong busy_bitset = (~ctx->bank_idle_bitset) & fd_ulong_mask_lsb( (int)bank_cnt );
+    ulong polls_remaining = fd_ulong_min( (ulong)fd_ulong_popcnt( busy_bitset ), 8UL );
 
     /* Suppose bank_cnt is 4 and idle_bitset looks something like this
        (pretending it's a uchar):
@@ -568,7 +569,10 @@ after_credit( fd_pack_ctx_t *     ctx,
        The rotated version would be
                 0100 0000
        Find lsb will return 6, so busy cursor would be set to 0, and
-       we'd poll bank 0, which is the right one. */
+       we'd poll bank 0, which is the right one. 
+       
+       cavey: we use a goto here to minimize diff size lol */
+poll_next_bank:
     poll_cursor++;
     poll_cursor = (poll_cursor + fd_ulong_find_lsb( fd_ulong_rotate_right( busy_bitset, (poll_cursor&63) ) )) & 63;
 
@@ -581,6 +585,7 @@ after_credit( fd_pack_ctx_t *     ctx,
         (fd_fseq_query( ctx->bank_current[poll_cursor] )==ctx->bank_expect[poll_cursor]) ) ) {
       *charge_busy = 1;
       ctx->bank_idle_bitset |= 1UL<<poll_cursor;
+      busy_bitset &= ~(1UL<<poll_cursor);
 
       /* Handle harmonic transaction completion - release account locks via pack */
       if( FD_UNLIKELY( ctx->harmonic && fd_pack_harmonic_inflight_cnt( ctx->pack ) > 0UL ) ) {
@@ -594,6 +599,7 @@ after_credit( fd_pack_ctx_t *     ctx,
       }
     }
 
+    if( --polls_remaining && busy_bitset ) goto poll_next_bank;
     ctx->poll_cursor = poll_cursor;
   }
 
