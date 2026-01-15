@@ -123,7 +123,7 @@ after_frag( fd_verify_ctx_t *   ctx,
   /* The bundle_id/block_slot union field is reused for both bundles and blocks,
      so we need to check the source_tpu to determine the type */
   int is_bundle = txnm->source_tpu == FD_TXN_M_TPU_SOURCE_BUNDLE && !!txnm->block_engine.bundle_id;
-  int is_block  = txnm->source_tpu == FD_TXN_M_TPU_SOURCE_BLOCK  && !!txnm->block_engine.block_slot;
+  int is_block  = txnm->source_tpu == FD_TXN_M_TPU_SOURCE_HARMONIC  && !!txnm->block_engine.block_slot;
 
   /* Bundle tracking: reset failed state when bundle_id changes */
   if( FD_UNLIKELY( is_bundle & (txnm->block_engine.bundle_id!=ctx->bundle_id) ) ) {

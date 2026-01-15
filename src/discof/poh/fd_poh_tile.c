@@ -3,10 +3,13 @@
 #include "fd_poh_tile.h"
 #include "../replay/fd_replay_tile.h"
 #include "../../disco/tiles.h"
+#include "../../disco/fd_txn_m.h"
+#include "../../disco/pack/fd_pack.h"
 
 #define IN_KIND_REPLAY (0)
 #define IN_KIND_PACK   (1)
 #define IN_KIND_BANK   (2)
+#define IN_KIND_RESOLV (3)  /* Harmonic Optimistic Broadcast: harmonic block txns from resolv_pack */
 
 struct fd_poh_in {
   fd_wksp_t * mem;
@@ -148,6 +151,26 @@ returnable_frag( fd_poh_tile_t *     ctx,
     ctx->expect_pack_idx++;
   }
 
+  /* Opticast: Delay block transactions from resolv until the initializer bundle (crank)
+     has been recorded. The IB must be recorded first to ensure proper ordering.
+     
+     Only delay block transactions (source_tpu == FD_TXN_M_TPU_SOURCE_HARMONIC).
+     Non-block transactions from resolv should pass through immediately.
+     
+     However, if we're past the harmonic cutoff (no block received in time), pack
+     enters SPRINT mode and we won't process harmonic blocks anyway. Don't delay. */
+  if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_RESOLV ) ) {
+    fd_txn_m_t const * txnm = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
+    int is_block = (txnm->source_tpu == FD_TXN_M_TPU_SOURCE_HARMONIC);
+    if( FD_UNLIKELY( is_block && !ctx->poh->opticast.bank_received ) ) {
+      long now_ns = fd_log_wallclock();
+      int past_cutoff = now_ns > ctx->poh->opticast.harmonic_cutoff_ns + (100L)*(1000L); /* 100 micro buffer. TODO: this is not 100% correct but practically correct. (resolv_pack could have some frags with ts_pub below cutoff) */
+      if( FD_UNLIKELY( !past_cutoff ) ) {
+        return 1; /* delay - requeue fragment until bank message received or cutoff reached */
+      }
+    }
+  }
+
   switch( ctx->in_kind[ in_idx ] ) {
     case IN_KIND_PACK: {
       fd_done_packing_t const * done_packing = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
@@ -158,6 +181,9 @@ returnable_frag( fd_poh_tile_t *     ctx,
       if( FD_LIKELY( sig==REPLAY_SIG_BECAME_LEADER ) ) {
         fd_became_leader_t const * became_leader = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
         fd_poh_begin_leader( ctx->poh, became_leader->slot, became_leader->hashcnt_per_tick, became_leader->ticks_per_slot, became_leader->tick_duration_ns, became_leader->max_microblocks_in_slot );
+        /* Initialize opticast state for this leader slot (shared implementation) */
+        fd_opticast_init( &ctx->poh->opticast, became_leader->slot_end_ns );
+        FD_LOG_INFO(( "OPTICAST: Firedancer PoH initialized for slot %lu", became_leader->slot ));
       } else if( sig==REPLAY_SIG_RESET ) {
         fd_poh_reset_t const * reset = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
         fd_poh_reset( ctx->poh, stem, reset->timestamp, reset->hashcnt_per_tick, reset->ticks_per_slot, reset->tick_duration_ns, reset->completed_slot, reset->completed_blockhash, reset->next_leader_slot, reset->max_microblocks_in_slot, reset->completed_block_id );
@@ -165,11 +191,144 @@ returnable_frag( fd_poh_tile_t *     ctx,
       break;
     }
     case IN_KIND_BANK: {
+      /* Harmonic: Mark that we've received microblock 0, unblocking block txns.
+         returnable_frag ensures microblocks are processed in order (delays if pack_idx != expect),
+         so the first bank message we process here IS microblock 0. */
+      if( FD_UNLIKELY( !ctx->poh->opticast.bank_received ) ) {
+        ctx->poh->opticast.bank_received = 1;
+      }
+
       ulong target_slot = fd_disco_bank_sig_slot( sig );
       ulong txn_cnt = (sz-sizeof(fd_microblock_trailer_t))/sizeof(fd_txn_p_t);
       fd_txn_p_t const * txns = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
       fd_microblock_trailer_t const * trailer = fd_type_pun_const( (uchar const*)txns+sz-sizeof(fd_microblock_trailer_t) );
+      /* OPTICAST: Harmonic microblocks were already recorded to PoH via opticast.
+         Record if: IB (pack-generated, not from resolv) OR not harmonic (votes, etc.)
+         Skip if: harmonic and not IB (already recorded via opticast) */
+      int is_ib = txn_cnt && (txns[0].flags & FD_TXN_P_FLAGS_INITIALIZER_BUNDLE);
+      int is_harmonic = txn_cnt && (txns[0].source_tpu == FD_TXN_M_TPU_SOURCE_HARMONIC);
+      if( FD_UNLIKELY( is_harmonic && !is_ib ) ) {
+        /* Harmonic block txn - already recorded via opticast, skip */
+        uint pack_idx = (uint)fd_disco_bank_sig_pack_idx( sig );
+        FD_LOG_INFO(( "OPTICAST: skip slot=%lu pack_idx=%u ib=0 harmonic=1 (already recorded via opticast)",
+                      target_slot, pack_idx ));
+        break;
+      }
+      {
+        uint pack_idx = (uint)fd_disco_bank_sig_pack_idx( sig );
+        FD_LOG_INFO(( "OPTICAST: record slot=%lu pack_idx=%u ib=%d harmonic=%d txn_cnt=%lu",
+                      target_slot, pack_idx, is_ib, is_harmonic, txn_cnt ));
+      }
       fd_poh1_mixin( ctx->poh, stem, target_slot, trailer->hash, txn_cnt, txns );
+      break;
+    }
+    /* Harmonic Optimistic Broadcast (Opticast):
+      -------------------------------------------------------
+      Opticast enables broadcasting harmonic block transactions to the
+      network *before* local execution completes, achieving true network
+      parallelism where the local validator executes at the same time as
+      the rest of the network.
+
+      The PoH tile receives harmonic transactions from the resolv_pack link
+      and records them optimistically into the PoH chain. The shred tile
+      then broadcasts these entries immediately, before the bank tile
+      finishes executing the transactions.
+
+      Coordination via arrival_ns:
+      - Resolv records fd_log_wallclock() in txnm->block_engine.arrival_ns
+        when receiving each block transaction.
+      - Both Pack and PoH read this exact same value from the message payload,
+        guaranteeing identical coordination-free decisions:
+        * If arrival_ns < harmonic_threshold_ns for the first txn: enter harmonic
+        * If arrival_ns >= cutoff: timeout, reject harmonic blocks
+      - This eliminates the need for explicit coordination messages between
+        Pack and PoH while ensuring they stay in sync.
+      - Subsequent transactions in harmonic mode are accepted until the
+        hard cutoff (arrival_ns > harmonic_cutoff_ns = slot_end_ns + buffer).
+
+      The opticast_microblock_cnt tracks how many microblocks have been
+      optimistically recorded, ensuring the first-txn threshold check is
+      applied correctly. */
+    case IN_KIND_RESOLV: {
+      /* Handle harmonic block transactions from resolv_pack.
+         Uses shared opticast logic from fd_opticast.h */
+      fd_txn_m_t const * txnm = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
+      fd_poh_t * poh = ctx->poh;
+      ulong target_slot = txnm->block_engine.block_slot;
+      
+      /* Only care about harmonic block transactions */
+      if( FD_LIKELY( txnm->source_tpu != FD_TXN_M_TPU_SOURCE_HARMONIC ) ) break;
+      
+      /* Need a leader bank to record opticast (implies we're in leader state) */
+      if( FD_UNLIKELY( !fd_poh_have_leader_bank( poh ) ) ) break;
+      
+      /* Opticast decision logic (shared implementation).
+         Both Pack and PoH read the same arrival_ns from the message payload,
+         guaranteeing identical coordination-free decisions. */
+      long txn_arrival_ns = txnm->block_engine.arrival_ns;
+      if( FD_UNLIKELY( !fd_opticast_should_record( &poh->opticast, txn_arrival_ns ) ) ) {
+        FD_LOG_INFO(( "OPTICAST: PoH rejecting block txn for slot=%lu "
+                      "(arrival=%ld, threshold=%ld, cutoff=%ld, cnt=%lu)",
+                      target_slot, txn_arrival_ns,
+                      poh->opticast.harmonic_threshold_ns, poh->opticast.harmonic_cutoff_ns,
+                      poh->opticast.microblock_cnt ));
+        break;
+      }
+      
+      /* Shared mixin logic */
+      uchar const * payload = fd_txn_m_payload_const( txnm );
+      fd_txn_t const * txn = fd_txn_m_txn_t_const( txnm );
+      ulong hashcnt_delta = fd_opticast_mixin(
+        &poh->opticast,
+        &poh->microblocks_lower_bound,
+        poh->max_microblocks_per_slot,
+        poh->hash,
+        &poh->hashcnt,
+        poh->last_hashcnt,
+        poh->hashcnt_per_slot,
+        &poh->slot,
+        &poh->last_slot,
+        &poh->last_hashcnt,
+        target_slot,
+        poh->next_leader_slot,
+        payload,
+        txn->signature_off,
+        txn->signature_cnt );
+      
+      if( FD_UNLIKELY( !hashcnt_delta ) ) break;
+      
+      /* Discof-specific: handle tick boundary transition.
+         If we crossed a tick boundary, check if we're past our leader slot
+         and need to transition to follower. */
+      if( FD_UNLIKELY( !(poh->hashcnt % poh->hashcnt_per_tick) ) ) {
+        fd_poh_opticast_tick_boundary( poh, stem );
+      }
+      
+      /* Publish opticast microblock to shred (shared implementation).
+         For parent_slot, pass reset_slot-1 which makes parent_block_id_valid=1,
+         matching discof's original behavior of always setting it valid. */
+      uchar * dst = (uchar *)fd_chunk_to_laddr( poh->shred_out->mem, poh->shred_out->chunk );
+      ulong out_sz = fd_opticast_publish(
+        dst,
+        target_slot,
+        poh->reset_slot,
+        poh->hashcnt,
+        poh->hashcnt_per_tick,
+        poh->ticks_per_slot,
+        hashcnt_delta,
+        poh->hash,
+        poh->reset_slot - 1UL,      /* parent_slot: makes parent_block_id_valid=1 */
+        poh->completed_block_id,
+        payload,
+        txnm->payload_sz );
+      
+      ulong tspub_out = (ulong)fd_frag_meta_ts_comp( fd_tickcount() );
+      ulong new_sig = fd_disco_poh_sig( target_slot, POH_PKT_TYPE_MICROBLOCK, 0UL );
+      fd_stem_publish( stem, poh->shred_out->idx, new_sig, poh->shred_out->chunk, out_sz, 0UL, 0UL, tspub_out );
+      poh->shred_out->chunk = fd_dcache_compact_next( poh->shred_out->chunk, out_sz, poh->shred_out->chunk0, poh->shred_out->wmark );
+      
+      FD_LOG_INFO(( "OPTICAST: PoH recorded block txn for slot=%lu (arrival=%ld, cnt=%lu)",
+                    target_slot, txn_arrival_ns, poh->opticast.microblock_cnt ));
       break;
     }
     default: {
@@ -230,6 +389,7 @@ unprivileged_init( fd_topo_t *      topo,
     if(      !strcmp( link->name, "replay_out" ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY;
     else if( !strcmp( link->name, "pack_poh"   ) ) ctx->in_kind[ i ] = IN_KIND_PACK;
     else if( !strcmp( link->name, "bank_poh"   ) ) ctx->in_kind[ i ] = IN_KIND_BANK;
+    else if( !strcmp( link->name, "resolv_pack") ) ctx->in_kind[ i ] = IN_KIND_RESOLV;
     else FD_LOG_ERR(( "unexpected input link name %s", link->name ));
   }
 
