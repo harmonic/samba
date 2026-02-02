@@ -3319,6 +3319,12 @@ fd_pack_harmonic_state_crank( fd_pack_t * pack,
       ulong pending_cnt = treap_ele_cnt( pack->pending_blocks );
       ulong scheduled_cnt = pack->harmonic_inflight + pack->harmonic_block_txn_completed;
 
+      /* Check if whole block has been received (all expected txns inserted).
+         block_txn_idx starts at 1 (0 reserved for crank), so received = block_txn_idx - 1. */
+      ulong received_cnt = pack->block_txn_idx - 1UL;
+      int whole_block_received = (pack->harmonic_block_txn_expected > 0UL) &&
+                                 (received_cnt >= pack->harmonic_block_txn_expected);
+
       if( pack->harmonic_block_txn_expected > 0UL &&
           pending_cnt == 0UL &&
           scheduled_cnt >= pack->harmonic_block_txn_expected ) {
@@ -3328,8 +3334,9 @@ fd_pack_harmonic_state_crank( fd_pack_t * pack,
         pack->lim->max_vote_cost_per_block   = pack->full_max_vote_cost_per_block;
         FD_LOG_INFO(( "HARMONIC: HARMONIC -> SPRINT (block complete: scheduled=%lu, expected=%lu)",
                       scheduled_cnt, pack->harmonic_block_txn_expected ));
-      } else if( FD_UNLIKELY( past_end_time ) ) {
-        /* Slot ending while still in harmonic mode */
+      } else if( FD_UNLIKELY( past_end_time && !whole_block_received ) ) {
+        /* Slot ending while still in harmonic mode, and we haven't received the whole block.
+           If whole block was received, we commit to executing it regardless of timing. */
         if( pending_cnt == 0UL && pack->harmonic_inflight == 0UL ) {
           /* Stuck - no pending blocks and nothing inflight, block was incomplete */
           pack->block_end_flags              |= FD_PACK_END_FLAG_HARMONIC_TIMEOUT;
@@ -3340,6 +3347,7 @@ fd_pack_harmonic_state_crank( fd_pack_t * pack,
         }
         /* else: Still have blocks to process - don't end yet */
       }
+      /* If whole_block_received but not all scheduled yet, keep processing with no timeout */
       break;
     }
 
