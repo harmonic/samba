@@ -1243,6 +1243,7 @@ after_credit( fd_shred_ctx_t *    ctx,
     if( FD_UNLIKELY( !k ) ) return;
     fd_shred_dest_t * sdest = fd_stake_ci_get_sdest_for_slot( ctx->stake_ci, new_shreds[ 0 ]->slot );
     if( FD_UNLIKELY( !sdest ) ) return;
+    int use_chacha8 = ( new_shreds[ 0 ]->slot >= ctx->features_activation->switch_to_chacha8_turbine );
     ulong out_stride;
     ulong max_dest_cnt[1];
     fd_shred_dest_idx_t * dests;
@@ -1251,14 +1252,14 @@ after_credit( fd_shred_ctx_t *    ctx,
         for( ulong j=0UL; j<ctx->adtl_dests_retransmit_cnt; j++ ) send_shred( ctx, stem, new_shreds[ i ], ctx->adtl_dests_retransmit+j, ctx->tsorig );
       }
       out_stride = k;
-      dests = fd_shred_dest_compute_children( sdest, new_shreds, k, ctx->scratchpad_dests, k, fanout, fanout, max_dest_cnt );
+      dests = fd_shred_dest_compute_children( sdest, new_shreds, k, ctx->scratchpad_dests, k, fanout, fanout, max_dest_cnt, use_chacha8 );
     } else {
       for( ulong i=0UL; i<k; i++ ) {
         for( ulong j=0UL; j<ctx->adtl_dests_leader_cnt; j++ ) send_shred( ctx, stem, new_shreds[ i ], ctx->adtl_dests_leader+j, ctx->tsorig );
       }
       out_stride = 1UL;
       *max_dest_cnt = 1UL;
-      dests = fd_shred_dest_compute_first   ( sdest, new_shreds, k, ctx->scratchpad_dests );
+      dests = fd_shred_dest_compute_first   ( sdest, new_shreds, k, ctx->scratchpad_dests, use_chacha8 );
     }
     if( FD_UNLIKELY( !dests ) ) return;
     for( ulong i=0UL; i<k; i++ ) {
