@@ -755,12 +755,10 @@ int fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
 #define HARMONIC_MODE_FAILED    -2
 #define HARMONIC_MODE_DONE      -3
 
-/* Slot end buffer values for harmonic mode.
-   BASE: default buffer when harmonic mode enabled but not actively broadcasting
-   EXTENSION: extended buffer while broadcasting harmonic block (HARMONIC state)
-   (most of the time will go unused, this is just for worst case) */
-#define FD_PACK_HARMONIC_BUFFER_NS    (100000000L)  /* 100ms base buffer */
-#define FD_PACK_HARMONIC_EXTENSION_NS (200000000L)  /* 200ms extension */
+/* Slot end buffer for harmonic mode.
+   50ms buffer: waiting for block (HARMONIC), no block (UNDECIDED->SPRINT), slot ending (->DONE)
+   0ms buffer: full block received and committed (HARMONIC->SPRINT), or block failed (->FAILED) */
+#define FD_PACK_HARMONIC_BUFFER_NS    ( 50000000L)  /* 50ms timeout buffer */
 #define FD_PACK_HARMONIC_DEADLINE_NS  ( 20000000L)  /* 20ms before slot end */
 
 /* fd_pack_harmonic_state: Returns the current harmonic state. */
