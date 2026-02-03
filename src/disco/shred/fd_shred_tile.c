@@ -1147,6 +1147,12 @@ after_frag( fd_shred_ctx_t *    ctx,
 
     /* Send only the ones we didn't receive. */
     for( ulong i=0UL; i<k; i++ ) {
+      /* CAVEY DIAGNOSTIC: check and log if last shred for block */
+      int is_last_shred_for_block = !!( new_shreds[ i ]->data.flags & FD_SHRED_DATA_FLAG_SLOT_COMPLETE );
+      if( FD_UNLIKELY( is_last_shred_for_block ) ) {
+        FD_LOG_NOTICE(( "CAVEY: Broadcasting last shred for block: slot=%lu shred_idx=%u fec_set_idx=%u", 
+                        new_shreds[ i ]->slot, new_shreds[ i ]->idx, new_shreds[ i ]->fec_set_idx ));
+      }
       for( ulong j=0UL; j<*max_dest_cnt; j++ ) send_shred( ctx, stem, new_shreds[ i ], fd_shred_dest_idx_to_dest( sdest, dests[ j*out_stride+i ]), ctx->tsorig );
     }
   }
@@ -1263,6 +1269,12 @@ after_credit( fd_shred_ctx_t *    ctx,
     }
     if( FD_UNLIKELY( !dests ) ) return;
     for( ulong i=0UL; i<k; i++ ) {
+      /* Check if this is the last shred for the block */
+      int is_last_shred_for_block = !!( new_shreds[ i ]->data.flags & FD_SHRED_DATA_FLAG_SLOT_COMPLETE );
+      if( FD_UNLIKELY( is_last_shred_for_block ) ) {
+        FD_LOG_NOTICE(( "Broadcasting last shred for block: slot=%lu shred_idx=%u fec_set_idx=%u", 
+                        new_shreds[ i ]->slot, new_shreds[ i ]->idx, new_shreds[ i ]->fec_set_idx ));
+      }
       for( ulong j=0UL; j<*max_dest_cnt; j++ ) send_shred( ctx, stem, new_shreds[ i ], fd_shred_dest_idx_to_dest( sdest, dests[ j*out_stride+i ]), ctx->tsorig );
     }
   }
