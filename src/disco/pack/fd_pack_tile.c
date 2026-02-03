@@ -212,10 +212,9 @@ typedef struct {
      for, if we are currently packing for a slot.*/
   long slot_end_ns;
 
-  /* Buffer time added to slot_end_ns when broadcasting harmonic blocks.
-     Set to 200ms when actively broadcasting, 0 otherwise.
-     Almost all blocks will not use this extra time; this is just here to
-     accommodate the worst case scenario. */
+  /* Buffer time added to slot_end_ns for harmonic blocks.
+     - 50ms: waiting for block (HARMONIC), no block (SPRINT), slot ending (DONE)
+     - 0ms: full block received (SPRINT from HARMONIC), or block failed (FAILED) */
   long slot_end_ns_buffer;
 
   /* Hard cutoff for harmonic txns (slot_end_ns + buffer).
@@ -689,8 +688,8 @@ poll_next_bank:
 
   /* Harmonic block mode: apply buffer managed by pack's state machine crank.
      The crank updates slot_end_ns_buffer on state transitions:
-       - HARMONIC state: extended buffer (200ms)
-       - Other states: base buffer (100ms) */
+       - 50ms: waiting for block (HARMONIC), no block (SPRINT), slot ending (DONE)
+       - 0ms: full block received (SPRINT from HARMONIC), or block failed (FAILED) */
   if( FD_UNLIKELY( ctx->harmonic && ctx->leader_slot!=ULONG_MAX ) ) {
     ctx->slot_end_ns_buffer = fd_pack_harmonic_slot_end_buffer( ctx->pack );
   }
