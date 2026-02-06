@@ -3148,14 +3148,14 @@ fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
   }
 
   /* Capacity check: harmonic txns are high priority, delete from regular treaps to make room.
-     We don't count harmonic txns in pending_txn_cnt, but we need pool slots for them.
-     Delete worst regular txns if pack is at capacity. The pool has extra_depth slots
-     beyond pack_depth, but we should try to keep regular txn count within pack_depth. */
+     We don't count harmonic txns in pending_txn_cnt, but they consume pool slots.
+     We must keep pending_txn_cnt + block_txn_cnt <= pack_depth so that the extra_depth
+     buffer remains free for bundle init/fini operations.  Since we maintain this
+     invariant on every insertion, at most one delete is needed to make room. */
+  ulong block_txn_cnt = treap_ele_cnt( pack->pending_blocks );
   ulong delete_cnt = 0UL;
-  while( FD_UNLIKELY( pack->pending_txn_cnt > 0UL && pack->pending_txn_cnt >= pack->pack_depth ) ) {
-    ulong _delete_cnt = delete_worst( pack, FLT_MAX, 0 );
-    delete_cnt += _delete_cnt;
-    if( FD_UNLIKELY( !_delete_cnt ) ) break; /* No more regular txns to delete, use extra space */
+  if( FD_UNLIKELY( pack->pending_txn_cnt > 0UL && pack->pending_txn_cnt + block_txn_cnt >= pack->pack_depth ) ) {
+    delete_cnt = delete_worst( pack, FLT_MAX, 0 );
   }
   if( opt_delete_cnt ) *opt_delete_cnt = delete_cnt;
 
