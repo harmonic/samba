@@ -1563,6 +1563,7 @@ unprivileged_init( fd_topo_t *      topo,
   }
 
   for( ulong i=0UL; i<tile->in_cnt; i++ ) {
+    if( FD_UNLIKELY( ctx->in_kind[ i ]==IN_KIND_BLOCK_FAIL ) ) continue; /* Zero-MTU signal link, no dcache */
     fd_topo_link_t * link = &topo->links[ tile->in_link_id[ i ] ];
     fd_topo_wksp_t * link_wksp = &topo->workspaces[ topo->objs[ link->dcache_obj_id ].wksp_id ];
 
