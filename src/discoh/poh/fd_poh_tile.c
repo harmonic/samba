@@ -1347,21 +1347,7 @@ fd_ext_poh_reset( ulong         completed_bank_slot, /* The slot that successful
   }
 
   ctx->leader_bank_start_ns = fd_log_wallclock(); /* safe to call from Rust */
-  if( FD_UNLIKELY( ctx->expect_sequential_leader_slot==(completed_bank_slot+1UL) ) ) {
-    /* If we are being reset onto a slot, it means some block was fully
-       processed, so we reset to build on top of it.  Typically we want
-       to update the reset_slot_start_ns to the current time, because
-       the network will give the next leader 400ms to publish,
-       regardless of how long the prior leader took.
-
-       But: if we were leader in the prior slot, and the block was our
-       own we can do better.  We know that the next slot should start
-       exactly 400ms after the prior one started, so we can use that as
-       the reset slot start time instead. */
-    ctx->reset_slot_start_ns = ctx->reset_slot_start_ns + (long)((double)((completed_bank_slot+1UL)-ctx->reset_slot)*ctx->slot_duration_ns);
-  } else {
-    ctx->reset_slot_start_ns = ctx->leader_bank_start_ns;
-  }
+  ctx->reset_slot_start_ns = ctx->leader_bank_start_ns;
   ctx->expect_sequential_leader_slot = ULONG_MAX;
 
   memcpy( ctx->reset_hash, reset_blockhash, 32UL );
