@@ -69,6 +69,7 @@
 #define FD_CONTACT_INFO_VERSION_CLIENT_FIREDANCER    (5)
 #define FD_CONTACT_INFO_VERSION_CLIENT_AGAVE_BAM     (6)
 #define FD_CONTACT_INFO_VERSION_CLIENT_SIG           (7)
+#define FD_CONTACT_INFO_VERSION_CLIENT_HARMONIC_FD  (11)
 
 /* A contact info represents a peer node in the cluster that is
    publishing information about itself to the gossip network.  It it
