@@ -1900,6 +1900,11 @@ before_frag( fd_poh_ctx_t * ctx,
      However, if we're past the harmonic cutoff (no block received in time), pack
      enters SPRINT mode and we won't process harmonic blocks anyway. Don't delay. */
   if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_RESOLV ) ) {
+    /* Discard block-fail signals from resolv.  These are zero-payload
+       fragments sent to notify pack of an upstream failure; PoH does
+       not need to act on them. */
+    if( FD_UNLIKELY( sig & FD_TXN_M_SIG_BLOCK_FAIL_FLAG ) ) return 1;
+
     int is_block = !!(sig & FD_TXN_M_SIG_BLOCK_FLAG);
     if( FD_UNLIKELY( is_block && !ctx->opticast.bank_received ) ) {
       long now_ns = fd_log_wallclock();

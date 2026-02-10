@@ -28,6 +28,7 @@
 #define IN_KIND_SIGN         (3UL)
 #define IN_KIND_REPLAY       (4UL)
 #define IN_KIND_EXECUTED_TXN (5UL)
+#define IN_KIND_BLOCK_FAIL   (6UL)
 
 /* Pace microblocks, but only slightly.  This helps keep performance
    more stable.  This limit is 2,000 microblocks/second/bank.  At 31
@@ -944,7 +945,20 @@ static inline int
 before_frag( fd_pack_ctx_t * ctx,
              ulong           in_idx,
              ulong           seq FD_PARAM_UNUSED,
-             ulong           sig FD_PARAM_UNUSED ) {
+             ulong           sig ) {
+
+  /* Handle block-fail signals from verify_packf / dedup_packf links */
+  if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_BLOCK_FAIL ) ) {
+    fd_pack_harmonic_signal_fail( ctx->pack, sig );
+    return 1; /* Discard - no payload to process */
+  }
+
+  /* Handle block-fail signals piggybacked on the resolv_pack link */
+  if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_RESOLV &&
+                   ( sig & FD_TXN_M_SIG_BLOCK_FAIL_FLAG ) ) ) {
+    fd_pack_harmonic_signal_fail( ctx->pack, sig & ~FD_TXN_M_SIG_BLOCK_FAIL_FLAG );
+    return 1; /* Discard - no payload to process */
+  }
 
   /* Only apply backpressure to resolv when harmonic pool is full */
   if( FD_UNLIKELY( ctx->harmonic &&
@@ -1127,6 +1141,8 @@ during_frag( fd_pack_ctx_t * ctx,
     fd_memcpy( ctx->executed_txn_sig, dcache_entry, sz );
     break;
   }
+  case IN_KIND_BLOCK_FAIL:
+    return; /* unreachable. handled in before_frag */
   }
 }
 
@@ -1341,6 +1357,8 @@ after_frag( fd_pack_ctx_t *     ctx,
     FD_MCNT_INC( PACK, TRANSACTION_ALREADY_EXECUTED, deleted );
     break;
   }
+  case IN_KIND_BLOCK_FAIL:
+    return; /* unreachable. handled in before_frag */
   }
 
   update_metric_state( ctx, now, FD_PACK_METRIC_STATE_TRANSACTIONS, fd_pack_avail_txn_cnt( ctx->pack )>0 );
@@ -1423,6 +1441,8 @@ unprivileged_init( fd_topo_t *      topo,
     else if( FD_LIKELY( !strcmp( link->name, "replay_out"   ) ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY;
     else if( FD_LIKELY( !strcmp( link->name, "executed_txn" ) ) ) ctx->in_kind[ i ] = IN_KIND_EXECUTED_TXN;
     else if( FD_LIKELY( !strcmp( link->name, "exec_sig"     ) ) ) ctx->in_kind[ i ] = IN_KIND_EXECUTED_TXN;
+    else if( FD_LIKELY( !strcmp( link->name, "verify_packf" ) ) ) ctx->in_kind[ i ] = IN_KIND_BLOCK_FAIL;
+    else if( FD_LIKELY( !strcmp( link->name, "dedup_packf"  ) ) ) ctx->in_kind[ i ] = IN_KIND_BLOCK_FAIL;
     else FD_LOG_ERR(( "pack tile has unexpected input link %lu %s", i, link->name ));
   }
 
