@@ -66,6 +66,8 @@ fd_topo_initialize( config_t * config ) {
   fd_topob_wksp( topo, "shred_store"  );
   fd_topob_wksp( topo, "stake_out"    );
   fd_topob_wksp( topo, "executed_txn" );
+  fd_topob_wksp( topo, "verify_packf");
+  fd_topob_wksp( topo, "dedup_packf" );
 
   fd_topob_wksp( topo, "shred_sign"   );
   fd_topob_wksp( topo, "sign_shred"   );
@@ -107,6 +109,10 @@ fd_topo_initialize( config_t * config ) {
   /**/                 fd_topob_link( topo, "crds_shred",   "poh_shred",    128UL,                                    8UL  + 40200UL * 46UL,  1UL );
   /**/                 fd_topob_link( topo, "replay_resol", "bank_poh",     128UL,                                    sizeof(fd_completed_bank_t), 1UL );
   /**/                 fd_topob_link( topo, "executed_txn", "executed_txn", 16384UL,                                  64UL, 1UL );
+  /* Harmonic block failure signal links (zero-MTU, signal-only).
+     Only verify:0 receives block txns, so only one verify_packf link needed. */
+  /**/                 fd_topob_link( topo, "verify_packf", "verify_packf", 128UL,                                    0UL,                    1UL );
+  /**/                 fd_topob_link( topo, "dedup_packf",  "dedup_packf",  128UL,                                    0UL,                    1UL );
   /* See long comment in fd_shred.c for an explanation about the size of this dcache. */
   FOR(shred_tile_cnt)  fd_topob_link( topo, "shred_store",  "shred_store",  65536UL,                                  4UL*FD_SHRED_STORE_MTU, 4UL+config->tiles.shred.max_pending_shred_sets );
 
@@ -173,15 +179,20 @@ fd_topo_initialize( config_t * config ) {
   FOR(verify_tile_cnt) for( ulong j=0UL; j<quic_tile_cnt; j++ )
                        fd_topob_tile_in(  topo, "verify",  i,            "metric_in", "quic_verify",  j,            FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED ); /* No reliable consumers, verify tiles may be overrun */
   FOR(verify_tile_cnt) fd_topob_tile_out( topo, "verify",  i,                         "verify_dedup", i                                                  );
+  /**/                 fd_topob_tile_out( topo, "verify",  0UL,                       "verify_packf", 0UL                                                );
   /* Declare the single gossip link before the variable length verify-dedup links so we could have a compile-time index to the gossip link. */
   /**/                 fd_topob_tile_in(  topo, "dedup",   0UL,          "metric_in", "gossip_dedup", 0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   FOR(verify_tile_cnt) fd_topob_tile_in(  topo, "dedup",   0UL,          "metric_in", "verify_dedup", i,            FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   /**/                 fd_topob_tile_in(  topo, "dedup",   0UL,          "metric_in", "executed_txn", 0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   /**/                 fd_topob_tile_out( topo, "dedup",   0UL,                       "dedup_resolv", 0UL                                                );
+  /**/                 fd_topob_tile_out( topo, "dedup",   0UL,                       "dedup_packf",  0UL                                                );
   FOR(resolv_tile_cnt) fd_topob_tile_in(  topo, "resolv",  i,            "metric_in", "dedup_resolv", 0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   FOR(resolv_tile_cnt) fd_topob_tile_in(  topo, "resolv",  i,            "metric_in", "replay_resol", 0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   FOR(resolv_tile_cnt) fd_topob_tile_out( topo, "resolv",  i,                         "resolv_pack",  i                                                  );
   /**/                 fd_topob_tile_in(  topo, "pack",    0UL,          "metric_in", "resolv_pack",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
+  /* Harmonic block failure signals from verify:0 and dedup to pack */
+  /**/                 fd_topob_tile_in(  topo, "pack",    0UL,          "metric_in", "verify_packf", 0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
+  /**/                 fd_topob_tile_in(  topo, "pack",    0UL,          "metric_in", "dedup_packf",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   /* The PoH to pack link is reliable, and must be.  The fragments going
      across here are "you became leader" which pack must respond to
      by publishing microblocks, otherwise the leader TPU will hang

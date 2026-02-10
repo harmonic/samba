@@ -536,7 +536,11 @@ after_frag( fd_resolv_ctx_t *   ctx,
     txnm->reference_slot = blockhash->slot;
     if( FD_UNLIKELY( txnm->reference_slot+151UL<ctx->completed_slot ) ) {
       ctx->bundle_failed = is_bundle;
-      ctx->block_failed  = is_block;
+      if( FD_UNLIKELY( is_block && !ctx->block_failed ) ) {
+        ctx->block_failed = 1;
+        ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
+        fd_stem_publish( stem, 0UL, ctx->block_slot | FD_TXN_M_SIG_BLOCK_FAIL_FLAG, 0UL, 0UL, 0UL, 0UL, tspub );
+      }
       ctx->metrics.blockhash_expired++;
       return;
     }
@@ -580,14 +584,22 @@ after_frag( fd_resolv_ctx_t *   ctx,
     if( FD_UNLIKELY( !ctx->bank ) ) {
       FD_MCNT_INC( RESOLF, NO_BANK_DROP, 1 );
       ctx->bundle_failed = is_bundle;
-      ctx->block_failed  = is_block;
+      if( FD_UNLIKELY( is_block && !ctx->block_failed ) ) {
+        ctx->block_failed = 1;
+        ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
+        fd_stem_publish( stem, 0UL, ctx->block_slot | FD_TXN_M_SIG_BLOCK_FAIL_FLAG, 0UL, 0UL, 0UL, 0UL, tspub );
+      }
       return;
     }
 
     int result = peek_aluts( ctx, txnm );
     if( FD_UNLIKELY( result ) ) {
       ctx->bundle_failed = is_bundle;
-      ctx->block_failed  = is_block;
+      if( FD_UNLIKELY( is_block && !ctx->block_failed ) ) {
+        ctx->block_failed = 1;
+        ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
+        fd_stem_publish( stem, 0UL, ctx->block_slot | FD_TXN_M_SIG_BLOCK_FAIL_FLAG, 0UL, 0UL, 0UL, 0UL, tspub );
+      }
       return;
     }
   }

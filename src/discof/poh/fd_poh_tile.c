@@ -111,6 +111,12 @@ returnable_frag( fd_poh_tile_t *     ctx,
   (void)tsorig;
   (void)tspub;
 
+  /* Discard block-fail signals from resolv.  These are zero-payload
+     fragments sent to notify pack of an upstream failure; PoH does
+     not need to act on them.  Must check before bounds check since
+     block-fail signals have sz=0 and chunk=0. */
+  if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_RESOLV && ( sig & FD_TXN_M_SIG_BLOCK_FAIL_FLAG ) ) ) return 0;
+
   /* TODO: Pack has a workaround for Frankendancer that sequences bank
      release to manage lifetimes, but it's not needed in Firedancer so
      we just drop it.  We shouldn't send it at all in future. */

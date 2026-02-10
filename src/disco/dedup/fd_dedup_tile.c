@@ -67,6 +67,8 @@ typedef struct {
   ulong       out_wmark;
   ulong       out_chunk;
 
+  ulong       packf_out_idx; /* Output link index for dedup_packf (block-fail signal) */
+
   ulong       hashmap_seed;
 
   struct {
@@ -255,8 +257,14 @@ after_frag( fd_dedup_ctx_t *    ctx,
 
   if( FD_LIKELY( is_dup ) ) {
     ctx->bundle_failed = is_bundle;
-    ctx->block_failed  = is_block;
-    if( is_block ) FD_LOG_NOTICE(( "CAVEY DEBUG: dedup failed for block in slot %lu", ctx->block_slot ));
+    if( FD_UNLIKELY( is_block && !ctx->block_failed ) ) {
+      ctx->block_failed = 1;
+      if( FD_LIKELY( ctx->packf_out_idx!=ULONG_MAX ) ) {
+        ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_tickcount() );
+        fd_stem_publish( stem, ctx->packf_out_idx, ctx->block_slot, 0UL, 0UL, 0UL, 0UL, tspub );
+      }
+      FD_LOG_NOTICE(( "CAVEY DEBUG: dedup failed for block in slot %lu", ctx->block_slot ));
+    }
 
     ctx->metrics.dedup_fail_cnt++;
   } else {
@@ -337,6 +345,16 @@ unprivileged_init( fd_topo_t *      topo,
   ctx->out_chunk0 = fd_dcache_compact_chunk0( ctx->out_mem, topo->links[ tile->out_link_id[ 0 ] ].dcache );
   ctx->out_wmark  = fd_dcache_compact_wmark ( ctx->out_mem, topo->links[ tile->out_link_id[ 0 ] ].dcache, topo->links[ tile->out_link_id[ 0 ] ].mtu );
   ctx->out_chunk  = ctx->out_chunk0;
+
+  /* Find the dedup_packf output link index for block-fail signals */
+  ctx->packf_out_idx = ULONG_MAX;
+  for( ulong i=0UL; i<tile->out_cnt; i++ ) {
+    fd_topo_link_t const * link = &topo->links[ tile->out_link_id[ i ] ];
+    if( !strcmp( link->name, "dedup_packf" ) ) {
+      ctx->packf_out_idx = i;
+      break;
+    }
+  }
 
   ulong scratch_top = FD_SCRATCH_ALLOC_FINI( l, 1UL );
   if( FD_UNLIKELY( scratch_top > (ulong)scratch + scratch_footprint( tile ) ) )
