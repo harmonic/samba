@@ -3214,6 +3214,28 @@ int   fd_pack_harmonic_pool_full      ( fd_pack_t const * pack ) { return trp_po
 int   fd_pack_harmonic_end_flags      ( fd_pack_t const * pack ) { return pack->block_end_flags;                }
 long  fd_pack_harmonic_slot_end_buffer( fd_pack_t const * pack ) { return pack->slot_end_ns_buffer;             }
 
+void
+fd_pack_harmonic_signal_fail( fd_pack_t * pack,
+                              ulong       failed_slot ) {
+  /* Only act if the failed slot matches the current harmonic block slot */
+  if( FD_UNLIKELY( failed_slot != pack->harmonic_block_slot ) ) return;
+
+  /* Only transition from HARMONIC or UNDECIDED.  If already in
+     SPRINT/FAILED/DONE, this is a no-op. */
+  if( FD_LIKELY( pack->harmonic_decision != HARMONIC_MODE_HARMONIC &&
+                 pack->harmonic_decision != HARMONIC_MODE_UNDECIDED ) ) return;
+
+  FD_LOG_INFO(( "HARMONIC: upstream block failure signal for slot=%lu (was %s)",
+                failed_slot,
+                pack->harmonic_decision == HARMONIC_MODE_HARMONIC ? "HARMONIC" : "UNDECIDED" ));
+
+  pack->block_end_flags             |= FD_PACK_END_FLAG_HARMONIC_TIMEOUT;
+  pack->harmonic_decision            = HARMONIC_MODE_SPRINT;
+  pack->slot_end_ns_buffer           = 0L;
+  pack->lim->max_vote_cost_per_block = pack->full_max_vote_cost_per_block;
+}
+
+
 /* fd_pack_harmonic_state_crank: Unified state machine for harmonic block scheduling.
 
    Overview

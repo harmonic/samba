@@ -14,11 +14,14 @@
 #define FD_TXN_M_TPU_SOURCE_HARMONIC (6UL)
 #define FD_TXN_M_TPU_SOURCE_HTPU     (7UL)
 
-/* Sig flag: set in the high bit of the sig field when publishing block
-   transactions from resolv->pack. This allows downstream tiles to identify
-   block transactions from the sig alone (in before_frag where chunk data
-   is not yet available). Slots won't reach 2^63 for an extremely long time. */
-#define FD_TXN_M_SIG_BLOCK_FLAG    (1UL<<63)
+/* Sig flags: high bits of the sig field used on resolv->pack link.
+   BLOCK_FLAG identifies block transactions so downstream tiles can
+   distinguish them in before_frag without reading chunk data.
+   BLOCK_FAIL_FLAG signals that a harmonic block failed upstream
+   (verify/dedup/resolv), allowing pack to exit harmonic mode early.
+   Slots won't reach 2^62 for an extremely long time. */
+#define FD_TXN_M_SIG_BLOCK_FLAG      (1UL<<63)
+#define FD_TXN_M_SIG_BLOCK_FAIL_FLAG (1UL<<62)
 
 struct fd_txn_m {
   /* The computed slot that this transaction is referencing, aka. the
