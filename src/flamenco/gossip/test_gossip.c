@@ -48,7 +48,7 @@ test_gossip_new_basic( void ) {
   my_ci.wallclock_nanos                      = my_ci.instance_creation_wallclock_nanos;
   my_ci.sockets[ FD_CONTACT_INFO_SOCKET_GOSSIP ].addr = entrypoints[0].addr;
   my_ci.sockets[ FD_CONTACT_INFO_SOCKET_GOSSIP ].port = entrypoints[0].port;
-  my_ci.version.client                       = FD_CONTACT_INFO_VERSION_CLIENT_FIREDANCER;
+  my_ci.version.client                       = FD_CONTACT_INFO_VERSION_CLIENT_HARMONIC_FD;
   my_ci.version.major                        = 0U;
   my_ci.version.minor                        = 0U;
   my_ci.version.patch                        = 0U;
