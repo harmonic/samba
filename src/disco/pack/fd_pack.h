@@ -789,6 +789,14 @@ FD_FN_PURE int fd_pack_harmonic_pool_full( fd_pack_t const * pack );
    Reset by fd_pack_end_block. */
 FD_FN_PURE int fd_pack_harmonic_end_flags( fd_pack_t const * pack );
 
+/* fd_pack_harmonic_signal_fail: Signal that the harmonic block failed
+   upstream (verify, dedup, or resolv detected a failure).  If the
+   failed_slot matches the current harmonic_block_slot and we are in
+   HARMONIC or UNDECIDED state, transition immediately to SPRINT mode
+   so votes and normal transactions can be scheduled.  No-op if already
+   in SPRINT/FAILED/DONE or if the slot doesn't match. */
+void fd_pack_harmonic_signal_fail( fd_pack_t * pack, ulong failed_slot );
+
 /* fd_pack_harmonic_state_crank: Crank the harmonic state machine.
    Called once after each scheduling attempt to handle all state transitions:
    - UNDECIDED -> HARMONIC: block transactions arrived

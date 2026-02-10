@@ -49,6 +49,8 @@ typedef struct {
   ulong       out_wmark;
   ulong       out_chunk;
 
+  ulong       packf_out_idx; /* Output link index for verify_packf (block-fail signal) */
+
   ulong       hashmap_seed;
 
   struct {
