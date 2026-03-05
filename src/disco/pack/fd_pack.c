@@ -1382,7 +1382,7 @@ fd_pack_insert_txn_fini( fd_pack_t  * pack,
     }
   }
 
-  if( FD_UNLIKELY( pack->pending_txn_cnt == pack->pack_depth ) ) {
+  if( FD_UNLIKELY( pack->pending_txn_cnt + treap_ele_cnt(pack->pending_blocks) == pack->pack_depth ) ) {
     float threshold_score = (float)ord->rewards/(float)ord->compute_est;
     ulong _delete_cnt = delete_worst( pack, threshold_score, is_vote );
     *delete_cnt += _delete_cnt;
@@ -1570,7 +1570,7 @@ fd_pack_insert_bundle_fini( fd_pack_t          * pack,
     }
   }
 
-  while( FD_UNLIKELY( pack->pending_txn_cnt+txn_cnt > pack->pack_depth ) ) {
+  while( FD_UNLIKELY( pack->pending_txn_cnt+txn_cnt+treap_ele_cnt(pack->pending_blocks) > pack->pack_depth ) ) {
     ulong _delete_cnt = delete_worst( pack, FLT_MAX, 0 );
     *delete_cnt += _delete_cnt;
     if( FD_UNLIKELY( !_delete_cnt ) ) {
