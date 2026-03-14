@@ -716,10 +716,11 @@ poll_next_bank:
           /* SPRINT/FAILED: harmonic block done/failed, use regular bundle meta */
           top_meta = fd_pack_peek_bundle_meta( ctx->pack );
           break;
+        case HARMONIC_MODE_VOTE_ONLY:
         case HARMONIC_MODE_UNDECIDED:
         case HARMONIC_MODE_DONE:
         default:
-          /* UNDECIDED/DONE: wait for harmonic state change or slot is ending */
+          /* VOTE_ONLY/UNDECIDED/DONE: no bundle cranking */
           break;
       }
     }
@@ -1254,10 +1255,11 @@ after_frag( fd_pack_ctx_t *     ctx,
        need to explicitly clear account locks here.
        Set harmonic_block_slot to leader_slot so block txns for other slots are dropped. */
     if( FD_UNLIKELY( ctx->harmonic ) ) {
-      fd_pack_harmonic_reset( ctx->pack, leader_slot );
+      fd_pack_harmonic_reset( ctx->pack, leader_slot, ctx->_became_leader->leader_next_slot );
       ctx->harmonic_threshold_ns = ctx->harmonic_cutoff_ns - FD_PACK_HARMONIC_DEADLINE_NS;
-      FD_LOG_INFO(( "HARMONIC: new leader slot=%lu, threshold_ns=%ld, cutoff_ns=%ld", 
-                    ctx->leader_slot, ctx->harmonic_threshold_ns, ctx->harmonic_cutoff_ns ));
+      FD_LOG_INFO(( "HARMONIC: new leader slot=%lu, threshold_ns=%ld, cutoff_ns=%ld, leader_next_slot=%d", 
+                    ctx->leader_slot, ctx->harmonic_threshold_ns, ctx->harmonic_cutoff_ns,
+                    ctx->_became_leader->leader_next_slot ));
     }
 
     fd_pack_limits_t limits[ 1 ];
