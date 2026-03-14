@@ -1119,6 +1119,10 @@ publish_became_leader( fd_poh_ctx_t * ctx,
   leader->bundle->config[0]       = config[0];
   leader->slot                    = slot;
 
+  /* cavey: check if we are leaeder next slot */
+  fd_pubkey_t const * next_slot_leader = fd_multi_epoch_leaders_get_leader_for_slot( ctx->mleaders, slot+1UL );
+  leader->leader_next_slot = next_slot_leader && !memcmp( next_slot_leader->key, ctx->identity_key.key, 32UL );
+
   leader->limits.slot_max_cost                = ctx->limits.slot_max_cost;
   leader->limits.slot_max_vote_cost           = ctx->limits.slot_max_vote_cost;
   leader->limits.slot_max_write_cost_per_acct = ctx->limits.slot_max_write_cost_per_acct;
