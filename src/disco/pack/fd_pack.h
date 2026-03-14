@@ -702,8 +702,9 @@ fd_pack_complete_harmonic_txn( fd_pack_t * pack,
 
 /* fd_pack_harmonic_reset: Resets harmonic state for a new leader slot.
    Clears pending transactions, resets decision state, and sets harmonic_block_slot
-   to leader_slot. Block txns for other slots will be dropped. */
-void fd_pack_harmonic_reset( fd_pack_t * pack, ulong leader_slot );
+   to leader_slot. Block txns for other slots will be dropped.
+   leader_next_slot: 1 if we are also the leader for slot+1, 0 otherwise. */
+void fd_pack_harmonic_reset( fd_pack_t * pack, ulong leader_slot, int leader_next_slot );
 
 /* fd_pack_harmonic_insert_fini: Inserts an already-populated block
    transaction into the pending_blocks treap.  Takes an fd_txn_e_t from
@@ -744,16 +745,19 @@ int fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
                                   ulong        * opt_delete_cnt );
 
 /* Harmonic state machine states.
-   UNDECIDED: Waiting for harmonic block transactions to arrive.
-   HARMONIC:  Received block transactions, scheduling them.
-   SPRINT:    Harmonic block complete (or skipped), scheduling votes/normal txns.
-   FAILED:    Block validation failed, behaves like SPRINT.
-   DONE:      Slot is ending, block_end_reason indicates why. */
+   UNDECIDED:  Waiting for harmonic block transactions to arrive.
+   HARMONIC:   Received block transactions, scheduling them.
+   SPRINT:     Harmonic block complete (or skipped), scheduling votes/normal txns.
+   FAILED:     Block validation failed, behaves like SPRINT.
+   VOTE_ONLY:  Harmonic block complete but we are leader next slot.
+               Only schedule votes; keep bundle/nonvote paused.
+   DONE:       Slot is ending, block_end_reason indicates why. */
 #define HARMONIC_MODE_UNDECIDED  0
 #define HARMONIC_MODE_HARMONIC   1
 #define HARMONIC_MODE_SPRINT    -1
 #define HARMONIC_MODE_FAILED    -2
 #define HARMONIC_MODE_DONE      -3
+#define HARMONIC_MODE_VOTE_ONLY -4
 
 /* Slot end buffer for harmonic mode.
    50ms buffer: waiting for block (HARMONIC), no block (UNDECIDED->SPRINT), slot ending (->DONE)
