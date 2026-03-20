@@ -93,10 +93,8 @@ fd_opticast_compute_merkle_hash( uchar const * payload,
                                  ushort        signature_off,
                                  ushort        signature_cnt,
                                  uchar       * merkle_out ) {
-  /* Use a stack-allocated bmtree for single-txn hash.
-     fd_bmtree_commit requires: 2 * tree_depth * 32 bytes
-     For a single leaf, tree_depth=1, so we need 64 bytes minimum. */
-  uchar bmtree_mem[ 256 ] __attribute__((aligned(32)));
+  /* Stack buffer sized per fd_bmtree_commit_init(..., inclusion_proof_layer_cnt=0). */
+  uchar bmtree_mem[ FD_BMTREE_COMMIT_FOOTPRINT( 0UL ) ] __attribute__((aligned(FD_BMTREE_COMMIT_ALIGN)));
   fd_bmtree_commit_t * bmtree = fd_bmtree_commit_init( bmtree_mem, 32UL, 1UL, 0UL );
 
   /* Hash all signatures, matching bank's hash_transactions */
