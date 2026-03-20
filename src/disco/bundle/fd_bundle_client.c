@@ -1288,15 +1288,35 @@ fd_harmonic_block_tile_publish_block_txn(
   ctx->harmonic_block_txn_received_cnt++;
 }
 
-/* Called for each transaction in a block.  Counts transactions. */
+/* Called for each transaction in a block.  Counts txns we will publish.
+   Empty or oversize payload returns false → BundleUuid decode fails → this
+   SubscribeBundlesResponse is dropped (invalid block). */
 static bool
 fd_harmonic_block_client_visit_pb_block_txn_preflight(
     pb_istream_t *     istream,
     pb_field_t const * field,
     void **            arg
 ) {
-  (void)istream; (void)field;
+  (void)field;
   fd_bundle_tile_t * ctx = *arg;
+
+  packet_Packet packet = packet_Packet_init_default;
+  if( FD_UNLIKELY( !pb_decode( istream, &packet_Packet_msg, &packet ) ) ) {
+    ctx->metrics.decode_fail_cnt++;
+    FD_LOG_WARNING(( "Protobuf decode of block (packet.Packet) failed" ));
+    return false;
+  }
+
+  if( FD_UNLIKELY( packet.data.size == 0 ) ) {
+    FD_LOG_WARNING(( "Block server delivered an empty packet; rejecting block" ));
+    return false;
+  }
+
+  if( FD_UNLIKELY( packet.data.size > FD_TXN_MTU ) ) {
+    FD_LOG_WARNING(( "Block server delivered an oversize transaction; rejecting block" ));
+    return false;
+  }
+
   ctx->harmonic_block_txn_cnt++;
   return true;
 }
@@ -1319,13 +1339,13 @@ fd_harmonic_block_client_visit_pb_block_txn(
   }
 
   if( FD_UNLIKELY( packet.data.size == 0 ) ) {
-    FD_LOG_WARNING(( "Block server delivered an empty packet, ignoring" ));
-    return true;
+    FD_LOG_WARNING(( "Block server delivered an empty packet; rejecting block" ));
+    return false;
   }
 
   if( FD_UNLIKELY( packet.data.size > FD_TXN_MTU ) ) {
-    FD_LOG_WARNING(( "Block server delivered an oversize transaction, ignoring" ));
-    return true;
+    FD_LOG_WARNING(( "Block server delivered an oversize transaction; rejecting block" ));
+    return false;
   }
 
   uint _ip4; uint ip4 = fd_uint_if( packet.has_meta, fd_cstr_to_ip4_addr( packet.meta.addr, &_ip4 ) ? _ip4 : ctx->server_ip4_addr, ctx->server_ip4_addr );
@@ -1355,7 +1375,7 @@ fd_harmonic_block_client_visit_pb_block_uuid(
   ctx->harmonic_block_txn_cnt = 0UL;
   ctx->harmonic_block_slot    = 0UL;
 
-  /* First pass: Count number of transactions and extract slot from uuid */
+  /* First pass: Count valid transactions and extract slot from uuid */
   pb_istream_t peek = *istream;
   bundle_BundleUuid bundle = bundle_BundleUuid_init_default;
   bundle.bundle.packets = (pb_callback_t) {
