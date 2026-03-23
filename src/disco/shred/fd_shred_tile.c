@@ -12,6 +12,7 @@
 #include "../keyguard/fd_keyguard.h"
 #include "../keyguard/fd_keyswitch.h"
 #include "../fd_disco.h"
+#include "../../tango/tempo/fd_tempo.h"
 #include "../net/fd_net_tile.h"
 #include "../../flamenco/leaders/fd_leaders.h"
 #include "../../util/net/fd_net_headers.h"
@@ -193,7 +194,8 @@ typedef struct {
 
   ulong send_fec_set_idx[ FD_SHRED_BATCH_FEC_SETS_MAX ];
   ulong send_fec_set_cnt;
-  long  batch_start_tick;  /* tickcount when POH batching started, 0 if not batching */
+  long  batch_start_tick;   /* tickcount when POH batching started, 0 if not batching */
+  long  batch_timeout_ticks; /* fd_tickcount span for POH batch flush (from fd_tempo_tick_per_ns) */
   ulong tsorig;  /* timestamp of the last packet in compressed form */
 
   /* Includes Ethernet, IP, UDP headers */
@@ -1157,9 +1159,6 @@ after_frag( fd_shred_ctx_t *    ctx,
   ctx->batch_start_tick = 0L;
 }
 
-/* 5ms timeout in ticks (~3 GHz CPU: 5ms = 15M ticks) */
-#define SHRED_BATCH_TIMEOUT_TICKS (15UL * 1000000UL)
-
 static inline void
 after_credit( fd_shred_ctx_t *    ctx,
               fd_stem_context_t * stem,
@@ -1169,7 +1168,7 @@ after_credit( fd_shred_ctx_t *    ctx,
   (void)charge_busy;
   if( FD_LIKELY( ctx->send_fec_set_cnt==0UL || ctx->batch_start_tick==0L ) ) return;
   long elapsed = fd_tickcount() - ctx->batch_start_tick;
-  if( FD_UNLIKELY( elapsed < (long)SHRED_BATCH_TIMEOUT_TICKS ) ) return;
+  if( FD_UNLIKELY( elapsed < ctx->batch_timeout_ticks ) ) return;
   /* Timeout expired - send using POH in_idx */
   ulong in_idx = ctx->poh_in_idx;
   ulong fanout = 200UL;
@@ -1324,6 +1323,11 @@ unprivileged_init( fd_topo_t *      topo,
   ctx->round_robin_id  = tile->kind_id;
   ctx->batch_cnt       = 0UL;
   ctx->slot            = ULONG_MAX;
+
+  /* POH batch flush timeout: 5 ms expressed in fd_tickcount ticks. */
+  enum { shred_batch_timeout_ns = 5000000 }; /* 5 ms */
+  ctx->batch_timeout_ticks = (long)(fd_tempo_tick_per_ns( NULL ) * (double)shred_batch_timeout_ns + 0.5);
+  if( FD_UNLIKELY( ctx->batch_timeout_ticks<1L ) ) ctx->batch_timeout_ticks = 1L;
 
   /* If the default partial_depth is ever changed, correspondingly
      change the size of the fd_fec_intra_pool in fd_fec_repair. */
