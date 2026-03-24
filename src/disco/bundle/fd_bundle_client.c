@@ -1025,6 +1025,10 @@ fd_bundle_client_grpc_rx_end(
   fd_bundle_tile_t * ctx = app_ctx;
   if( FD_UNLIKELY( resp->h2_status!=200 ) ) {
     FD_LOG_WARNING(( "gRPC request failed (HTTP status %u)", resp->h2_status ));
+    /* Unary RPC wait bits are normally cleared in the switch below, which we skip. */
+    if( FD_UNLIKELY( request_ctx==FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo ) ) {
+      ctx->submit_leader_window_info_wait = 0;
+    }
     fd_bundle_client_request_failed( ctx, request_ctx );
     return;
   }
@@ -1092,6 +1096,9 @@ fd_bundle_client_grpc_rx_timeout(
   (void)deadline_kind;
   FD_LOG_WARNING(( "Request timed out: %s", fd_bundle_request_ctx_cstr( request_ctx ) ));
   fd_bundle_tile_t * ctx = app_ctx;
+  if( FD_UNLIKELY( request_ctx==FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo ) ) {
+    ctx->submit_leader_window_info_wait = 0;
+  }
   ctx->defer_reset = 1;
 }
 
