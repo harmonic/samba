@@ -309,7 +309,6 @@
 #include "../../disco/tiles.h"
 #include "../../disco/fd_txn_m.h"
 #include "../../disco/bundle/fd_bundle_crank.h"
-#include "../../disco/poh/fd_opticast.h"
 #include "../../disco/bundle/fd_bundle_tpu.h"
 #include "../../disco/pack/fd_pack.h"
 #include "../../disco/pack/fd_pack_cost.h"
@@ -358,27 +357,6 @@
 #define IN_KIND_PACK          (1)
 #define IN_KIND_STAKE         (2)
 #define IN_KIND_BUNDLE_GOSSIP (3)
-/* Harmonic Optimistic Broadcast (Opticast):
-   -------------------------------------------------------
-   Opticast enables broadcasting harmonic block transactions to the
-   network *before* local execution completes. In Frankendancer, the
-   PoH tile receives harmonic transactions from the resolv_pack link.
-
-   Coordination via arrival_ns:
-   - Resolv records fd_log_wallclock() in txnm->block_engine.arrival_ns
-     when receiving each block transaction.
-   - Both Pack and PoH read this exact same value from the message payload,
-     guaranteeing identical coordination-free decisions:
-     * First txn with arrival_ns < harmonic_threshold_ns: enter harmonic
-     * First txn with arrival_ns >= threshold: timeout, reject blocks
-   - Subsequent transactions are accepted until hard timeout (arrival_ns >
-     harmonic_cutoff_ns).
-
-   In Frankendancer, the actual PoH recording is managed by Agave's
-   Rust code. This tile logs opticast messages for debugging and
-   coordination purposes, with the expectation that future integration
-   will bridge these transactions to the Agave PoH. */
-#define IN_KIND_RESOLV        (4)  /* Opticast: harmonic block txns from resolv_pack */
 
 
 typedef struct {
@@ -566,10 +544,6 @@ typedef struct {
     fd_bundle_crank_gen_t gen[1];
   } bundle;
 
-  /* OPTICAST state for coordination-free harmonic block recording.
-     Uses shared implementation from fd_opticast.h */
-  fd_opticast_state_t opticast;
-
   /* The Agave client needs to be notified when the leader changes,
      so that they can resume the replay stage if it was suspended waiting. */
   void * signal_leader_change;
@@ -581,14 +555,6 @@ typedef struct {
 
   /* TPU update from bundle tile, set in during_frag for after_frag */
   fd_bundle_tpu_update_t _tpu_update[ 1 ];
-
-  /* Opticast: txnm data copied in during_frag for decision in after_frag.
-     We need the full payload (including signature) to compute the merkle hash. */
-  uchar _opticast_payload[ FD_TPU_MTU ];
-  ulong _opticast_payload_sz;
-  fd_txn_m_t _opticast_txnm[ 1 ];
-  ushort _opticast_signature_off;
-  ushort _opticast_signature_cnt;
 
   int in_kind[ 64 ];
   fd_poh_in_ctx_t in[ 64 ];
@@ -1136,11 +1102,6 @@ publish_became_leader( fd_poh_ctx_t * ctx,
   ulong sig = fd_disco_poh_sig( slot, POH_PKT_TYPE_BECAME_LEADER, 0UL );
   fd_stem_publish( ctx->stem, ctx->pack_out->idx, sig, ctx->pack_out->chunk, sizeof(fd_became_leader_t), 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
   ctx->pack_out->chunk = fd_dcache_compact_next( ctx->pack_out->chunk, sizeof(fd_became_leader_t), ctx->pack_out->chunk0, ctx->pack_out->wmark );
-
-  /* Initialize opticast state for this leader slot (shared implementation) */
-  fd_opticast_init( &ctx->opticast, leader->slot_end_ns );
-  FD_LOG_INFO(( "OPTICAST: Frankendancer PoH initialized for slot %lu (threshold=%ld, cutoff=%ld)",
-                slot, ctx->opticast.harmonic_threshold_ns, ctx->opticast.harmonic_cutoff_ns ));
 
   /* increment refcount for pack's reference to the current leader bank */
   if( FD_UNLIKELY( ctx->current_leader_bank ) ) {
@@ -1881,31 +1842,6 @@ before_frag( fd_poh_ctx_t * ctx,
              ulong          sig ) {
   (void)seq;
 
-  /* Harmonic: Delay block transactions from resolv until we receive the first
-     message from bank_pack. This ensures the IB (if any) is recorded first.
-     
-     Only delay block transactions (sig has FD_TXN_M_SIG_BLOCK_FLAG set by resolv).
-     Non-block transactions from resolv should pass through immediately.
-     
-     However, if we're past the harmonic cutoff (no block received in time), pack
-     enters SPRINT mode and we won't process harmonic blocks anyway. Don't delay. */
-  if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_RESOLV ) ) {
-    /* Discard block-fail signals from resolv.  These are zero-payload
-       fragments sent to notify pack of an upstream failure; PoH does
-       not need to act on them. */
-    if( FD_UNLIKELY( sig & FD_TXN_M_SIG_BLOCK_FAIL_FLAG ) ) return 1;
-
-    int is_block = !!(sig & FD_TXN_M_SIG_BLOCK_FLAG);
-    if( FD_UNLIKELY( is_block && !ctx->opticast.bank_received ) ) {
-      long now_ns = fd_log_wallclock();
-      int past_cutoff = now_ns > ctx->opticast.harmonic_cutoff_ns + (100L)*(1000L); /* 100 micro buffer. TODO: this is not 100% correct but practically correct. (resolv_pack could have some frags with ts_pub below cutoff) */
-      if( FD_UNLIKELY( !past_cutoff ) ) {
-        return -1; /* delay - requeue fragment until bank message received or cutoff reached */
-      }
-    }
-    return 0;
-  }
-
   if( FD_LIKELY( ctx->in_kind[ in_idx ]!=IN_KIND_BANK && ctx->in_kind[ in_idx ]!=IN_KIND_PACK ) ) return 0;
 
   if( FD_UNLIKELY( sig==ULONG_MAX ) ) {
@@ -1954,30 +1890,6 @@ during_frag( fd_poh_ctx_t * ctx,
     } else {
       ctx->skip_frag = 1;
     }
-    return;
-  }
-  
-  /* Opticast: Copy harmonic block transaction data for decision in after_frag.
-     Copy header and payload (needed for merkle hash computation). */
-  if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_RESOLV ) ) {
-    if( FD_UNLIKELY( chunk<ctx->in[ in_idx ].chunk0 || chunk>ctx->in[ in_idx ].wmark ) )
-      FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu]", chunk, sz,
-            ctx->in[ in_idx ].chunk0, ctx->in[ in_idx ].wmark ));
-    
-    fd_txn_m_t const * txnm = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
-    fd_memcpy( ctx->_opticast_txnm, txnm, sizeof(fd_txn_m_t) );
-
-    /* Copy payload for merkle hash computation and extract signature info */
-    ulong payload_sz = fd_ulong_min( txnm->payload_sz, FD_TPU_MTU );
-    fd_memcpy( ctx->_opticast_payload, fd_txn_m_payload_const( txnm ), payload_sz );
-    ctx->_opticast_payload_sz = payload_sz;
-
-    /* Extract signature offset and count from parsed transaction */
-    fd_txn_t const * txn = fd_txn_m_txn_t_const( txnm );
-    ctx->_opticast_signature_off = txn->signature_off;
-    ctx->_opticast_signature_cnt = txn->signature_cnt;
-    
-    ctx->skip_frag = 0;  /* Process in after_frag */
     return;
   }
 
@@ -2126,96 +2038,6 @@ after_frag( fd_poh_ctx_t *      ctx,
     return;
   }
 
-  /* Opticast: Handle harmonic block transactions from resolv_pack.
-     Uses shared logic from fd_opticast.h with discoh-specific extras. */
-  if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_RESOLV ) ) {
-    fd_txn_m_t const * txnm = ctx->_opticast_txnm;
-    ulong target_slot = txnm->block_engine.block_slot;
-    
-    /* Only care about harmonic block transactions */
-    if( FD_LIKELY( txnm->source_tpu != FD_TXN_M_TPU_SOURCE_HARMONIC ) ) return;
-    
-    /* Need a leader bank to record opticast */
-    if( FD_UNLIKELY( !ctx->current_leader_bank ) ) return;
-    
-    /* Opticast decision logic (shared).
-       Both Pack and PoH read the same arrival_ns from the message payload,
-       guaranteeing identical coordination-free decisions. */
-    long txn_arrival_ns = txnm->block_engine.arrival_ns;
-    if( FD_UNLIKELY( !fd_opticast_should_record( &ctx->opticast, txn_arrival_ns ) ) ) {
-      FD_LOG_INFO(( "OPTICAST: Frankendancer PoH rejecting block txn for slot=%lu "
-                    "(arrival=%ld, threshold=%ld, cutoff=%ld, cnt=%lu)",
-                    target_slot, txn_arrival_ns,
-                    ctx->opticast.harmonic_threshold_ns, ctx->opticast.harmonic_cutoff_ns,
-                    ctx->opticast.microblock_cnt ));
-      return;
-    }
-    
-    /* Shared mixin logic */
-    ulong hashcnt_delta = fd_opticast_mixin(
-      &ctx->opticast,
-      &ctx->microblocks_lower_bound,
-      ctx->max_microblocks_per_slot,
-      ctx->hash,
-      &ctx->hashcnt,
-      ctx->last_hashcnt,
-      ctx->hashcnt_per_slot,
-      &ctx->slot,
-      &ctx->last_slot,
-      &ctx->last_hashcnt,
-      target_slot,
-      ctx->next_leader_slot,
-      ctx->_opticast_payload,
-      ctx->_opticast_signature_off,
-      ctx->_opticast_signature_cnt );
-    
-    if( FD_UNLIKELY( !hashcnt_delta ) ) return;
-    
-    /* Discoh-specific: handle tick boundary transition.
-       Mirrors the logic in the normal microblock path (lines 2264-2279). */
-    if( FD_UNLIKELY( !(ctx->hashcnt % ctx->hashcnt_per_tick) ) ) {
-      fd_ext_poh_register_tick( ctx->current_leader_bank, ctx->hash );
-      if( FD_UNLIKELY( ctx->slot > ctx->next_leader_slot ) ) {
-        /* We ticked while leader and are no longer leader... transition
-           the state machine. */
-        publish_plugin_slot_end( ctx, ctx->next_leader_slot, ctx->cus_used );
-        no_longer_leader( ctx );
-        
-        if( FD_UNLIKELY( ctx->slot >= ctx->next_leader_slot ) ) {
-          /* We finished a leader slot, and are immediately leader for the
-             following slot... transition. */
-          publish_plugin_slot_start( ctx, ctx->next_leader_slot, ctx->next_leader_slot-1UL );
-        }
-      }
-    }
-    
-    /* Publish opticast microblock to shred (shared implementation) */
-    uchar * dst = (uchar *)fd_chunk_to_laddr( ctx->shred_out->mem, ctx->shred_out->chunk );
-    ulong out_sz = fd_opticast_publish(
-      dst,
-      target_slot,
-      ctx->reset_slot,
-      ctx->hashcnt,
-      ctx->hashcnt_per_tick,
-      ctx->ticks_per_slot,
-      hashcnt_delta,
-      ctx->hash,
-      ctx->parent_slot,
-      ctx->parent_block_id,
-      ctx->_opticast_payload,
-      ctx->_opticast_payload_sz );
-    
-    ulong tspub_out = (ulong)fd_frag_meta_ts_comp( fd_tickcount() );
-    ulong new_sig = fd_disco_poh_sig( target_slot, POH_PKT_TYPE_MICROBLOCK, 0UL );
-    fd_stem_publish( stem, ctx->shred_out->idx, new_sig, ctx->shred_out->chunk, out_sz, 0UL, 0UL, tspub_out );
-    ctx->shred_seq = stem->seqs[ ctx->shred_out->idx ];
-    ctx->shred_out->chunk = fd_dcache_compact_next( ctx->shred_out->chunk, out_sz, ctx->shred_out->chunk0, ctx->shred_out->wmark );
-    
-    FD_LOG_DEBUG(( "OPTICAST: Frankendancer PoH recorded block txn #%lu for slot=%lu",
-                   ctx->opticast.microblock_cnt, target_slot ));
-    return;
-  }
-
   if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_STAKE ) ) {
     fd_multi_epoch_leaders_stake_msg_fini( ctx->mleaders );
     /* It might seem like we do not need to do state transitions in and
@@ -2253,13 +2075,6 @@ after_frag( fd_poh_ctx_t *      ctx,
     return;
   }
 
-  /* Harmonic: Mark that we've received microblock 0, unblocking block txns.
-     before_frag ensures microblocks are processed in order (delays if pack_idx != expect),
-     so the first bank message we process here IS microblock 0. */
-  if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_BANK && !ctx->opticast.bank_received ) ) {
-    ctx->opticast.bank_received = 1;
-  }
-
   if( FD_UNLIKELY( !ctx->microblocks_lower_bound ) ) {
     double tick_per_ns = fd_tempo_tick_per_ns( NULL );
     fd_histf_sample( ctx->first_microblock_delay, (ulong)((double)(fd_log_wallclock()-ctx->reset_slot_start_ns)/tick_per_ns) );
@@ -2289,54 +2104,18 @@ after_frag( fd_poh_ctx_t *      ctx,
     }
   }
 
-  /* OPTICAST: Determine if this is a harmonic block transaction.
-     Harmonic microblocks were already recorded to PoH and published
-     via optimistic broadcasting when received from resolv_pack.
-     
-     Record if: IB (pack-generated, not from resolv) OR not harmonic (votes, etc.)
-     Skip if: harmonic and not IB (already recorded via opticast) */
-  int is_ib = txn_cnt && (txns[0].flags & FD_TXN_P_FLAGS_INITIALIZER_BUNDLE);
-  int is_harmonic = txn_cnt && (txns[0].source_tpu == FD_TXN_M_TPU_SOURCE_HARMONIC);
-
   /* We don't publish transactions that fail to execute.  If all the
      transactions failed to execute, the microblock would be empty,
      causing agave to think it's a tick and complain.  Instead, we just
-     skip the microblock and don't hash or update the hashcnt.
-     
-     For harmonic failures: opticast already recorded them and incremented
-     microblocks_lower_bound, so just return. This will be a skipped slot.
-     
-     For non-harmonic failures: we must still increment microblocks_lower_bound
-     to track that we "saw" this microblock slot, otherwise PoH will wait
-     forever for microblocks that will never come, preventing slot completion. */
+     skip the microblock and don't hash or update the hashcnt. */
   if( FD_UNLIKELY( !executed_txn_cnt ) ) {
-    if( FD_UNLIKELY( !(is_harmonic && !is_ib) ) ) {
-      /* Non-harmonic failure - still need to count it */
-      FD_TEST( ctx->microblocks_lower_bound<ctx->max_microblocks_per_slot );
-      ctx->microblocks_lower_bound += 1UL;
-    } else {
-      /* Block txn failure - this should be VERY rare! Log details for debugging. */
-      FD_BASE58_ENCODE_64_BYTES( txns[0].payload, failed_sig_b58 );
-      uint pack_idx = (uint)fd_disco_bank_sig_pack_idx( sig );
-      uint error_code = (txns[0].flags >> 24) & 0xFF;
-      FD_LOG_WARNING(( "OPTICAST: harmonic failure for slot=%lu pack_idx=%u sig=%s error=%u. This should be rare...",
-                       target_slot, pack_idx, failed_sig_b58, error_code ));
-    }
-    return;
-  }
-
-  if( FD_UNLIKELY( is_harmonic && !is_ib ) ) {
-    /* Harmonic block txn - already recorded via opticast, just update cus */
-    ctx->cus_used += cus_used;
-    FD_LOG_DEBUG(( "OPTICAST: skip slot=%lu (already recorded via opticast)", ctx->slot ));
+    FD_TEST( ctx->microblocks_lower_bound<ctx->max_microblocks_per_slot );
+    ctx->microblocks_lower_bound += 1UL;
     return;
   }
 
   FD_TEST( ctx->microblocks_lower_bound<ctx->max_microblocks_per_slot );
   ctx->microblocks_lower_bound += 1UL;
-
-  FD_LOG_DEBUG(( "OPTICAST: record slot=%lu ib=%d harmonic=%d txn_cnt=%lu",
-                 ctx->slot, is_ib, is_harmonic, txn_cnt ));
 
   uchar data[ 64 ];
   fd_memcpy( data, ctx->hash, 32UL );
@@ -2670,8 +2449,6 @@ unprivileged_init( fd_topo_t *      topo,
       ctx->in_kind[ i ] = IN_KIND_BANK;
     } else if( !strcmp( link->name, "bundle_gossi" ) ) {
       ctx->in_kind[ i ] = IN_KIND_BUNDLE_GOSSIP;
-    } else if( !strcmp( link->name, "resolv_pack" ) ) {
-      ctx->in_kind[ i ] = IN_KIND_RESOLV;
     } else {
       FD_LOG_ERR(( "unexpected input link name %s", link->name ));
     }
