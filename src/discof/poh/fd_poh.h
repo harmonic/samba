@@ -308,7 +308,6 @@
         will always be 420,000. */
 
 #include "../../disco/pack/fd_pack.h"
-#include "../../disco/poh/fd_opticast.h"
 #include "../../disco/stem/fd_stem.h"
 #include "../../util/fd_util_base.h"
 #include "../../ballet/sha256/fd_sha256.h"
@@ -444,9 +443,6 @@ struct __attribute__((aligned(FD_POH_ALIGN))) fd_poh_private {
   fd_poh_out_t shred_out[ 1 ];
   fd_poh_out_t replay_out[ 1 ];
 
-  /* Opticast state (shared implementation in fd_opticast.h) */
-  fd_opticast_state_t opticast;
-
   ulong magic;
 };
 
@@ -512,16 +508,6 @@ fd_poh1_mixin( fd_poh_t *          poh,
                uchar const *       hash,
                ulong               txn_cnt,
                fd_txn_p_t const *  txns );
-
-/* Opticast uses shared implementation from fd_opticast.h.
-   Tiles call fd_opticast_mixin() directly. */
-
-/* fd_poh_opticast_tick_boundary: Handle tick boundary after opticast mixin.
-   Should be called when (hashcnt % hashcnt_per_tick) == 0 after fd_opticast_mixin.
-   Handles transition to follower if we've crossed our leader slot. */
-void
-fd_poh_opticast_tick_boundary( fd_poh_t *          poh,
-                               fd_stem_context_t * stem );
 
 FD_PROTOTYPES_END
 

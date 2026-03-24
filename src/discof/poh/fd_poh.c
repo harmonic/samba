@@ -709,19 +709,3 @@ fd_poh1_mixin( fd_poh_t *          poh,
   publish_microblock( poh, stem, slot, hashcnt_delta, txn_cnt, txns );
 }
 
-/* Opticast uses shared implementation from fd_opticast.h.
-   The tile calls fd_opticast_mixin() directly and handles
-   discof-specific logic (state checks, tick transitions, publishing). */
-
-void
-fd_poh_opticast_tick_boundary( fd_poh_t *          poh,
-                               fd_stem_context_t * stem ) {
-  /* Called after fd_opticast_mixin when (hashcnt % hashcnt_per_tick) == 0.
-     Mirrors the tick boundary logic in fd_poh1_mixin (lines 700-706). */
-  if( FD_UNLIKELY( poh->slot > poh->next_leader_slot ) ) {
-    /* We ticked while leader and are no longer leader... transition
-       the state machine. */
-    transition_to_follower( poh, stem, 1 );
-    poh->state = STATE_WAITING_FOR_RESET;
-  }
-}

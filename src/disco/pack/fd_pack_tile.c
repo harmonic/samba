@@ -889,7 +889,8 @@ poll_next_bank:
      This handles all state transitions and sets block_end_reason when reaching DONE. */
   ulong pending_votes = fd_pack_avail_vote_cnt( ctx->pack );
   fd_pack_harmonic_state_crank( ctx->pack, ctx->approx_wallclock_ns, ctx->harmonic_threshold_ns,
-                                  past_end_time, pending_votes, (ulong)any_scheduled, any_ready );
+                                  ctx->harmonic_cutoff_ns, past_end_time, pending_votes,
+                                  (ulong)any_scheduled, any_ready );
   update_metric_state( ctx, now, FD_PACK_METRIC_STATE_BANKS,       any_ready     );
   update_metric_state( ctx, now, FD_PACK_METRIC_STATE_MICROBLOCKS, any_scheduled );
   now = fd_tickcount();
@@ -1294,14 +1295,10 @@ after_frag( fd_pack_ctx_t *     ctx,
         break;
       }
 
-      /* Opticast: Pass arrival_ns to fd_pack_harmonic_insert_fini.
+      /* Pass arrival_ns to fd_pack_harmonic_insert_fini.
          For the FIRST block txn in UNDECIDED state, this determines whether
          we enter HARMONIC mode (arrival < threshold) or SPRINT mode (arrival >= threshold).
-         Subsequent txns are processed normally while in HARMONIC mode.
-         Txns arriving after harmonic_cutoff_ns are rejected as timeout.
-         
-         Both Pack and PoH read the same arrival_ns from the message payload,
-         guaranteeing identical coordination-free decisions. */
+         Txns arriving after harmonic_cutoff_ns are rejected as timeout. */
       long txn_arrival_ns = ctx->block_arrival_ns;
       ulong deleted;
       long insert_duration = -fd_tickcount();

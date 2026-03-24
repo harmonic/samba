@@ -801,34 +801,17 @@ FD_FN_PURE int fd_pack_harmonic_end_flags( fd_pack_t const * pack );
    in SPRINT/FAILED/DONE or if the slot doesn't match. */
 void fd_pack_harmonic_signal_fail( fd_pack_t * pack, ulong failed_slot );
 
-/* fd_pack_harmonic_state_crank: Crank the harmonic state machine.
-   Called once after each scheduling attempt to handle all state transitions:
-   - UNDECIDED -> HARMONIC: block transactions arrived
-   - UNDECIDED -> SPRINT: threshold reached without blocks
-   - HARMONIC -> SPRINT: all expected blocks scheduled
-   - SPRINT/FAILED -> DONE: slot ended (sets end reason)
-   - HARMONIC/UNDECIDED -> DONE: stuck + timeout (sets HARMONIC_TIMEOUT)
-   
-   approx_wallclock_ns:   current wall clock time
-   harmonic_threshold_ns: deadline for receiving harmonic blocks
-   past_end_time:         1 if past slot_end_ns + buffer
-   pending_votes:         number of pending votes remaining
-   schedule_cnt:          number of transactions scheduled this iteration
-   tried_votes:           1 if this scheduling attempt included votes */
+/* fd_pack_harmonic_state_crank: Crank the multi-message harmonic state
+   machine. Handles between-message waiting, cutoff transitions, and
+   slot end detection. See fd_pack.c for full state transition docs. */
 void fd_pack_harmonic_state_crank( fd_pack_t * pack,
                                      long        approx_wallclock_ns,
                                      long        harmonic_threshold_ns,
+                                     long        harmonic_cutoff_ns,
                                      int         past_end_time,
                                      ulong       pending_votes,
                                      ulong       schedule_cnt,
                                      int         tried_votes );
-
-/* fd_pack_harmonic_vote_conflicts: Check if a vote would conflict with pending
-   harmonic transactions. Returns 1 if conflict found, 0 if safe to schedule.
-   Fast path: returns 0 immediately if no harmonic accounts are tracked. */
-int fd_pack_harmonic_vote_conflicts( fd_pack_t       * pack,
-                                     fd_txn_t  const * txn,
-                                     uchar     const * payload );
 
 void const *
 fd_pack_peek_harmonic_meta( fd_pack_t const * pack );
