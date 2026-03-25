@@ -2954,11 +2954,10 @@ fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
     return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
   }
 
-  /* If already in SPRINT or FAILED, reject block transactions entirely.
-     This check must happen BEFORE the slot-change reset below, otherwise
-     a late block arrival would reset us back to UNDECIDED and bypass rejection. */
-  if( FD_UNLIKELY( pack->harmonic_decision == HARMONIC_MODE_FAILED
-                || pack->harmonic_decision == HARMONIC_MODE_SPRINT ) ) {
+  /* Should only accept transactions when in an approriate harmonic mode (undecided or harmonic) */
+  int appropriate_harmonic_mode = (pack->harmonic_decision == HARMONIC_MODE_UNDECIDED)
+                               || (pack->harmonic_decision == HARMONIC_MODE_HARMONIC);
+  if( FD_UNLIKELY( !appropriate_harmonic_mode ) ) {
     trp_pool_ele_release( pool, ord );
     return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
   }
