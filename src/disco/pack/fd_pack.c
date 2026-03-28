@@ -2974,8 +2974,7 @@ fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
      HARMONIC or SPRINT/VOTE_ONLY mode. */
   if( FD_UNLIKELY( pack->harmonic_decision == HARMONIC_MODE_UNDECIDED ) ) {
     if( txn_arrival_ns < harmonic_threshold_ns ) {
-      /* Block txn arrived in time - enter HARMONIC mode.
-         Use 50ms buffer while waiting to receive full block. */
+      /* Block txn arrived in time - enter HARMONIC mode (streaming). */
       pack->harmonic_decision  = HARMONIC_MODE_HARMONIC;
       pack->slot_end_ns_buffer = FD_PACK_HARMONIC_BUFFER_NS;
       FD_LOG_INFO(( "HARMONIC: UNDECIDED -> HARMONIC (arrival=%ld < threshold=%ld)",
@@ -3178,7 +3177,7 @@ fd_pack_harmonic_signal_fail( fd_pack_t * pack,
    New chunks arriving from the builder are appended to the treap and
    scheduled in FIFO order alongside any remaining txns from prior chunks.
 
-   This continues until the harmonic cutoff (slot_end_ns + 50ms). After
+   This continues until the harmonic cutoff (slot_end_ns + FD_PACK_HARMONIC_BUFFER_NS). After
    cutoff, insert_fini rejects any new block transaction arrivals. Pending
    block transactions already in the treap are NOT dropped -- they drain
    naturally. Once all pending work finishes, the state machine transitions
@@ -3205,22 +3204,22 @@ fd_pack_harmonic_signal_fail( fd_pack_t * pack,
    -----------------
    UNDECIDED -> HARMONIC:         first block txn arrived before threshold
      - triggered in insert_fini using tspub for the decision
-     - slot_end_ns_buffer = 50ms (buffer while waiting for full block)
+     - slot_end_ns_buffer = FD_PACK_HARMONIC_BUFFER_NS
 
    UNDECIDED -> SPRINT/VOTE_ONLY: threshold timeout, no block txns
      - block_end_flags |= HARMONIC_TIMEOUT
-     - slot_end_ns_buffer = 50ms
+     - slot_end_ns_buffer = FD_PACK_HARMONIC_BUFFER_NS
 
    HARMONIC -> SPRINT/VOTE_ONLY:  all pending drained + cutoff reached
      - slot_end_ns_buffer = 0 (committed to packing)
 
    HARMONIC -> DONE:              slot ending, nothing in flight
      - block_end_flags |= HARMONIC_TIMEOUT
-     - slot_end_ns_buffer = 50ms
+     - slot_end_ns_buffer = FD_PACK_HARMONIC_BUFFER_NS
 
    SPRINT/FAILED/VOTE_ONLY -> DONE: slot ending, votes drained or failed
      - block_end_flags |= VOTE_DRAIN (if tried but couldn't schedule)
-     - slot_end_ns_buffer = 50ms
+     - slot_end_ns_buffer = FD_PACK_HARMONIC_BUFFER_NS
 
    Parameters
    ----------
