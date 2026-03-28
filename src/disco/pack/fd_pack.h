@@ -760,10 +760,10 @@ int fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
 #define HARMONIC_MODE_VOTE_ONLY -4
 
 /* Slot end buffer for harmonic mode.
-   50ms buffer: waiting for block (HARMONIC), no block (UNDECIDED->SPRINT), slot ending (->DONE)
-   0ms buffer: full block received and committed (HARMONIC->SPRINT), or block failed (->FAILED) */
-#define FD_PACK_HARMONIC_BUFFER_NS    ( 50000000L)  /* 50ms timeout buffer */
-#define FD_PACK_HARMONIC_DEADLINE_NS  ( 20000000L)  /* 20ms before slot end */
+   Nonzero: harmonic_cutoff_ns = slot_end_ns + this; then SPRINT/votes after cutoff + drain.
+   0ms: full block received (HARMONIC->SPRINT), or block failed (->FAILED) */
+#define FD_PACK_HARMONIC_BUFFER_NS    ( 30000000L)  /* harmonic_cutoff = slot_end_ns + this */
+#define FD_PACK_HARMONIC_DEADLINE_NS  ( 20000000L)  /* cutoff - this = harmonic_threshold_ns */
 
 /* fd_pack_harmonic_state: Returns the current harmonic state. */
 FD_FN_PURE int fd_pack_harmonic_state( fd_pack_t const * pack );

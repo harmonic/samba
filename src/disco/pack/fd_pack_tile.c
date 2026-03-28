@@ -214,7 +214,7 @@ typedef struct {
   long slot_end_ns;
 
   /* Buffer time added to slot_end_ns for harmonic blocks.
-     - 50ms: waiting for block (HARMONIC), no block (SPRINT), slot ending (DONE)
+     - FD_PACK_HARMONIC_BUFFER_NS: waiting for block (HARMONIC), no block (SPRINT), slot ending (DONE)
      - 0ms: full block received (SPRINT from HARMONIC), or block failed (FAILED) */
   long slot_end_ns_buffer;
 
@@ -327,7 +327,7 @@ typedef struct {
     ulong                 metrics[4];
   } crank[1];
 
-  /* Harmonic block mode: decision threshold (50ms before slot end). */
+  /* Harmonic block mode: harmonic_threshold_ns = harmonic_cutoff_ns - FD_PACK_HARMONIC_DEADLINE_NS. */
   long harmonic_threshold_ns;
   int  harmonic; /* If set, processes harmonic blocks */
 
@@ -689,7 +689,7 @@ poll_next_bank:
 
   /* Harmonic block mode: apply buffer managed by pack's state machine crank.
      The crank updates slot_end_ns_buffer on state transitions:
-       - 50ms: waiting for block (HARMONIC), no block (SPRINT), slot ending (DONE)
+       - FD_PACK_HARMONIC_BUFFER_NS: waiting for block (HARMONIC), no block (SPRINT), slot ending (DONE)
        - 0ms: full block received (SPRINT from HARMONIC), or block failed (FAILED) */
   if( FD_UNLIKELY( ctx->harmonic && ctx->leader_slot!=ULONG_MAX ) ) {
     ctx->slot_end_ns_buffer = fd_pack_harmonic_slot_end_buffer( ctx->pack );
@@ -828,7 +828,7 @@ poll_next_bank:
           break;
         case FD_PACK_STRATEGY_BUNDLE:
           flags = FD_PACK_SCHEDULE_VOTE | FD_PACK_SCHEDULE_BUNDLE
-                                        | fd_int_if( (ctx->slot_end_ns+ctx->slot_end_ns_buffer) - ctx->approx_wallclock_ns<50000000L, FD_PACK_SCHEDULE_TXN,  0 );
+                                        | fd_int_if( (ctx->slot_end_ns+ctx->slot_end_ns_buffer) - ctx->approx_wallclock_ns<(long)FD_PACK_HARMONIC_BUFFER_NS, FD_PACK_SCHEDULE_TXN,  0 );
           break;
       }
     }
