@@ -509,7 +509,6 @@ struct fd_pack_private {
   ulong harmonic_block_txn_expected;
   ulong harmonic_block_txn_completed;
   int   block_end_flags;
-  long  slot_end_ns_buffer;
   int   leader_next_slot;
 
   /* penalty_treaps: an fd_map_dynamic mapping hotly contended account
@@ -869,7 +868,6 @@ fd_pack_new( void                   * mem,
   pack->harmonic_inflight            = 0UL;
   pack->harmonic_block_txn_expected  = 0UL;
   pack->block_end_flags              = 0;
-  pack->slot_end_ns_buffer           = 0L;
   pack->harmonic_block_txn_completed = 0UL;
 
   return mem;
@@ -2842,7 +2840,6 @@ fd_pack_harmonic_reset( fd_pack_t * pack,
   pack->harmonic_inflight             = 0UL;
   pack->harmonic_block_txn_expected   = 0UL;
   pack->block_end_flags               = 0;
-  pack->slot_end_ns_buffer            = FD_PACK_HARMONIC_BUFFER_NS;
   pack->harmonic_block_txn_completed  = 0UL;
   pack->leader_next_slot              = leader_next_slot;
 
@@ -2913,7 +2910,6 @@ fd_pack_harmonic_fail_block( fd_pack_t         * pack,
   FD_BASE58_ENCODE_64_BYTES( ord->txn_e->txnp->payload+1, signature );
   FD_LOG_INFO(( "HARMONIC: failing block due to transaction %s; reason=%d", signature, reject_reason ));
   trp_pool_ele_release( pack->pool, ord );
-  pack->slot_end_ns_buffer           = 0L;
   pack->lim->max_vote_cost_per_block = pack->full_max_vote_cost_per_block;
   if( FD_UNLIKELY( pack->leader_next_slot ) ) {
     pack->harmonic_decision = HARMONIC_MODE_VOTE_ONLY;
@@ -2945,8 +2941,7 @@ fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
   fd_pack_ord_txn_t * ord  = (fd_pack_ord_txn_t *)txne;
   fd_pack_ord_txn_t * pool = pack->pool;
 
-  /* Timeout check: reject if transaction arrived after cutoff (slot_end + buffer).
-     This matches PoH's harmonic_cutoff_ns for coordination-free decisions. */
+  /* Timeout: reject if arrival after harmonic_cutoff_ns (slot_end - vote tail). */
   if( FD_UNLIKELY( txn_arrival_ns > harmonic_cutoff_ns ) ) {
     FD_LOG_INFO(( "HARMONIC: rejecting block txn, arrived after cutoff (arrival=%ld, cutoff=%ld)",
                   txn_arrival_ns, harmonic_cutoff_ns ));
@@ -2976,13 +2971,11 @@ fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
     if( txn_arrival_ns < harmonic_threshold_ns ) {
       /* Block txn arrived in time - enter HARMONIC mode (streaming). */
       pack->harmonic_decision  = HARMONIC_MODE_HARMONIC;
-      pack->slot_end_ns_buffer = FD_PACK_HARMONIC_BUFFER_NS;
       FD_LOG_INFO(( "HARMONIC: UNDECIDED -> HARMONIC (arrival=%ld < threshold=%ld)",
                     txn_arrival_ns, harmonic_threshold_ns ));
     } else {
       /* Block txn arrived too late - reject this and all future block txns */
       pack->block_end_flags              |= FD_PACK_END_FLAG_HARMONIC_TIMEOUT;
-      pack->slot_end_ns_buffer            = FD_PACK_HARMONIC_BUFFER_NS;
       pack->lim->max_vote_cost_per_block  = pack->full_max_vote_cost_per_block;
       if( FD_UNLIKELY( pack->leader_next_slot ) ) {
         pack->harmonic_decision = HARMONIC_MODE_VOTE_ONLY;
@@ -3125,7 +3118,6 @@ ulong fd_pack_harmonic_pending_cnt    ( fd_pack_t const * pack ) { return treap_
 ulong fd_pack_harmonic_inflight_cnt   ( fd_pack_t const * pack ) { return pack->harmonic_inflight;              }
 int   fd_pack_harmonic_pool_full      ( fd_pack_t const * pack ) { return trp_pool_free( pack->pool ) == 0UL;    }
 int   fd_pack_harmonic_end_flags      ( fd_pack_t const * pack ) { return pack->block_end_flags;                }
-long  fd_pack_harmonic_slot_end_buffer( fd_pack_t const * pack ) { return pack->slot_end_ns_buffer;             }
 
 void
 fd_pack_harmonic_signal_fail( fd_pack_t * pack,
@@ -3145,7 +3137,6 @@ fd_pack_harmonic_signal_fail( fd_pack_t * pack,
   if( was_harmonic ) fd_pack_harmonic_drop_pending_block_txns( pack );
 
   pack->block_end_flags             |= FD_PACK_END_FLAG_HARMONIC_TIMEOUT;
-  pack->slot_end_ns_buffer           = 0L;
   pack->lim->max_vote_cost_per_block = pack->full_max_vote_cost_per_block;
   if( FD_UNLIKELY( pack->leader_next_slot ) ) {
     pack->harmonic_decision = HARMONIC_MODE_VOTE_ONLY;
@@ -3165,24 +3156,30 @@ fd_pack_harmonic_signal_fail( fd_pack_t * pack,
    transactions are appended to the pending_blocks treap as they arrive
    and scheduled continuously.
 
-   Every slot starts in UNDECIDED, waiting to see if a harmonic block
-   arrives. If block transactions arrive before the threshold timeout, we
-   transition to HARMONIC mode and schedule them with priority, extending
-   the slot buffer to give extra time for execution. If the threshold
-   passes without receiving any block transactions, we skip harmonic and
-   go to SPRINT mode (or VOTE_ONLY if leader_next_slot).
+   Slot timing:
+   - past_end_time: wallclock >= slot_end_ns.
+   - harmonic_cutoff_ns = slot_end_ns - FD_PACK_HARMONIC_VOTE_TAIL_NS (last
+     VOTE_TAIL_NS of the slot are vote-only/sprint; no new block txn arrivals).
+   - harmonic_threshold_ns = slot_start_ns + half the slot length: UNDECIDED
+     schedules nothing until then; if no qualifying first block txn, crank
+     moves to SPRINT/VOTE_ONLY (sad path).  Happy path: first block txn tspub
+     before threshold enters HARMONIC until cutoff.
+
+   Every slot starts in UNDECIDED.  If the first block txn has tspub before
+   threshold, we enter HARMONIC.  If threshold passes with no block txn, we
+   go to SPRINT/VOTE_ONLY.  FAILED and signal_fail jump to SPRINT/VOTE_ONLY
+   and sprint to slot end like the sad path after the failure.
 
    Once in HARMONIC mode, block transactions are scheduled one at a time
    from the pending_blocks treap as fast as bank tiles become available.
    New chunks arriving from the builder are appended to the treap and
    scheduled in FIFO order alongside any remaining txns from prior chunks.
 
-   This continues until the harmonic cutoff (slot_end_ns + FD_PACK_HARMONIC_BUFFER_NS). After
-   cutoff, insert_fini rejects any new block transaction arrivals. Pending
-   block transactions already in the treap are NOT dropped -- they drain
-   naturally. Once all pending work finishes, the state machine transitions
-   to VOTE_ONLY (if leader_next_slot, to avoid interfering with consensus)
-   or SPRINT (to fill remaining time with votes and normal transactions).
+   Streaming continues until wallclock >= harmonic_cutoff_ns with no pending
+   block txns (see HARMONIC case). After cutoff, insert_fini rejects new
+   block arrivals. Pending block transactions already in the treap are NOT
+   dropped; they drain naturally. The crank then moves to VOTE_ONLY (if
+   leader_next_slot) or SPRINT.
 
    SPRINT mode (and FAILED, which behaves identically) continues until the
    slot ends. We try to drain all pending votes before ending. If we're
@@ -3203,31 +3200,26 @@ fd_pack_harmonic_signal_fail( fd_pack_t * pack,
    State Transitions
    -----------------
    UNDECIDED -> HARMONIC:         first block txn arrived before threshold
-     - triggered in insert_fini using tspub for the decision
-     - slot_end_ns_buffer = FD_PACK_HARMONIC_BUFFER_NS
+     - triggered in insert_fini (txn_arrival_ns = pack wallclock at insert)
 
    UNDECIDED -> SPRINT/VOTE_ONLY: threshold timeout, no block txns
      - block_end_flags |= HARMONIC_TIMEOUT
-     - slot_end_ns_buffer = FD_PACK_HARMONIC_BUFFER_NS
 
    HARMONIC -> SPRINT/VOTE_ONLY:  all pending drained + cutoff reached
-     - slot_end_ns_buffer = 0 (committed to packing)
 
    HARMONIC -> DONE:              slot ending, nothing in flight
      - block_end_flags |= HARMONIC_TIMEOUT
-     - slot_end_ns_buffer = FD_PACK_HARMONIC_BUFFER_NS
 
    SPRINT/FAILED/VOTE_ONLY -> DONE: slot ending, votes drained or failed
      - block_end_flags |= VOTE_DRAIN (if tried but couldn't schedule)
-     - slot_end_ns_buffer = FD_PACK_HARMONIC_BUFFER_NS
 
    Parameters
    ----------
    pack                  - Pack state to update
    approx_wallclock_ns   - Current approximate wallclock time in nanoseconds
-   harmonic_threshold_ns - Time at which UNDECIDED transitions to SPRINT
-   harmonic_cutoff_ns    - Time after which new block txns are rejected
-   past_end_time         - 1 if current time >= slot_end_ns + slot_end_ns_buffer
+   harmonic_threshold_ns - slot_start + half slot (UNDECIDED timeout / first-txn gate)
+   harmonic_cutoff_ns    - slot_end - VOTE_TAIL (last block txn arrival)
+   past_end_time         - 1 if current time >= slot_end_ns
    pending_votes         - Number of votes waiting to be scheduled
    schedule_cnt          - Number of transactions scheduled this iteration
    tried_votes           - 1 if this scheduling attempt included votes */
@@ -3243,13 +3235,9 @@ fd_pack_harmonic_state_crank( fd_pack_t * pack,
 
   switch( pack->harmonic_decision ) {
 
-    /* allowed transitions: 
+    /* allowed transitions:
       UNDECIDED -> HARMONIC: handled in fd_pack_harmonic_insert_fini on first block txn
-      UNDECIDED -> SPRINT:   block transactions did not arrive within threshold
-      
-      Note: The UNDECIDED -> HARMONIC transition is now triggered by the first block
-      txn in fd_pack_harmonic_insert_fini, using tspub for the decision. This ensures
-      both Pack and PoH make the same decision based on the same timestamp. */
+      UNDECIDED -> SPRINT:   block transactions did not arrive within threshold */
     case HARMONIC_MODE_UNDECIDED: {
       /* block_txn_idx starts at 1 (reserving 0 for crank), so >1 means we received block txns.
          If we're here with received txns, it means insert_fini already transitioned us,
@@ -3263,7 +3251,6 @@ fd_pack_harmonic_state_crank( fd_pack_t * pack,
       /* Timeout check: if threshold reached without any block txns, transition out. */
       if( approx_wallclock_ns >= harmonic_threshold_ns ) {
         pack->block_end_flags              |= FD_PACK_END_FLAG_HARMONIC_TIMEOUT;
-        pack->slot_end_ns_buffer            = FD_PACK_HARMONIC_BUFFER_NS;
         pack->lim->max_vote_cost_per_block  = pack->full_max_vote_cost_per_block;
         if( FD_UNLIKELY( pack->leader_next_slot ) ) {
           pack->harmonic_decision = HARMONIC_MODE_VOTE_ONLY;
@@ -3286,7 +3273,6 @@ fd_pack_harmonic_state_crank( fd_pack_t * pack,
          out. Harmonic txns already in-flight hold their bank locks,
          so non-harmonic txns scheduled after can't conflict. */
       if( pending_cnt == 0UL && approx_wallclock_ns >= harmonic_cutoff_ns ) {
-        pack->slot_end_ns_buffer           = 0L;
         pack->lim->max_vote_cost_per_block = pack->full_max_vote_cost_per_block;
         if( pack->leader_next_slot ) {
           pack->harmonic_decision = HARMONIC_MODE_VOTE_ONLY;
@@ -3303,7 +3289,6 @@ fd_pack_harmonic_state_crank( fd_pack_t * pack,
       if( FD_UNLIKELY( pending_cnt == 0UL && pack->harmonic_inflight == 0UL && past_end_time ) ) {
         pack->block_end_flags             |= FD_PACK_END_FLAG_HARMONIC_TIMEOUT;
         pack->harmonic_decision            = HARMONIC_MODE_DONE;
-        pack->slot_end_ns_buffer           = FD_PACK_HARMONIC_BUFFER_NS;
         pack->lim->max_vote_cost_per_block = pack->full_max_vote_cost_per_block;
         FD_LOG_INFO(( "HARMONIC: HARMONIC -> DONE (flags=%d)", pack->block_end_flags ));
       }
@@ -3320,12 +3305,10 @@ fd_pack_harmonic_state_crank( fd_pack_t * pack,
                             pack->harmonic_decision==HARMONIC_MODE_SPRINT    ? "SPRINT"    : "FAILED";
         if( pending_votes == 0UL ) {
           pack->harmonic_decision  = HARMONIC_MODE_DONE;
-          pack->slot_end_ns_buffer = FD_PACK_HARMONIC_BUFFER_NS;
           FD_LOG_INFO(( "HARMONIC: %s -> DONE (flags=%d)", from, pack->block_end_flags ));
         } else if( tried_votes && schedule_cnt == 0UL ) {
           pack->block_end_flags   |= FD_PACK_END_FLAG_VOTE_DRAIN;
           pack->harmonic_decision  = HARMONIC_MODE_DONE;
-          pack->slot_end_ns_buffer = FD_PACK_HARMONIC_BUFFER_NS;
           FD_LOG_INFO(( "HARMONIC: %s -> DONE (flags=%d)", from, pack->block_end_flags ));
         }
       }

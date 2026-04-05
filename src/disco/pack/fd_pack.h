@@ -720,15 +720,16 @@ void fd_pack_harmonic_reset( fd_pack_t * pack, ulong leader_slot, int leader_nex
 
    If block_slot changes, resets harmonic state for the new block.
 
-   txn_arrival_ns is the tspub timestamp (nanoseconds) of when this
-   transaction was published. harmonic_threshold_ns is the deadline
-   for entering harmonic mode. For the FIRST block txn while in
-   UNDECIDED state:
+   txn_arrival_ns is the pack tile's estimated wallclock (nanoseconds) when
+   insert_fini runs (approx_wallclock_ns plus tick-based adjustment), same
+   basis as scheduler_arrival_time_nanos on the txn.  harmonic_threshold_ns
+   is slot_start + (slot_end-slot_start)/2.  For the FIRST block txn while
+   in UNDECIDED:
      - If txn_arrival_ns < harmonic_threshold_ns: enter HARMONIC mode
      - If txn_arrival_ns >= harmonic_threshold_ns: enter SPRINT, reject
    
-   harmonic_cutoff_ns is the hard timeout (slot_end_ns + buffer).
-   Transactions with txn_arrival_ns > harmonic_cutoff_ns are rejected.
+   harmonic_cutoff_ns is slot_end_ns - FD_PACK_HARMONIC_VOTE_TAIL_NS.
+   txn_arrival_ns > harmonic_cutoff_ns is rejected.
 
    On any validation failure, the entire block is failed: all pending
    block transactions are cleared, harmonic mode transitions to FAILED,
@@ -745,8 +746,9 @@ int fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
                                   ulong        * opt_delete_cnt );
 
 /* Harmonic state machine states.
-   UNDECIDED:  Waiting for harmonic block transactions to arrive.
-   HARMONIC:   Received block transactions, scheduling them.
+   UNDECIDED:  No scheduling; wait for first block txn (tspub < half slot) or
+               half-slot timeout -> SPRINT/VOTE_ONLY.
+   HARMONIC:   Scheduling block txns until cutoff (slot_end - VOTE_TAIL).
    SPRINT:     Harmonic block complete (or skipped), scheduling votes/normal txns.
    FAILED:     Block validation failed, behaves like SPRINT.
    VOTE_ONLY:  Harmonic block complete but we are leader next slot.
@@ -759,18 +761,13 @@ int fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
 #define HARMONIC_MODE_DONE      -3
 #define HARMONIC_MODE_VOTE_ONLY -4
 
-/* Slot end buffer for harmonic mode.
-   Nonzero: harmonic_cutoff_ns = slot_end_ns + this; then SPRINT/votes after cutoff + drain.
-   0ms: full block received (HARMONIC->SPRINT), or block failed (->FAILED) */
-#define FD_PACK_HARMONIC_BUFFER_NS    ( 30000000L)  /* harmonic_cutoff = slot_end_ns + this */
-#define FD_PACK_HARMONIC_DEADLINE_NS  ( 20000000L)  /* cutoff - this = harmonic_threshold_ns */
+/* FD_PACK_HARMONIC_VOTE_TAIL_NS: last portion of the leader slot reserved for
+   vote-only / sprint after harmonic block ingestion.  Ingestion cutoff is
+   slot_end_ns - VOTE_TAIL_NS (see pack tile). */
+#define FD_PACK_HARMONIC_VOTE_TAIL_NS ( 20000000L )
 
 /* fd_pack_harmonic_state: Returns the current harmonic state. */
 FD_FN_PURE int fd_pack_harmonic_state( fd_pack_t const * pack );
-
-/* fd_pack_harmonic_slot_end_buffer: Returns the recommended slot_end_ns_buffer.
-   Updated by the state machine crank based on current state. */
-FD_FN_PURE long fd_pack_harmonic_slot_end_buffer( fd_pack_t const * pack );
 
 /* fd_pack_harmonic_done: Returns 1 if in DONE state (slot should end), 0 otherwise. */
 FD_FN_PURE int fd_pack_harmonic_done( fd_pack_t const * pack );

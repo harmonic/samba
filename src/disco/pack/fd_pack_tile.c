@@ -139,7 +139,6 @@ typedef struct {
   /* Harmonic transaction info (valid when txn_type==TXN_TYPE_HARMONIC) */
   ulong        block_slot;
   ulong        block_txn_expected;
-  long         block_arrival_ns;  /* From txnm->block_engine.arrival_ns */
 
   uchar executed_txn_sig[ 64UL ];
 
@@ -209,18 +208,12 @@ typedef struct {
 
   fd_rng_t * rng;
 
-  /* The end wallclock time of the leader slot we are currently packing
-     for, if we are currently packing for a slot.*/
+  /* The start and end wallclock of the leader slot (fd_log_wallclock). */
+  long slot_start_ns;
   long slot_end_ns;
 
-  /* Buffer time added to slot_end_ns for harmonic blocks.
-     - FD_PACK_HARMONIC_BUFFER_NS: waiting for block (HARMONIC), no block (SPRINT), slot ending (DONE)
-     - 0ms: full block received (SPRINT from HARMONIC), or block failed (FAILED) */
-  long slot_end_ns_buffer;
-
-  /* Hard cutoff for harmonic txns (slot_end_ns + buffer).
-     Txns with tspub > harmonic_cutoff_ns are rejected.
-     This matches PoH's harmonic_cutoff_ns for coordination-free decisions. */
+  /* harmonic_cutoff_ns = slot_end_ns - FD_PACK_HARMONIC_VOTE_TAIL_NS: last
+     time a harmonic block txn may arrive; tail is vote/sprint. */
   long harmonic_cutoff_ns;
 
   /* pacer and ticks_per_ns are used for pacing CUs through the slot,
@@ -327,7 +320,7 @@ typedef struct {
     ulong                 metrics[4];
   } crank[1];
 
-  /* Harmonic block mode: harmonic_threshold_ns = harmonic_cutoff_ns - FD_PACK_HARMONIC_DEADLINE_NS. */
+  /* Harmonic: harmonic_threshold_ns = slot_start + (slot_end-slot_start)/2. */
   long harmonic_threshold_ns;
   int  harmonic; /* If set, processes harmonic blocks */
 
@@ -608,7 +601,7 @@ poll_next_bank:
      happen in the first after_credit after a housekeeping.
      However, if we still have pending votes, continue scheduling votes
      only before ending the slot (unless vote scheduling failed). */
-  int past_end_time = ctx->approx_wallclock_ns>=(ctx->slot_end_ns+ctx->slot_end_ns_buffer);
+  int past_end_time = ctx->approx_wallclock_ns>=ctx->slot_end_ns;
   if( FD_UNLIKELY( past_end_time && ctx->leader_slot!=ULONG_MAX ) ) {
     /* Check if state machine reached DONE (set by fd_pack_harmonic_state_crank after scheduling) */
     if( FD_LIKELY( fd_pack_harmonic_done( ctx->pack ) ) ) {
@@ -686,14 +679,6 @@ poll_next_bank:
   int any_scheduled = 0;
 
   *charge_busy = 1;
-
-  /* Harmonic block mode: apply buffer managed by pack's state machine crank.
-     The crank updates slot_end_ns_buffer on state transitions:
-       - FD_PACK_HARMONIC_BUFFER_NS: waiting for block (HARMONIC), no block (SPRINT), slot ending (DONE)
-       - 0ms: full block received (SPRINT from HARMONIC), or block failed (FAILED) */
-  if( FD_UNLIKELY( ctx->harmonic && ctx->leader_slot!=ULONG_MAX ) ) {
-    ctx->slot_end_ns_buffer = fd_pack_harmonic_slot_end_buffer( ctx->pack );
-  }
 
   if( FD_LIKELY( ctx->crank->enabled ) ) {
     int harmonic_crank = 0;
@@ -827,8 +812,9 @@ poll_next_bank:
                                         | fd_int_if( i<pacing_bank_cnt, FD_PACK_SCHEDULE_TXN,    0 );
           break;
         case FD_PACK_STRATEGY_BUNDLE:
+          /* Non-vote txns only in the last VOTE_TAIL window before slot_end_ns. */
           flags = FD_PACK_SCHEDULE_VOTE | FD_PACK_SCHEDULE_BUNDLE
-                                        | fd_int_if( (ctx->slot_end_ns+ctx->slot_end_ns_buffer) - ctx->approx_wallclock_ns<(long)FD_PACK_HARMONIC_BUFFER_NS, FD_PACK_SCHEDULE_TXN,  0 );
+                                        | fd_int_if( ctx->slot_end_ns - ctx->approx_wallclock_ns<(long)FD_PACK_HARMONIC_VOTE_TAIL_NS, FD_PACK_SCHEDULE_TXN,  0 );
           break;
       }
     }
@@ -856,10 +842,10 @@ poll_next_bank:
       int is_vote = !!(microblock_dst->flags & FD_TXN_P_FLAGS_IS_SIMPLE_VOTE);
       int is_ib = !!(microblock_dst->flags & FD_TXN_P_FLAGS_INITIALIZER_BUNDLE);
       int is_harmonic_mode = ctx->harmonic && fd_pack_harmonic_state( ctx->pack )==HARMONIC_MODE_HARMONIC;
-      long remaining_ns = (ctx->slot_end_ns + ctx->slot_end_ns_buffer) - ctx->approx_wallclock_ns;
+      long remaining_ns = ctx->slot_end_ns - ctx->approx_wallclock_ns;
       char const * type_str = is_harmonic_mode ? (is_ib ? "harmonic-crank" : "harmonic") : (trailer->is_bundle ? "bundle" : (is_vote ? "vote" : "txn"));
-      FD_LOG_INFO(( "HARMONIC: scheduled %s cnt=%lu bank=%d remaining_ms=%ld slot=%lu buffer_ms=%ld",
-                    type_str, schedule_cnt, i, remaining_ns/1000000L, ctx->leader_slot, ctx->slot_end_ns_buffer/1000000L ));
+      FD_LOG_INFO(( "HARMONIC: scheduled %s cnt=%lu bank=%d remaining_ms=%ld slot=%lu",
+                    type_str, schedule_cnt, i, remaining_ns/1000000L, ctx->leader_slot ));
 
       ulong sig = fd_disco_poh_sig( ctx->leader_slot, POH_PKT_TYPE_MICROBLOCK, (ulong)i );
       fd_stem_publish( stem, 0UL, sig, chunk, msg_sz+sizeof(fd_microblock_bank_trailer_t), 0UL, tsorig, tspub );
@@ -1057,7 +1043,6 @@ during_frag( fd_pack_ctx_t * ctx,
       ctx->txn_type = TXN_TYPE_HARMONIC;
       ctx->block_slot         = txnm->block_engine.block_slot;
       ctx->block_txn_expected = txnm->block_engine.bundle_txn_cnt;
-      ctx->block_arrival_ns   = txnm->block_engine.arrival_ns;
       ctx->cur_spot = fd_pack_insert_txn_init( ctx->pack );
 
       /* Extract block builder commission info */
@@ -1247,9 +1232,14 @@ after_frag( fd_pack_ctx_t *     ctx,
 
     update_metric_state( ctx, fd_tickcount(), FD_PACK_METRIC_STATE_LEADER, 1 );
 
-    ctx->slot_end_ns = ctx->_became_leader->slot_end_ns;
-    ctx->slot_end_ns_buffer = FD_PACK_HARMONIC_BUFFER_NS * ctx->harmonic;
-    ctx->harmonic_cutoff_ns = ctx->slot_end_ns + FD_PACK_HARMONIC_BUFFER_NS;
+    ctx->slot_start_ns = ctx->_became_leader->slot_start_ns;
+    ctx->slot_end_ns   = ctx->_became_leader->slot_end_ns;
+    {
+      long slot_dur = ctx->slot_end_ns - ctx->slot_start_ns;
+      if( FD_UNLIKELY( slot_dur < 0L ) ) slot_dur = 0L;
+      ctx->harmonic_threshold_ns = ctx->slot_start_ns + slot_dur/2L;
+      ctx->harmonic_cutoff_ns    = ctx->slot_end_ns - (long)FD_PACK_HARMONIC_VOTE_TAIL_NS;
+    }
 
     /* Reset harmonic state for new slot.
        Note: pack's acct_in_use is cleared by fd_pack_end_block, so we don't
@@ -1257,9 +1247,9 @@ after_frag( fd_pack_ctx_t *     ctx,
        Set harmonic_block_slot to leader_slot so block txns for other slots are dropped. */
     if( FD_UNLIKELY( ctx->harmonic ) ) {
       fd_pack_harmonic_reset( ctx->pack, leader_slot, ctx->_became_leader->leader_next_slot );
-      ctx->harmonic_threshold_ns = ctx->harmonic_cutoff_ns - FD_PACK_HARMONIC_DEADLINE_NS;
-      FD_LOG_INFO(( "HARMONIC: new leader slot=%lu, threshold_ns=%ld, cutoff_ns=%ld, leader_next_slot=%d", 
-                    ctx->leader_slot, ctx->harmonic_threshold_ns, ctx->harmonic_cutoff_ns,
+      FD_LOG_INFO(( "HARMONIC: new leader slot=%lu, start=%ld end=%ld threshold_ns=%ld cutoff_ns=%ld leader_next_slot=%d",
+                    ctx->leader_slot, ctx->slot_start_ns, ctx->slot_end_ns,
+                    ctx->harmonic_threshold_ns, ctx->harmonic_cutoff_ns,
                     ctx->_became_leader->leader_next_slot ));
     }
 
@@ -1295,23 +1285,20 @@ after_frag( fd_pack_ctx_t *     ctx,
         break;
       }
 
-      /* Pass arrival_ns to fd_pack_harmonic_insert_fini.
-         For the FIRST block txn in UNDECIDED state, this determines whether
-         we enter HARMONIC mode (arrival < threshold) or SPRINT mode (arrival >= threshold).
-         Txns arriving after harmonic_cutoff_ns are rejected as timeout. */
-      long txn_arrival_ns = ctx->block_arrival_ns;
+      /* Wallclock at insert (same basis as scheduler_arrival_time_nanos on the txn). */
+      long insert_wall_ns = ctx->approx_wallclock_ns + (long)((double)(fd_tickcount() - ctx->approx_tickcount) / ctx->ticks_per_ns);
       ulong deleted;
       long insert_duration = -fd_tickcount();
       int result = fd_pack_harmonic_insert_fini( ctx->pack, ctx->cur_spot, ctx->block_slot, ctx->block_txn_expected, ctx->blk_engine_cfg, 0,
-                                                  txn_arrival_ns, ctx->harmonic_threshold_ns, ctx->harmonic_cutoff_ns, &deleted );
+                                                  insert_wall_ns, ctx->harmonic_threshold_ns, ctx->harmonic_cutoff_ns, &deleted );
       insert_duration      += fd_tickcount();
       fd_histf_sample( ctx->insert_duration, (ulong)insert_duration );
       FD_MCNT_INC( PACK, TRANSACTION_DELETED, deleted );
       if( FD_UNLIKELY( result < 0 ) ) {
         FD_LOG_INFO(( "HARMONIC: failed to insert block txn for slot=%lu (result=%d)", ctx->block_slot, result ));
       } else {
-        FD_LOG_INFO(( "HARMONIC: inserted block txn for slot=%lu, pending_cnt=%lu (arrival_ns=%ld)", 
-                      ctx->block_slot, fd_pack_harmonic_pending_cnt( ctx->pack ), txn_arrival_ns ));
+        FD_LOG_INFO(( "HARMONIC: inserted block txn for slot=%lu, pending_cnt=%lu",
+                      ctx->block_slot, fd_pack_harmonic_pending_cnt( ctx->pack ) ));
       }
       ctx->cur_spot = NULL;
       break;
