@@ -71,12 +71,6 @@ struct fd_txn_m {
       ulong block_slot;  /* For blocks: intended slot from server */
     };
 
-    /* Arrival time in nanoseconds (fd_log_wallclock). For block transactions,
-       this is set by resolv when the transaction is received. Both pack and
-       POH read this same value to make coordination-free threshold decisions.
-       No compression/decompression needed - guaranteed identical. */
-    long arrival_ns;
-
     ushort bundle_txn_cnt; /* Harmonic: shrunk from ulong - never exceeds 65535 */
     uchar commission;
     uchar commission_pubkey[ 32 ];

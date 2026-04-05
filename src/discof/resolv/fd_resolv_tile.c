@@ -608,13 +608,6 @@ after_frag( fd_resolv_ctx_t *   ctx,
     }
   }
 
-  /* Harmonic: For block transactions, record arrival time in the message payload.
-     Both pack and POH read this exact value to make inclusion decisions without
-     additional coordination */
-  if( FD_UNLIKELY( is_block ) ) {
-    txnm->block_engine.arrival_ns = fd_log_wallclock();
-  }
-
   ulong realized_sz = fd_txn_m_realized_footprint( txnm, 1, 1 );
   ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
   /* Set the block flag in sig if this is a block transaction, so downstream
