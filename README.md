@@ -1,4 +1,8 @@
-# [Firedancer](https://jumpcrypto.com/firedancer/) 🔥💃
+# Samba
+
+Samba is the Harmonic fork of the Firedancer validator client for Solana.
+
+## [Firedancer](https://jumpcrypto.com/firedancer/) 🔥💃
 
 Firedancer is a new validator client for Solana.
 
