@@ -3185,7 +3185,9 @@ fd_pack_harmonic_signal_fail( fd_pack_t * pack,
    slot ends. We try to drain all pending votes before ending. If we're
    past end time and either all votes are drained OR we tried to schedule
    votes but couldn't, we transition to DONE. The DONE state signals the
-   tile to end the block.
+   tile to end the block.  While in SPRINT/FAILED/VOTE_ONLY, the crank
+   restores full max_vote_cost_per_block once pending_blocks is empty and
+   harmonic_inflight is zero (no harmonic work left).
 
    An upstream failure signal (signal_fail) can arrive at any time. From
    UNDECIDED or HARMONIC, it transitions to SPRINT/VOTE_ONLY, killing all
@@ -3295,6 +3297,10 @@ fd_pack_harmonic_state_crank( fd_pack_t * pack,
     case HARMONIC_MODE_SPRINT:
     case HARMONIC_MODE_FAILED:
     case HARMONIC_MODE_VOTE_ONLY: {
+      /* Harmonic block work finished (nothing queued, nothing in banks) — restore full vote CU cap. */
+      if( treap_ele_cnt( pack->pending_blocks )==0UL && pack->harmonic_inflight==0UL ) {
+        pack->lim->max_vote_cost_per_block = pack->full_max_vote_cost_per_block;
+      }
       if( FD_UNLIKELY( past_end_time ) ) {
         char const * from = pack->harmonic_decision==HARMONIC_MODE_VOTE_ONLY ? "VOTE_ONLY" :
                             pack->harmonic_decision==HARMONIC_MODE_SPRINT    ? "SPRINT"    : "FAILED";
