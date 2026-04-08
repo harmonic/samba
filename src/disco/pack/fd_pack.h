@@ -746,8 +746,9 @@ int fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
                                   ulong        * opt_delete_cnt );
 
 /* Harmonic state machine states.
-   UNDECIDED:  No scheduling; wait for first block txn (tspub < half slot) or
-               half-slot timeout -> SPRINT/VOTE_ONLY.
+   UNDECIDED:  No scheduling; wait for first block txn (tspub < half slot),
+               half-slot timeout -> SPRINT (crank), or late first block txn
+               in insert_fini -> SPRINT or VOTE_ONLY per leader_next_slot.
    HARMONIC:   Scheduling block txns until cutoff (slot_end - VOTE_TAIL).
    SPRINT:     Harmonic block complete (or skipped), scheduling votes/normal txns.
    FAILED:     Block validation failed, behaves like SPRINT.
