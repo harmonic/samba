@@ -580,15 +580,14 @@ poll_next_bank:
       ctx->bank_idle_bitset |= 1UL<<poll_cursor;
       busy_bitset &= ~(1UL<<poll_cursor);
 
-      /* Handle harmonic transaction completion - release account locks via pack */
+      /* Release account locks; harmonic_inflight is updated only when this bank's
+         microblock was scheduled from pending_blocks (see fd_pack_microblock_complete). */
+      long complete_duration = -fd_tickcount();
+      int completed = fd_pack_microblock_complete( ctx->pack, (ulong)poll_cursor );
+      complete_duration      += fd_tickcount();
+      if( FD_LIKELY( completed ) ) fd_histf_sample( ctx->complete_duration, (ulong)complete_duration );
       if( FD_UNLIKELY( ctx->harmonic && fd_pack_harmonic_inflight_cnt( ctx->pack ) > 0UL ) ) {
-        fd_pack_complete_harmonic_txn( ctx->pack, (ulong)poll_cursor );
         FD_LOG_NOTICE(( "HARMONIC: bank %d completed, inflight=%lu", poll_cursor, fd_pack_harmonic_inflight_cnt( ctx->pack ) ));
-      } else {
-        long complete_duration = -fd_tickcount();
-        int completed = fd_pack_microblock_complete( ctx->pack, (ulong)poll_cursor );
-        complete_duration      += fd_tickcount();
-        if( FD_LIKELY( completed ) ) fd_histf_sample( ctx->complete_duration, (ulong)complete_duration );
       }
     }
 

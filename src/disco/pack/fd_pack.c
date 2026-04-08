@@ -499,6 +499,8 @@ struct fd_pack_private {
      harmonic_decision: 0=undecided, 1=harmonic mode, -1=sprint mode, -2=failed.
      harmonic_block_slot: current block's target slot.
      harmonic_inflight: number of block txns currently dispatched to banks.
+     harmonic_bank_outstanding: bit i set iff bank i's outstanding microblock was
+       scheduled from pending_blocks (must pair with harmonic_inflight decrements).
      harmonic_block_txn_expected: total transactions expected in this block.
      harmonic_block_txn_completed: transactions that have completed execution.
      block_end_flags: bitset of failure flags (see FD_PACK_END_FLAG_* constants). */
@@ -506,6 +508,7 @@ struct fd_pack_private {
   int   harmonic_decision;
   ulong harmonic_block_slot;
   ulong harmonic_inflight;
+  ulong harmonic_bank_outstanding; /* bank bit -> that bank completed a harmonic-scheduled microblock */
   ulong harmonic_block_txn_expected;
   ulong harmonic_block_txn_completed;
   int   block_end_flags;
@@ -866,6 +869,7 @@ fd_pack_new( void                   * mem,
   pack->harmonic_decision            = 0;
   pack->harmonic_block_slot          = 0UL;
   pack->harmonic_inflight            = 0UL;
+  pack->harmonic_bank_outstanding    = 0UL;
   pack->harmonic_block_txn_expected  = 0UL;
   pack->block_end_flags              = 0;
   pack->harmonic_block_txn_completed = 0UL;
@@ -2191,6 +2195,7 @@ fd_pack_schedule_impl( fd_pack_t               * pack,
       pack->pending_txn_cnt--;
     } else {
       pack->harmonic_inflight++;
+      pack->harmonic_bank_outstanding |= (1UL<<bank_tile);
     }
 
     cur->root = FD_ORD_TXN_ROOT_FREE;
@@ -2340,6 +2345,17 @@ fd_pack_microblock_complete( fd_pack_t * pack,
   /* outstanding_microblock_mask never has the writable bit set, so we
      don't care about clearing it here either. */
   pack->outstanding_microblock_mask &= clear_mask;
+
+  /* Decrement harmonic_inflight only when this bank's microblock was a harmonic
+     block txn.  Do not use global harmonic_inflight>0 on the tile: sprint work
+     on one bank must not consume another bank's harmonic completion credit. */
+  ulong const harmonic_bmsk = 1UL<<bank_tile;
+  if( FD_UNLIKELY( pack->harmonic_bank_outstanding & harmonic_bmsk ) ) {
+    pack->harmonic_bank_outstanding &= ~harmonic_bmsk;
+    FD_TEST( pack->harmonic_inflight > 0UL );
+    pack->harmonic_inflight--;
+    pack->harmonic_block_txn_completed++;
+  }
   return 1;
 }
 
@@ -2769,17 +2785,6 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
 }
 
 
-/* Release account locks for a completed harmonic transaction.
-   Uses the standard fd_pack_microblock_complete. */
-void
-fd_pack_complete_harmonic_txn( fd_pack_t * pack,
-                               ulong       bank_tile ) {
-  fd_pack_microblock_complete( pack, bank_tile );
-  if( pack->harmonic_inflight > 0UL ) pack->harmonic_inflight--;
-  pack->harmonic_block_txn_completed++;
-}
-
-
 /* Reset harmonic state for a new leader slot - delete all pending block transactions.
    leader_slot is the slot we're now leading for. Block txns for other slots will be dropped. */
 void
@@ -2838,6 +2843,7 @@ fd_pack_harmonic_reset( fd_pack_t * pack,
   pack->harmonic_decision             = 0;
   pack->harmonic_block_slot           = leader_slot; /* Set to leader slot - mismatched block txns will be dropped */
   pack->harmonic_inflight             = 0UL;
+  pack->harmonic_bank_outstanding     = 0UL;
   pack->harmonic_block_txn_expected   = 0UL;
   pack->block_end_flags               = 0;
   pack->harmonic_block_txn_completed  = 0UL;
@@ -3440,6 +3446,7 @@ fd_pack_end_block( fd_pack_t * pack ) {
   pack->cumulative_vote_cost        = 0UL;
   pack->cumulative_rebated_cus      = 0UL;
   pack->outstanding_microblock_mask = 0UL;
+  pack->harmonic_bank_outstanding   = 0UL;
   pack->block_end_flags            = 0;
 
   pack->initializer_bundle_state = FD_PACK_IB_STATE_NOT_INITIALIZED;

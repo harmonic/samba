@@ -690,15 +690,8 @@ fd_pack_schedule_next_microblock( fd_pack_t  * pack,
 
    Harmonic scheduling uses fd_pack_schedule_next_microblock with harmonic=1,
    which internally uses transitive dependency tracking to maintain execution
-   order from the received block.
-
-   fd_pack_complete_harmonic_txn: Releases the account locks for a
-   harmonic transaction that was previously scheduled to bank_tile.
-   This should be called when the bank tile completes execution. */
-
-void
-fd_pack_complete_harmonic_txn( fd_pack_t * pack,
-                               ulong       bank_tile );
+   order from the received block.  On bank completion, call
+   fd_pack_microblock_complete (harmonic inflight is updated per-bank there). */
 
 /* fd_pack_harmonic_reset: Resets harmonic state for a new leader slot.
    Clears pending transactions, resets decision state, and sets harmonic_block_slot
@@ -848,7 +841,9 @@ void fd_pack_rebate_cus( fd_pack_t * pack, fd_pack_rebate_t const * rebate );
    times after a microblock or even if bank_tile does not have a
    previously scheduled; in this case, the function will return 0 and
    act as a no-op.  Returns 1 if the bank_tile had an outstanding,
-   previously scheduled microblock to mark as completed. */
+   previously scheduled microblock to mark as completed.  When that
+   microblock was a harmonic block txn (pending_blocks), decrements
+   harmonic_inflight for this bank only. */
 int fd_pack_microblock_complete( fd_pack_t * pack, ulong bank_tile );
 
 /* fd_pack_expire_before deletes all available transactions with
