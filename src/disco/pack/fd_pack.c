@@ -2663,6 +2663,7 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
   }
 
   if( FD_UNLIKELY( harmonic && pack->harmonic_decision==HARMONIC_MODE_HARMONIC ) ) {
+    if( FD_UNLIKELY( bank_tile ) ) return 0UL; /* streaming harmonic: pending_blocks only on execle 0 */
     ulong * use_by_bank_txn = pack->use_by_bank_txn[ bank_tile ];
     sched_return_t status = fd_pack_schedule_impl( pack, pack->pending_blocks,
                                                    ULONG_MAX, 1UL, ULONG_MAX,
