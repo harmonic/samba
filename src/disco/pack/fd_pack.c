@@ -2974,18 +2974,13 @@ fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
       FD_LOG_INFO(( "HARMONIC: UNDECIDED -> HARMONIC (arrival=%ld < threshold=%ld)",
                     txn_arrival_ns, harmonic_threshold_ns ));
     } else {
-      /* Block txn arrived too late - reject this and all future block txns */
+      /* Block txn arrived too late - reject this and all future block txns.
+         UNDECIDED always transitions to SPRINT. */
       pack->block_end_flags              |= FD_PACK_END_FLAG_HARMONIC_TIMEOUT;
       pack->lim->max_vote_cost_per_block  = pack->full_max_vote_cost_per_block;
-      if( FD_UNLIKELY( pack->leader_next_slot ) ) {
-        pack->harmonic_decision = HARMONIC_MODE_VOTE_ONLY;
-        FD_LOG_INFO(( "HARMONIC: UNDECIDED -> VOTE_ONLY (arrival=%ld >= threshold=%ld, leader_next_slot)",
-                      txn_arrival_ns, harmonic_threshold_ns ));
-      } else {
-        pack->harmonic_decision = HARMONIC_MODE_SPRINT;
-        FD_LOG_INFO(( "HARMONIC: UNDECIDED -> SPRINT (arrival=%ld >= threshold=%ld)",
-                      txn_arrival_ns, harmonic_threshold_ns ));
-      }
+      pack->harmonic_decision             = HARMONIC_MODE_SPRINT;
+      FD_LOG_INFO(( "HARMONIC: UNDECIDED -> SPRINT (arrival=%ld >= threshold=%ld)",
+                    txn_arrival_ns, harmonic_threshold_ns ));
       trp_pool_ele_release( pool, ord );
       return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
     }
@@ -3138,7 +3133,8 @@ fd_pack_harmonic_signal_fail( fd_pack_t * pack,
 
   pack->block_end_flags             |= FD_PACK_END_FLAG_HARMONIC_TIMEOUT;
   pack->lim->max_vote_cost_per_block = pack->full_max_vote_cost_per_block;
-  if( FD_UNLIKELY( pack->leader_next_slot ) ) {
+  /* UNDECIDED always goes to SPRINT; HARMONIC can go to VOTE_ONLY if leader_next_slot */
+  if( was_harmonic && FD_UNLIKELY( pack->leader_next_slot ) ) {
     pack->harmonic_decision = HARMONIC_MODE_VOTE_ONLY;
   } else {
     pack->harmonic_decision = HARMONIC_MODE_SPRINT;
@@ -3162,13 +3158,13 @@ fd_pack_harmonic_signal_fail( fd_pack_t * pack,
      VOTE_TAIL_NS of the slot are vote-only/sprint; no new block txn arrivals).
    - harmonic_threshold_ns = slot_start_ns + half the slot length: UNDECIDED
      schedules nothing until then; if no qualifying first block txn, crank
-     moves to SPRINT/VOTE_ONLY (sad path).  Happy path: first block txn tspub
-     before threshold enters HARMONIC until cutoff.
+     moves to SPRINT (sad path).  Happy path: first block txn tspub before
+     threshold enters HARMONIC until cutoff.
 
    Every slot starts in UNDECIDED.  If the first block txn has tspub before
    threshold, we enter HARMONIC.  If threshold passes with no block txn, we
-   go to SPRINT/VOTE_ONLY.  FAILED and signal_fail jump to SPRINT/VOTE_ONLY
-   and sprint to slot end like the sad path after the failure.
+   go to SPRINT.  FAILED and signal_fail jump to SPRINT (from UNDECIDED) or
+   SPRINT/VOTE_ONLY (from HARMONIC) and sprint to slot end like the sad path.
 
    Once in HARMONIC mode, block transactions are scheduled one at a time
    from the pending_blocks treap as fast as bank tiles become available.
@@ -3188,9 +3184,9 @@ fd_pack_harmonic_signal_fail( fd_pack_t * pack,
    tile to end the block.
 
    An upstream failure signal (signal_fail) can arrive at any time. From
-   UNDECIDED or HARMONIC, it transitions to SPRINT/VOTE_ONLY, killing all
-   harmonic processing for the remainder of the slot. From SPRINT or later,
-   it is a no-op.
+   UNDECIDED it transitions to SPRINT; from HARMONIC it transitions to
+   SPRINT/VOTE_ONLY (depending on leader_next_slot), killing all harmonic
+   processing for the remainder of the slot. From SPRINT or later, it is a no-op.
 
    The block_end_flags bitset accumulates failure reasons throughout:
    harmonic timeout (block never arrived or was incomplete) and vote drain
@@ -3202,7 +3198,7 @@ fd_pack_harmonic_signal_fail( fd_pack_t * pack,
    UNDECIDED -> HARMONIC:         first block txn arrived before threshold
      - triggered in insert_fini (txn_arrival_ns = pack wallclock at insert)
 
-   UNDECIDED -> SPRINT/VOTE_ONLY: threshold timeout, no block txns
+   UNDECIDED -> SPRINT:           threshold timeout, no block txns
      - block_end_flags |= HARMONIC_TIMEOUT
 
    HARMONIC -> SPRINT/VOTE_ONLY:  all pending drained + cutoff reached
@@ -3248,17 +3244,13 @@ fd_pack_harmonic_state_crank( fd_pack_t * pack,
         FD_LOG_WARNING(( "HARMONIC: UNDECIDED with received=%lu, should have transitioned", received_cnt ));
       }
       
-      /* Timeout check: if threshold reached without any block txns, transition out. */
+      /* Timeout check: if threshold reached without any block txns, transition out.
+         UNDECIDED always transitions to SPRINT (never VOTE_ONLY). */
       if( approx_wallclock_ns >= harmonic_threshold_ns ) {
         pack->block_end_flags              |= FD_PACK_END_FLAG_HARMONIC_TIMEOUT;
         pack->lim->max_vote_cost_per_block  = pack->full_max_vote_cost_per_block;
-        if( FD_UNLIKELY( pack->leader_next_slot ) ) {
-          pack->harmonic_decision = HARMONIC_MODE_VOTE_ONLY;
-          FD_LOG_INFO(( "HARMONIC: UNDECIDED -> VOTE_ONLY (threshold reached, leader_next_slot)" ));
-        } else {
-          pack->harmonic_decision = HARMONIC_MODE_SPRINT;
-          FD_LOG_INFO(( "HARMONIC: UNDECIDED -> SPRINT (threshold reached, no block txns)" ));
-        }
+        pack->harmonic_decision             = HARMONIC_MODE_SPRINT;
+        FD_LOG_INFO(( "HARMONIC: UNDECIDED -> SPRINT (threshold reached)" ));
       }
       break;
     }
