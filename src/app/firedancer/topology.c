@@ -11,6 +11,7 @@
 #include "../../discof/reasm/fd_reasm.h"
 #include "../../discof/replay/fd_replay_tile.h"
 #include "../../disco/net/fd_net_tile.h"
+#include "../../disco/bundle/fd_bundle_tpu.h"
 #include "../../discof/restore/fd_snapct_tile.h"
 #include "../../disco/gui/fd_gui_config_parse.h"
 #include "../../disco/quic/fd_tpu.h"
@@ -468,6 +469,10 @@ fd_topo_initialize( config_t * config ) {
     fd_topob_wksp( topo, "execle_busy"   );
     fd_topob_wksp( topo, "poh_shred"     );
     fd_topob_wksp( topo, "poh_replay"    );
+
+    /* Harmonic block failure signal links from verify:0 and dedup to pack */
+    fd_topob_wksp( topo, "verify_packf"  );
+    fd_topob_wksp( topo, "dedup_packf"   );
   }
 
   fd_topob_wksp( topo, "funk"          )->core_dump_level = FD_TOPO_CORE_DUMP_LEVEL_FULL;
@@ -629,6 +634,11 @@ fd_topo_initialize( config_t * config ) {
     }
     /**/                   fd_topob_link( topo, "poh_shred",     "poh_shred",     16384UL,                                  USHORT_MAX,                    1UL );
     /**/                   fd_topob_link( topo, "poh_replay",    "poh_replay",    4096UL,                                   sizeof(fd_poh_leader_slot_ended_t), 1UL );
+
+    /* Harmonic block failure signal links (zero-MTU, signal-only).
+       Only verify:0 receives block txns, so only one verify_packf link needed. */
+    /**/                   fd_topob_link( topo, "verify_packf",  "verify_packf",  128UL,                                    0UL,                           1UL );
+    /**/                   fd_topob_link( topo, "dedup_packf",   "dedup_packf",   128UL,                                    0UL,                           1UL );
   }
 
   FOR(resolv_tile_cnt) fd_topob_link( topo, "resolv_replay", "resolv_replay", 4096UL,                                   sizeof(fd_resolv_slot_exchanged_t), 1UL );
@@ -965,14 +975,19 @@ fd_topo_initialize( config_t * config ) {
     FOR(verify_tile_cnt) fd_topob_tile_in(  topo, "verify",  i,            "metric_in", "gossip_out",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     /**/                 fd_topob_tile_in(  topo, "verify",  0UL,          "metric_in", "txsend_out",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     FOR(verify_tile_cnt) fd_topob_tile_out( topo, "verify",  i,                         "verify_dedup",  i                                                  );
+    /**/                 fd_topob_tile_out( topo, "verify",  0UL,                       "verify_packf",  0UL                                                );
     FOR(verify_tile_cnt) fd_topob_tile_in(  topo, "dedup",   0UL,          "metric_in", "verify_dedup",  i,            FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     /**/                 fd_topob_tile_in(  topo, "dedup",   0UL,          "metric_in", "replay_out",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     /**/                 fd_topob_tile_out( topo, "dedup",   0UL,                       "dedup_resolv",  0UL                                                );
+    /**/                 fd_topob_tile_out( topo, "dedup",   0UL,                       "dedup_packf",   0UL                                                );
     FOR(resolv_tile_cnt) fd_topob_tile_in(  topo, "resolv",  i,            "metric_in", "dedup_resolv",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     FOR(resolv_tile_cnt) fd_topob_tile_in(  topo, "resolv",  i,            "metric_in", "replay_out",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     FOR(resolv_tile_cnt) fd_topob_tile_out( topo, "resolv",  i,                         "resolv_pack",   i                                                  );
     FOR(resolv_tile_cnt) fd_topob_tile_out( topo, "resolv",  i,                         "resolv_replay", i                                                  );
     FOR(resolv_tile_cnt) fd_topob_tile_in(  topo, "pack",    0UL,          "metric_in", "resolv_pack",   i,            FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
+    /* Harmonic block failure signals from verify:0 and dedup to pack */
+    /**/                 fd_topob_tile_in(  topo, "pack",    0UL,          "metric_in", "verify_packf",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
+    /**/                 fd_topob_tile_in(  topo, "pack",    0UL,          "metric_in", "dedup_packf",   0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     /**/                 fd_topob_tile_in(  topo, "pack",    0UL,          "metric_in", "replay_out",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     /**/                 fd_topob_tile_out(  topo, "pack",   0UL,                       "pack_execle",   0UL                                                );
     /**/                 fd_topob_tile_out(  topo, "pack",   0UL,                       "pack_poh" ,     0UL                                                );
@@ -1042,11 +1057,17 @@ fd_topo_initialize( config_t * config ) {
 
     /**/                 fd_topob_tile( topo, "bundle",  "bundle",  "metric_in", tile_to_cpu[ topo->tile_cnt ], 0, 1, 0 );
 
+    /* Harmonic: read became_leader messages from replay_out link.
+       NOTE: replay_out must be the first in_link for bundle tile because fd_stem
+       uses poll indices (skipping unpolled links), so we need the polled link first. */
+    /**/                 fd_topob_tile_in(  topo, "bundle", 0UL,           "metric_in", "replay_out",     0UL,        FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
+
     /**/                 fd_topob_tile_out( topo, "bundle", 0UL, "bundle_verif", 0UL );
     FOR(verify_tile_cnt) fd_topob_tile_in(  topo, "verify", i,             "metric_in", "bundle_verif",   0UL,        FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
 
     /**/                 fd_topob_tile_in(  topo, "sign",   0UL,           "metric_in", "bundle_sign",    0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
     /**/                 fd_topob_tile_out( topo, "bundle", 0UL,                        "bundle_sign",    0UL                                                );
+    /* sign_bundle must be the last in_link for bundle tile (unpolled links go last) */
     /**/                 fd_topob_tile_in(  topo, "bundle", 0UL,           "metric_in", "sign_bundle",    0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_UNPOLLED );
     /**/                 fd_topob_tile_out( topo, "sign",   0UL,                        "sign_bundle",    0UL                                                );
 
@@ -1056,6 +1077,14 @@ fd_topo_initialize( config_t * config ) {
       /**/               fd_topob_tile_in(  topo, "pack",   0UL,           "metric_in", "sign_pack",      0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_UNPOLLED );
       /**/               fd_topob_tile_out( topo, "sign",   0UL,                        "sign_pack",      0UL                                                );
     }
+
+    /* bundle_gossi link for bundle->gossip TPU updates.
+       In full Firedancer, gossip tile consumes this. */
+    fd_topob_wksp( topo, "bundle_gossi" );
+    fd_topob_link( topo, "bundle_gossi", "bundle_gossi", 128UL, sizeof(fd_bundle_tpu_update_t), 1UL );
+    fd_topob_tile_out( topo, "bundle", 0UL, "bundle_gossi", 0UL );
+    /* gossip tile reads from bundle_gossi */
+    fd_topob_tile_in( topo, "gossip", 0UL, "metric_in", "bundle_gossi", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
 
     if( config->tiles.gui.enabled ) { /* GUI is the only consumer of bundle_status */
       fd_topob_wksp( topo, "bundle_status" );
@@ -1752,6 +1781,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
       PARSE_PUBKEY( pack, tip_payment_program_addr      );
       PARSE_PUBKEY( pack, tip_distribution_authority    );
       tile->pack.bundle.commission_bps = config->tiles.bundle.commission_bps;
+      tile->pack.bundle.harmonic_block_mode = config->tiles.bundle.harmonic_block_mode;
       fd_cstr_ncpy( tile->pack.bundle.identity_key_path, config->paths.identity_key, sizeof(tile->pack.bundle.identity_key_path) );
       fd_cstr_ncpy( tile->pack.bundle.vote_account_path, config->paths.vote_account, sizeof(tile->pack.bundle.vote_account_path) );
     } else {
@@ -1876,6 +1906,11 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->bundle.url_len = strnlen( tile->bundle.url, sizeof(tile->bundle.url)-1UL );
     fd_cstr_ncpy( tile->bundle.sni, config->tiles.bundle.tls_domain_name, sizeof(tile->bundle.sni) );
     tile->bundle.sni_len = strnlen( tile->bundle.sni, sizeof(tile->bundle.sni)-1UL );
+    /* Second endpoint for a second subscribePackets connection */
+    fd_cstr_ncpy( tile->bundle.tpu_url, config->tiles.bundle.tpu_url, sizeof(tile->bundle.tpu_url) );
+    tile->bundle.tpu_url_len = strnlen( tile->bundle.tpu_url, sizeof(tile->bundle.tpu_url)-1UL );
+    fd_cstr_ncpy( tile->bundle.tpu_sni, config->tiles.bundle.tpu_tls_domain_name, sizeof(tile->bundle.tpu_sni) );
+    tile->bundle.tpu_sni_len = strnlen( tile->bundle.tpu_sni, sizeof(tile->bundle.tpu_sni)-1UL );
     fd_cstr_ncpy( tile->bundle.identity_key_path, config->paths.identity_key, sizeof(tile->bundle.identity_key_path) );
     fd_cstr_ncpy( tile->bundle.key_log_path, config->development.bundle.ssl_key_log_file, sizeof(tile->bundle.key_log_path) );
     tile->bundle.buf_sz = config->development.bundle.buffer_size_kib<<10;
@@ -1883,6 +1918,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->bundle.ssl_heap_sz = config->development.bundle.ssl_heap_size_mib<<20;
     tile->bundle.keepalive_interval_nanos = config->tiles.bundle.keepalive_interval_millis * (ulong)1e6;
     tile->bundle.tls_cert_verify = !!config->tiles.bundle.tls_cert_verify;
+    tile->bundle.harmonic_block_mode = config->tiles.bundle.harmonic_block_mode;
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "accdb" ) ) ) {
 

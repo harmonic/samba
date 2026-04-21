@@ -218,12 +218,15 @@ fd_config_extract_pod( uchar *       pod,
   CFG_POP      ( bool,   tiles.bundle.enabled                             );
   CFG_POP      ( cstr,   tiles.bundle.url                                 );
   CFG_POP      ( cstr,   tiles.bundle.tls_domain_name                     );
+  CFG_POP      ( cstr,   tiles.bundle.tpu_url                             );
+  CFG_POP      ( cstr,   tiles.bundle.tpu_tls_domain_name                 );
   CFG_POP      ( cstr,   tiles.bundle.tip_distribution_program_addr       );
   CFG_POP      ( cstr,   tiles.bundle.tip_payment_program_addr            );
   CFG_POP      ( cstr,   tiles.bundle.tip_distribution_authority          );
   CFG_POP      ( uint,   tiles.bundle.commission_bps                      );
   CFG_POP      ( ulong,  tiles.bundle.keepalive_interval_millis           );
   CFG_POP      ( bool,   tiles.bundle.tls_cert_verify                     );
+  CFG_POP      ( bool,   tiles.bundle.harmonic_block_mode                 );
 
   CFG_POP      ( uint,   tiles.pack.max_pending_transactions              );
   CFG_POP      ( bool,   tiles.pack.use_consumed_cus                      );
