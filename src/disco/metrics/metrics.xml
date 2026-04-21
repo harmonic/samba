@@ -374,6 +374,11 @@ metric introduced.
     <counter name="ShredstreamHeartbeats" summary="Number of ShredStream heartbeats successfully sent" />
     <counter name="Keepalives" summary="Number of HTTP/2 PINGs acknowledged by server" />
     <gauge name="State" summary="Bundle tile state: 0=disconnected, 1=connecting, 2=connected, 3=sleeping" />
+    <gauge name="TpuConnected" summary="1 if connected to the TPU endpoint, 0 if not" />
+    <counter name="TpuPacketReceived" summary="Total count of packets received from TPU endpoint" />
+    <counter name="TpuTransactionReceived" summary="Total count of transactions received from TPU endpoint" />
+    <counter name="BlockReceived" summary="Total count of blocks received" />
+    <counter name="BlockTransactionReceived" summary="Total count of transactions received from blocks" />
     <gauge name="RttSample" summary="Latest RTT sample at scrape time (nanoseconds)" />
     <gauge name="RttSmoothed" summary="RTT moving average (nanoseconds)" />
     <gauge name="RttVar" summary="RTT variance (nanoseconds)" />
@@ -390,6 +395,7 @@ metric introduced.
     <int value="2" name="ParseFailure" label="Transaction failed to parse" />
     <int value="3" name="DedupFailure" label="Transaction failed deduplication" />
     <int value="4" name="VerifyFailure" label="Transaction failed signature verification" />
+    <int value="5" name="BlockPeerFailure" label="Peer transaction in the block failed" />
 </enum>
 
 <tile name="verify">
@@ -442,6 +448,7 @@ metric introduced.
 
 <enum name="PackTxnInsertReturn">
     <!-- Note: You must keep the list of return values in fd_pack.h in sync with this list -->
+    <int value="-16" name="BlockFailed" label="Harmonic block already failed validation" />
     <int value="-15" name="InstrAcctCnt" label="Transaction has an instruction that references too many accounts" />
     <int value="-14" name="NonceConflict" label="Bundle with two conflicting durable nonce transactions" />
     <int value="-13" name="BundleBlacklist" label="Transaction is a vote in a bundle or uses an account on the bundle blacklist" />

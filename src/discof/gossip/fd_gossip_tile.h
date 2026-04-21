@@ -52,6 +52,11 @@ struct fd_gossip_tile_ctx {
   fd_ip4_udp_hdrs_t net_out_hdr[ 1 ];
   fd_rng_t          rng[ 1 ];
 
+  /* Local TPU addresses - saved at startup for reverting when bundle disconnects */
+  fd_gossip_socket_t local_tpu_addr;
+  fd_gossip_socket_t local_tpu_quic_addr;
+  fd_gossip_socket_t local_tpu_fwd_addr;
+  fd_gossip_socket_t local_tpu_fwd_quic_addr;
 
   /* FIXME: Support a larger bound. */
   /* The condition for complete = 1 is 80% of the cluster has joined
