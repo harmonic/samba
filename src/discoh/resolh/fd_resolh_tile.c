@@ -21,6 +21,7 @@ typedef struct blockhash blockhash_t;
 struct blockhash_map {
   blockhash_t key;
   ulong       slot;
+  ulong       block_height;
 };
 
 typedef struct blockhash_map blockhash_map_t;
@@ -121,6 +122,9 @@ struct fd_resolh_tile {
   int   bundle_failed;
   ulong bundle_id;
 
+  int   block_failed;
+  ulong block_slot;
+
   void * root_bank;
   ulong  root_slot;
 
@@ -134,6 +138,7 @@ struct fd_resolh_tile {
   lru_list_t           lru_list[1];
 
   ulong completed_slot;
+  ulong current_block_height;
   ulong blockhash_ring_idx;
   blockhash_t blockhash_ring[ BLOCKHASH_RING_LEN ];
 
@@ -343,13 +348,15 @@ after_frag( fd_resolh_tile_t *  ctx,
         ctx->blockhash_ring_idx++;
 
         blockhash_map_t * blockhash = map_insert( ctx->blockhash_map, *(blockhash_t *)frag->hash );
-        blockhash->slot = frag->slot;
+        blockhash->slot         = frag->slot;
+        blockhash->block_height = frag->block_height;
 
         blockhash_t * hash = (blockhash_t *)frag->hash;
         ctx->flush_pool_idx  = map_chain_idx_query_const( ctx->map_chain, &hash, ULONG_MAX, ctx->pool );
         ctx->flushing_slot   = frag->slot;
 
-        ctx->completed_slot = frag->slot;
+        ctx->completed_slot       = frag->slot;
+        ctx->current_block_height = frag->block_height;
         break;
       }
       default:
@@ -375,7 +382,7 @@ after_frag( fd_resolh_tile_t *  ctx,
      (2) The blockhash is not that old, but was created before this
          validator was started.
      (3) It's really new (we haven't seen the bank yet).
-     (4) It's a durable nonce transaction, or part of a bundle (just let
+     (4) It's a durable nonce transaction, or part of a bundle or block (just let
          it pass).
 
     For durable nonce transactions, there isn't much we can do except
@@ -386,13 +393,31 @@ after_frag( fd_resolh_tile_t *  ctx,
     buffer.  If we later see the blockhash come to exist, we forward any
     buffered transactions to back. */
 
-  if( FD_UNLIKELY( txnm->block_engine.bundle_id && (txnm->block_engine.bundle_id!=ctx->bundle_id) ) ) {
+  /* Check transaction type using source_tpu:
+     - Bundles: FD_TXN_M_TPU_SOURCE_BUNDLE with bundle_id
+     - Blocks: FD_TXN_M_TPU_SOURCE_HARMONIC with block_slot */
+  int is_bundle = (txnm->source_tpu == FD_TXN_M_TPU_SOURCE_BUNDLE) && txnm->block_engine.bundle_id;
+  int is_block  = (txnm->source_tpu == FD_TXN_M_TPU_SOURCE_HARMONIC) && txnm->block_engine.block_slot;
+
+  /* Bundle tracking */
+  if( FD_UNLIKELY( is_bundle && (txnm->block_engine.bundle_id!=ctx->bundle_id) ) ) {
     ctx->bundle_failed = 0;
     ctx->bundle_id     = txnm->block_engine.bundle_id;
   }
 
-  if( FD_UNLIKELY( txnm->block_engine.bundle_id && ctx->bundle_failed ) ) {
+  if( FD_UNLIKELY( is_bundle && ctx->bundle_failed ) ) {
     ctx->metrics.bundle_peer_failure_cnt++;
+    return;
+  }
+
+  /* Block tracking (similar to bundles) */
+  if( FD_UNLIKELY( is_block && (txnm->block_engine.block_slot!=ctx->block_slot) ) ) {
+    ctx->block_failed = 0;
+    ctx->block_slot   = txnm->block_engine.block_slot;
+  }
+
+  if( FD_UNLIKELY( is_block && ctx->block_failed ) ) {
+    FD_LOG_NOTICE(( "CAVEY DEBUG: block failed in slot=%lu, dropping", txnm->block_engine.block_slot ));
     return;
   }
 
@@ -400,17 +425,23 @@ after_frag( fd_resolh_tile_t *  ctx,
   blockhash_map_t const * blockhash = map_query_const( ctx->blockhash_map, *(blockhash_t*)( fd_txn_m_payload( txnm )+txnt->recent_blockhash_off ), NULL );
   if( FD_LIKELY( blockhash ) ) {
     txnm->reference_slot = blockhash->slot;
-    if( FD_UNLIKELY( txnm->reference_slot+151UL<ctx->completed_slot ) ) {
-      if( FD_UNLIKELY( txnm->block_engine.bundle_id ) ) ctx->bundle_failed = 1;
+    if( FD_UNLIKELY( ctx->current_block_height>blockhash->block_height+151UL ) ) {
+      ctx->bundle_failed = is_bundle;
+      if( FD_UNLIKELY( is_block && !ctx->block_failed ) ) {
+        ctx->block_failed = 1;
+        ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
+        fd_stem_publish( stem, 0UL, ctx->block_slot | FD_TXN_M_SIG_BLOCK_FAIL_FLAG, 0UL, 0UL, 0UL, 0UL, tspub );
+      }
       ctx->metrics.blockhash_expired++;
       return;
     }
   }
 
-  int is_bundle_member = !!txnm->block_engine.bundle_id;
+  /* Bundles and blocks skip blockhash stashing (they're pre-validated) */
+  int is_bundle_or_block = is_bundle || is_block;
   int is_durable_nonce = fd_resolh_is_durable_nonce( txnt, fd_txn_m_payload( txnm ) );
 
-  if( FD_UNLIKELY( !is_bundle_member && !is_durable_nonce && !blockhash ) ) {
+  if( FD_UNLIKELY( !is_bundle_or_block && !is_durable_nonce && !blockhash ) ) {
     ulong pool_idx;
     if( FD_UNLIKELY( !pool_free( ctx->pool ) ) ) {
       pool_idx = lru_list_idx_pop_tail( ctx->lru_list, ctx->pool );
@@ -443,7 +474,12 @@ after_frag( fd_resolh_tile_t *  ctx,
   if( FD_UNLIKELY( txnt->addr_table_adtl_cnt ) ) {
     if( FD_UNLIKELY( !ctx->root_bank ) ) {
       FD_MCNT_INC( RESOLH, NO_BANK_DROP, 1 );
-      if( FD_UNLIKELY( txnm->block_engine.bundle_id ) ) ctx->bundle_failed = 1;
+      ctx->bundle_failed = is_bundle;
+      if( FD_UNLIKELY( is_block && !ctx->block_failed ) ) {
+        ctx->block_failed = 1;
+        ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
+        fd_stem_publish( stem, 0UL, ctx->block_slot | FD_TXN_M_SIG_BLOCK_FAIL_FLAG, 0UL, 0UL, 0UL, 0UL, tspub );
+      }
       return;
     }
 
@@ -452,14 +488,22 @@ after_frag( fd_resolh_tile_t *  ctx,
     ctx->metrics.lut[ (ulong)((long)FD_METRICS_COUNTER_RESOLH_LUT_RESOLVED_CNT+result-1L) ]++;
 
     if( FD_UNLIKELY( result!=FD_BANK_ABI_TXN_INIT_SUCCESS ) ) {
-      if( FD_UNLIKELY( txnm->block_engine.bundle_id ) ) ctx->bundle_failed = 1;
+      ctx->bundle_failed = is_bundle;
+      if( FD_UNLIKELY( is_block && !ctx->block_failed ) ) {
+        ctx->block_failed = 1;
+        ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
+        fd_stem_publish( stem, 0UL, ctx->block_slot | FD_TXN_M_SIG_BLOCK_FAIL_FLAG, 0UL, 0UL, 0UL, 0UL, tspub );
+      }
       return;
     }
   }
 
   ulong realized_sz = fd_txn_m_realized_footprint( txnm, 1, 1 );
   ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
-  fd_stem_publish( stem, 0UL, txnm->reference_slot, ctx->out_chunk, realized_sz, 0UL, tsorig, tspub );
+  /* Harmonic: Set the block flag in sig if this is a block transaction, so
+     downstream tiles can identify it in before_frag without the chunk data. */
+  ulong out_sig = txnm->reference_slot | (is_block ? FD_TXN_M_SIG_BLOCK_FLAG : 0UL);
+  fd_stem_publish( stem, 0UL, out_sig, ctx->out_chunk, realized_sz, 0UL, tsorig, tspub );
   ctx->out_chunk = fd_dcache_compact_next( ctx->out_chunk, realized_sz, ctx->out_chunk0, ctx->out_wmark );
 }
 
@@ -477,7 +521,11 @@ unprivileged_init( fd_topo_t *      topo,
   ctx->bundle_failed = 0;
   ctx->bundle_id     = 0UL;
 
-  ctx->completed_slot = 0UL;
+  ctx->block_failed = 0;
+  ctx->block_slot   = 0UL;
+
+  ctx->completed_slot       = 0UL;
+  ctx->current_block_height = 0UL;
   ctx->blockhash_ring_idx = 0UL;
 
   ctx->flush_pool_idx = ULONG_MAX;
