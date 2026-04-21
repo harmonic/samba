@@ -30,6 +30,9 @@ typedef struct {
   int   bundle_failed;
   ulong bundle_id;
 
+  int   block_failed;
+  ulong block_slot;
+
   ulong round_robin_idx;
   ulong round_robin_cnt;
 
@@ -46,6 +49,8 @@ typedef struct {
   ulong       out_chunk0;
   ulong       out_wmark;
   ulong       out_chunk;
+
+  ulong       packf_out_idx; /* Output link index for verify_packf (block-fail signal) */
 
   ulong       hashmap_seed;
 
