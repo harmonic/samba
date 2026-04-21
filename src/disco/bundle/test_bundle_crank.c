@@ -229,6 +229,86 @@ test_crank_cnt( void ) {
       _GwHH8ciFhR8vejWCqmg8FWZUCNtubPY2esALvy5tBvji, _4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7, 740UL, 5UL, payload, txn ) );
 }
 
+static inline void
+test_block_builder_eq_identity( void ) {
+  fd_bundle_crank_gen_t g[1];
+
+  fd_rng_t _rng[1];
+  fd_rng_t * rng = fd_rng_join( fd_rng_new( _rng, 1U, 7UL ) );
+
+  fd_bundle_crank_gen_init( g, _4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7, _T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt,
+                               _3iPuTgpWaaC6jYEY7kd993QBthGsQTK3yPCrNJyPMhCD, _GZctHpWXmsZC1YHACTGGcHhYxjdRqQvTpYkb9LMvxDib,
+                               "NONE",
+                               0UL );
+
+  fd_acct_addr_t const * identity          = _GwHH8ciFhR8vejWCqmg8FWZUCNtubPY2esALvy5tBvji;
+  fd_acct_addr_t const * new_block_builder = _GwHH8ciFhR8vejWCqmg8FWZUCNtubPY2esALvy5tBvji;
+
+  fd_bundle_crank_tip_payment_config_t old_tip_payment_config[1] = {{
+    .discriminator = 0x82ccfa1ee0aa0c9bUL,
+    .tip_receiver  = {{{ EXPAND_ARR32( _GiLHMES95axFbFX7ogCTwL6QQ1uqspajz9SHMpt5dCGh->b, 0UL ) }}},
+    .block_builder = {{{ EXPAND_ARR32( _feeywn2ffX8DivmRvBJ9i9YZnss7WBouTmujfQcEdeY->b,  0UL ) }}},
+    .commission_pct = 5UL,
+    .bumps = { 254, 255, 254, 255, 255, 252, 255, 252, 255 }
+  }};
+
+  uchar payload[ FD_TXN_MTU ];
+  uchar _txn[ FD_TXN_MAX_SZ ];
+  fd_txn_t * txn = (fd_txn_t *)_txn;
+
+  ulong sz = fd_bundle_crank_generate( g, old_tip_payment_config, new_block_builder,
+      identity, _4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7, 740UL, 6UL, payload, txn );
+  FD_TEST( sz==sizeof(fd_bundle_crank_2_t) );
+
+  fd_acct_addr_t const * addr = fd_txn_get_acct_addrs( txn, payload );
+  fd_chkdup_t chkdup[1];
+  fd_chkdup_join( fd_chkdup_new( chkdup, rng ) );
+  FD_TEST( !fd_chkdup_check( chkdup, addr, fd_txn_account_cnt( txn, FD_TXN_ACCT_CAT_ALL ), NULL, 0UL ) );
+
+  /* change_block_builder is instruction 2 in crank2; acct_idx[3] is the
+     new block builder slot, which should now point at slot 0 (identity)
+     and slot 14 should hold a perturbed unique address. */
+  uchar nbb_slot = payload[ txn->instr[2].acct_off + 3UL ];
+  FD_TEST( nbb_slot==0 );
+  FD_TEST( fd_memeq( addr+nbb_slot, identity, 32UL ) );
+  FD_TEST( !fd_memeq( addr+14UL, identity, 32UL ) );
+
+  do {
+    uchar _txn2[ FD_TXN_MAX_SZ ];
+    ulong txn_sz = fd_txn_parse( payload, sz, _txn2, NULL );
+    FD_TEST( txn_sz );
+    FD_TEST( fd_memeq( _txn2, _txn, txn_sz ) );
+  } while( 0 );
+
+  fd_acct_addr_t tip_receiver_owner[1];
+  fd_bundle_crank_apply( g, old_tip_payment_config, new_block_builder, tip_receiver_owner, 740UL, 6UL );
+  FD_TEST( 0UL==fd_bundle_crank_generate( g, old_tip_payment_config, new_block_builder,
+      identity, tip_receiver_owner, 740UL, 6UL, payload, txn ) );
+
+  /* swap3 / crank3 path. */
+  do {
+    fd_bundle_crank_gen_t g3[1];
+    fd_bundle_crank_gen_init( g3, _4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7, _T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt,
+                                  _3iPuTgpWaaC6jYEY7kd993QBthGsQTK3yPCrNJyPMhCD, _GZctHpWXmsZC1YHACTGGcHhYxjdRqQvTpYkb9LMvxDib,
+                                  "NONE",
+                                  0UL );
+    fd_acct_addr_t uncreated[1] = {{{ 0 }}};
+    ulong sz3 = fd_bundle_crank_generate( g3, old_tip_payment_config, new_block_builder,
+        identity, uncreated, 740UL, 6UL, payload, txn );
+    FD_TEST( sz3==sizeof(fd_bundle_crank_3_t) );
+
+    fd_acct_addr_t const * addr3 = fd_txn_get_acct_addrs( txn, payload );
+    FD_TEST( !fd_chkdup_check( chkdup, addr3, fd_txn_account_cnt( txn, FD_TXN_ACCT_CAT_ALL ), NULL, 0UL ) );
+
+    uchar nbb_slot3 = payload[ txn->instr[3].acct_off + 3UL ];
+    FD_TEST( nbb_slot3==0 );
+    FD_TEST( fd_memeq( addr3+nbb_slot3, identity, 32UL ) );
+    FD_TEST( !fd_memeq( addr3+14UL,     identity, 32UL ) );
+  } while( 0 );
+
+  fd_rng_delete( fd_rng_leave( rng ) );
+}
+
 int
 main( int argc,
     char ** argv ) {
@@ -237,6 +317,7 @@ main( int argc,
   test_repro_onchain();
   test_no_duplicates();
   test_crank_cnt();
+  test_block_builder_eq_identity();
 
   FD_LOG_NOTICE(( "pass" ));
 

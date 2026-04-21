@@ -116,8 +116,12 @@ after_frag( fd_verify_ctx_t *   ctx,
   fd_txn_t *  txnt = fd_txn_m_txn_t( txnm );
   txnm->txn_t_sz = (ushort)fd_txn_parse( fd_txn_m_payload( txnm ), txnm->payload_sz, txnt, NULL );
 
-  int is_bundle = !!txnm->block_engine.bundle_id;
+  /* The bundle_id/block_slot union field is reused for both bundles and blocks,
+     so we need to check the source_tpu to determine the type */
+  int is_bundle = txnm->source_tpu == FD_TXN_M_TPU_SOURCE_BUNDLE && !!txnm->block_engine.bundle_id;
+  int is_block  = txnm->source_tpu == FD_TXN_M_TPU_SOURCE_HARMONIC  && !!txnm->block_engine.block_slot;
 
+  /* Bundle tracking: reset failed state when bundle_id changes */
   if( FD_UNLIKELY( is_bundle & (txnm->block_engine.bundle_id!=ctx->bundle_id) ) ) {
     ctx->bundle_failed = 0;
     ctx->bundle_id     = txnm->block_engine.bundle_id;
@@ -128,8 +132,26 @@ after_frag( fd_verify_ctx_t *   ctx,
     return;
   }
 
+  /* Block tracking: reset failed state when block_slot changes */
+  if( FD_UNLIKELY( is_block & (txnm->block_engine.block_slot!=ctx->block_slot) ) ) {
+    ctx->block_failed = 0;
+    ctx->block_slot   = txnm->block_engine.block_slot;
+  }
+
+  if( FD_UNLIKELY( is_block & (!!ctx->block_failed) ) ) {
+    ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_TILE_RESULT_V_BLOCK_PEER_FAILURE_IDX ]++;
+    return;
+  }
+
   if( FD_UNLIKELY( !txnm->txn_t_sz ) ) {
     if( FD_UNLIKELY( is_bundle ) ) ctx->bundle_failed = 1;
+    if( FD_UNLIKELY( is_block && !ctx->block_failed ) ) {
+      ctx->block_failed = 1;
+      if( FD_LIKELY( ctx->packf_out_idx!=ULONG_MAX ) ) {
+        ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_tickcount() );
+        fd_stem_publish( stem, ctx->packf_out_idx, ctx->block_slot, 0UL, 0UL, 0UL, 0UL, tspub );
+      }
+    }
     ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_TILE_RESULT_V_PARSE_FAILURE_IDX ]++;
     return;
   }
@@ -139,11 +161,19 @@ after_frag( fd_verify_ctx_t *   ctx,
      arrives first, we want to pack the one with the tip.  Thus, we
      exempt bundles from the normal HA dedup checks.  The dedup tile
      will still do a full-bundle dedup check to make sure to drop any
-     identical bundles. */
+     identical bundles.  Block transactions are also exempt from dedup. */
   ulong _txn_sig;
-  int res = fd_txn_verify( ctx, fd_txn_m_payload( txnm ), txnm->payload_sz, txnt, !is_bundle, &_txn_sig );
+  int skip_dedup = is_bundle | is_block;
+  int res = fd_txn_verify( ctx, fd_txn_m_payload( txnm ), txnm->payload_sz, txnt, !skip_dedup, &_txn_sig );
   if( FD_UNLIKELY( res!=FD_TXN_VERIFY_SUCCESS ) ) {
     if( FD_UNLIKELY( is_bundle ) ) ctx->bundle_failed = 1;
+    if( FD_UNLIKELY( is_block && !ctx->block_failed ) ) {
+      ctx->block_failed = 1;
+      if( FD_LIKELY( ctx->packf_out_idx!=ULONG_MAX ) ) {
+        ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_tickcount() );
+        fd_stem_publish( stem, ctx->packf_out_idx, ctx->block_slot, 0UL, 0UL, 0UL, 0UL, tspub );
+      }
+    }
 
     if( FD_LIKELY( res==FD_TXN_VERIFY_DEDUP ) ) ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_TILE_RESULT_V_DEDUP_FAILURE_IDX ]++;
     else                                        ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_TILE_RESULT_V_VERIFY_FAILURE_IDX ]++;
@@ -191,6 +221,9 @@ unprivileged_init( fd_topo_t *      topo,
   ctx->bundle_failed = 0;
   ctx->bundle_id     = 0UL;
 
+  ctx->block_failed = 0;
+  ctx->block_slot   = 0UL;
+
   memset( &ctx->metrics, 0, sizeof( ctx->metrics ) );
 
   ctx->tcache_depth   = fd_tcache_depth       ( tcache );
@@ -218,6 +251,16 @@ unprivileged_init( fd_topo_t *      topo,
   ctx->out_chunk0 = fd_dcache_compact_chunk0( ctx->out_mem, topo->links[ tile->out_link_id[ 0 ] ].dcache );
   ctx->out_wmark  = fd_dcache_compact_wmark ( ctx->out_mem, topo->links[ tile->out_link_id[ 0 ] ].dcache, topo->links[ tile->out_link_id[ 0 ] ].mtu );
   ctx->out_chunk  = ctx->out_chunk0;
+
+  /* Find the verify_packf output link index for block-fail signals */
+  ctx->packf_out_idx = ULONG_MAX;
+  for( ulong i=0UL; i<tile->out_cnt; i++ ) {
+    fd_topo_link_t const * link = &topo->links[ tile->out_link_id[ i ] ];
+    if( !strcmp( link->name, "verify_packf" ) ) {
+      ctx->packf_out_idx = i;
+      break;
+    }
+  }
 
   ulong scratch_top = FD_SCRATCH_ALLOC_FINI( l, 1UL );
   if( FD_UNLIKELY( scratch_top > (ulong)scratch + scratch_footprint( tile ) ) )

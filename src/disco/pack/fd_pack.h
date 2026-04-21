@@ -261,6 +261,10 @@ fd_pack_avail_txn_cnt( fd_pack_t const * pack ) {
   return *((ulong const *)((uchar const *)pack + FD_PACK_PENDING_TXN_CNT_OFF));
 }
 
+/* fd_pack_avail_vote_cnt returns the number of pending vote transactions
+   available to schedule. */
+ulong fd_pack_avail_vote_cnt( fd_pack_t const * pack );
+
 /* fd_pack_current_block_cost returns the number of CUs that have been
    scheduled in the current block, net of any rebates.  It should be
    between 0 and the specified value of max_cost_per_block, but it can
@@ -410,14 +414,15 @@ void fd_pack_get_pending_smallest( fd_pack_t * pack, fd_pack_smallest_t * opt_pe
 #define FD_PACK_INSERT_REJECT_BUNDLE_BLACKLIST      (-13)
 #define FD_PACK_INSERT_REJECT_NONCE_CONFLICT        (-14)
 #define FD_PACK_INSERT_REJECT_INSTR_ACCT_CNT        (-15)
+#define FD_PACK_INSERT_REJECT_BLOCK_FAILED          (-16)
 
 /* The FD_PACK_INSERT_{ACCEPT, REJECT}_* values defined above are in the
    range [-FD_PACK_INSERT_RETVAL_OFF,
    -FD_PACK_INSERT_RETVAL_OFF+FD_PACK_INSERT_RETVAL_CNT ) */
-#define FD_PACK_INSERT_RETVAL_OFF 15
-#define FD_PACK_INSERT_RETVAL_CNT 22
+#define FD_PACK_INSERT_RETVAL_OFF 16
+#define FD_PACK_INSERT_RETVAL_CNT 23
 
-FD_STATIC_ASSERT( FD_PACK_INSERT_REJECT_INSTR_ACCT_CNT>=-FD_PACK_INSERT_RETVAL_OFF, pack_retval );
+FD_STATIC_ASSERT( FD_PACK_INSERT_REJECT_BLOCK_FAILED>=-FD_PACK_INSERT_RETVAL_OFF, pack_retval );
 FD_STATIC_ASSERT( FD_PACK_INSERT_ACCEPT_NONCE_NONVOTE_REPLACE<FD_PACK_INSERT_RETVAL_CNT-FD_PACK_INSERT_RETVAL_OFF, pack_retval );
 
 /* fd_pack_insert_txn_{init,fini,cancel} execute the process of
@@ -700,7 +705,136 @@ fd_pack_schedule_next_microblock( fd_pack_t  * pack,
                                   float        vote_fraction,
                                   ulong        bank_tile,
                                   int          schedule_flags,
+                                  int          harmonic,
                                   fd_txn_e_t * out );
+
+
+/* Harmonic block scheduling functions.
+
+   Harmonic scheduling uses fd_pack_schedule_next_microblock with harmonic=1,
+   which internally uses transitive dependency tracking to maintain execution
+   order from the received block.
+
+   fd_pack_complete_harmonic_txn: Releases the account locks for a
+   harmonic transaction that was previously scheduled to bank_tile.
+   This should be called when the bank tile completes execution. */
+
+void
+fd_pack_complete_harmonic_txn( fd_pack_t * pack,
+                               ulong       bank_tile );
+
+/* fd_pack_harmonic_reset: Resets harmonic state for a new leader slot.
+   Clears pending transactions, resets decision state, and sets harmonic_block_slot
+   to leader_slot. Block txns for other slots will be dropped.
+   leader_next_slot: 1 if we are also the leader for slot+1, 0 otherwise. */
+void fd_pack_harmonic_reset( fd_pack_t * pack, ulong leader_slot, int leader_next_slot );
+
+/* fd_pack_harmonic_insert_fini: Inserts an already-populated block
+   transaction into the pending_blocks treap.  Takes an fd_txn_e_t from
+   fd_pack_insert_txn_init.  Returns 1 on success, negative
+   FD_PACK_INSERT_REJECT_* code on validation failure.  Uses FIFO
+   ordering via block_txn_idx encoding.
+
+   block_meta points to the bundle metadata (e.g. block_builder_info_t)
+   which is copied into the parallel bundle_meta array.
+
+   is_ib indicates this is the initializer bundle (crank transaction),
+   which gets idx=0 to ensure it's scheduled first.
+
+   If block_slot changes, resets harmonic state for the new block.
+
+   txn_arrival_ns is the pack tile's estimated wallclock (nanoseconds) when
+   insert_fini runs (approx_wallclock_ns plus tick-based adjustment), same
+   basis as scheduler_arrival_time_nanos on the txn.  harmonic_threshold_ns
+   is slot_start + (slot_end-slot_start)/2.  For the FIRST block txn while
+   in UNDECIDED:
+     - If txn_arrival_ns < harmonic_threshold_ns: enter HARMONIC mode
+     - If txn_arrival_ns >= harmonic_threshold_ns: enter SPRINT, reject
+
+   harmonic_cutoff_ns is slot_end_ns - FD_PACK_HARMONIC_VOTE_TAIL_NS.
+   txn_arrival_ns > harmonic_cutoff_ns is rejected.
+
+   On any validation failure, the entire block is failed: all pending
+   block transactions are cleared, harmonic mode transitions to FAILED,
+   and subsequent insert attempts for this slot return immediately. */
+int fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
+                                  fd_txn_e_t   * txne,
+                                  ulong          block_slot,
+                                  ulong          block_txn_expected,
+                                  void   const * block_meta,
+                                  int            is_ib,
+                                  long           txn_arrival_ns,
+                                  long           harmonic_threshold_ns,
+                                  long           harmonic_cutoff_ns,
+                                  ulong        * opt_delete_cnt );
+
+/* Harmonic state machine states.
+   UNDECIDED:  No scheduling; wait for first block txn (tspub < half slot) or
+               half-slot timeout -> SPRINT/VOTE_ONLY.
+   HARMONIC:   Scheduling block txns until cutoff (slot_end - VOTE_TAIL).
+   SPRINT:     Harmonic block complete (or skipped), scheduling votes/normal txns.
+   FAILED:     Block validation failed, behaves like SPRINT.
+   VOTE_ONLY:  Harmonic block complete but we are leader next slot.
+               Only schedule votes; keep bundle/nonvote paused.
+   DONE:       Slot is ending, block_end_reason indicates why. */
+#define HARMONIC_MODE_UNDECIDED  0
+#define HARMONIC_MODE_HARMONIC   1
+#define HARMONIC_MODE_SPRINT    -1
+#define HARMONIC_MODE_FAILED    -2
+#define HARMONIC_MODE_DONE      -3
+#define HARMONIC_MODE_VOTE_ONLY -4
+
+/* FD_PACK_HARMONIC_VOTE_TAIL_NS: last portion of the leader slot reserved for
+   vote-only / sprint after harmonic block ingestion.  Ingestion cutoff is
+   slot_end_ns - VOTE_TAIL_NS (see pack tile). */
+#define FD_PACK_HARMONIC_VOTE_TAIL_NS ( 20000000L )
+
+/* fd_pack_harmonic_state: Returns the current harmonic state. */
+FD_FN_PURE int fd_pack_harmonic_state( fd_pack_t const * pack );
+
+/* fd_pack_harmonic_done: Returns 1 if in DONE state (slot should end), 0 otherwise. */
+FD_FN_PURE int fd_pack_harmonic_done( fd_pack_t const * pack );
+
+/* fd_pack_harmonic_pending_cnt: Returns number of pending block txns */
+FD_FN_PURE ulong fd_pack_harmonic_pending_cnt( fd_pack_t const * pack );
+
+/* fd_pack_harmonic_inflight_cnt: Returns number of in-flight block txns */
+FD_FN_PURE ulong fd_pack_harmonic_inflight_cnt( fd_pack_t const * pack );
+
+/* fd_pack_harmonic_pool_full: Returns 1 if treap pool is exhausted */
+FD_FN_PURE int fd_pack_harmonic_pool_full( fd_pack_t const * pack );
+
+/* Block end failure flags (bitset).  Success is implied when flags==0.
+   Multiple failures can occur (e.g., harmonic timeout followed by vote drain failure). */
+#define FD_PACK_END_FLAG_HARMONIC_TIMEOUT (1<<0)  /* Harmonic block never fully arrived */
+#define FD_PACK_END_FLAG_VOTE_DRAIN       (1<<1)  /* Post-harmonic vote scheduling failed */
+
+/* fd_pack_harmonic_end_flags: Returns bitset of failure flags, or 0 for success.
+   Reset by fd_pack_end_block. */
+FD_FN_PURE int fd_pack_harmonic_end_flags( fd_pack_t const * pack );
+
+/* fd_pack_harmonic_signal_fail: Signal that the harmonic block failed
+   upstream (verify, dedup, or resolv detected a failure).  If the
+   failed_slot matches the current harmonic_block_slot and we are in
+   HARMONIC or UNDECIDED state, transition immediately to SPRINT mode
+   so votes and normal transactions can be scheduled.  No-op if already
+   in SPRINT/FAILED/DONE or if the slot doesn't match. */
+void fd_pack_harmonic_signal_fail( fd_pack_t * pack, ulong failed_slot );
+
+/* fd_pack_harmonic_state_crank: Crank the multi-message harmonic state
+   machine. Handles between-message waiting, cutoff transitions, and
+   slot end detection. See fd_pack.c for full state transition docs. */
+void fd_pack_harmonic_state_crank( fd_pack_t * pack,
+                                     long        approx_wallclock_ns,
+                                     long        harmonic_threshold_ns,
+                                     long        harmonic_cutoff_ns,
+                                     int         past_end_time,
+                                     ulong       pending_votes,
+                                     ulong       schedule_cnt,
+                                     int         tried_votes );
+
+void const *
+fd_pack_peek_harmonic_meta( fd_pack_t const * pack );
 
 
 /* fd_pack_rebate_cus adjusts the compute unit accounting for the

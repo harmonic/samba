@@ -424,12 +424,16 @@ struct fd_config {
       int  enabled;
       char url[ 256 ];
       char tls_domain_name[ 256 ];
+      char tpu_url[ 256 ];
+      char tpu_tls_domain_name[ 256 ];
       char tip_distribution_program_addr[ FD_BASE58_ENCODED_32_SZ ];
       char tip_payment_program_addr[ FD_BASE58_ENCODED_32_SZ ];
       char tip_distribution_authority[ FD_BASE58_ENCODED_32_SZ ];
       uint commission_bps;
       ulong keepalive_interval_millis;
       int   tls_cert_verify;
+      /* Harmonic config */
+      int  harmonic_block_mode;
     } bundle;
 
     struct {
