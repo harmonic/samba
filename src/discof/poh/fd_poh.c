@@ -1,4 +1,6 @@
 #include "fd_poh.h"
+#include "../../ballet/bmtree/fd_bmtree.h"
+#include "../../disco/pack/fd_pack.h"
 
 /* The PoH implementation is at its core a state machine ...
 
@@ -759,3 +761,4 @@ fd_poh1_mixin( fd_poh_t *          poh,
 
   publish_microblock( poh, stem, slot, hashcnt_delta, txn_cnt, txns );
 }
+

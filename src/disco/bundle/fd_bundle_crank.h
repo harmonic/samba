@@ -49,20 +49,26 @@ typedef struct fd_bundle_crank_gen_private fd_bundle_crank_gen_t;
    however, merkle_root_authority_addr must point to a valid 32-byte
    region.
 
-   schedule_mode is an ASCII cstr that describe what schedule mode is
-   currently in use.  It is useful for metrics aggregation but otherwise
-   has no effect.  Only the first 3 characters are used on-chain.
-
    Returns mem, which is properly initialized for use in
-   fd_bundle_crank_generate. */
+   fd_bundle_crank_generate.  Use fd_bundle_crank_gen_set_memo to set the
+   on-chain memo tag before generating transactions. */
 fd_bundle_crank_gen_t *
 fd_bundle_crank_gen_init( void                 * mem,
                           fd_acct_addr_t const * tip_distribution_program_addr,
                           fd_acct_addr_t const * tip_payment_program_addr,
                           fd_acct_addr_t const * validator_vote_acct_addr,
                           fd_acct_addr_t const * merkle_root_authority_addr,
-                          char const           * schedule_mode,
                           ulong                  commission_bps );
+
+
+/* fd_bundle_crank_gen_set_memo sets the 3-byte memo instruction payload
+   on both crank transaction templates.  memo must point to at least 3
+   bytes (typically a harmonic strategy tag such as FBA, MRV, or FIF, or a
+   pack schedule tag such as PRF or BAL on harmonic fallback). */
+
+void
+fd_bundle_crank_gen_set_memo( fd_bundle_crank_gen_t * gen,
+                              char const            * memo );
 
 
 /* fd_bundle_crank_get_addresses returns the account addresses that need

@@ -62,6 +62,11 @@ test_replay_frag_ingest( void ) {
   ctx->replay_in.chunk0 = 0UL;
   ctx->replay_in.wmark  = 1UL; /* allow chunk 0 and 1 */
 
+  /* In the Firedancer (ffire) topology, replay_out doubles as the leader
+     link, so leader_in aliases the same in_idx. */
+  ctx->leader_in.idx      = in_idx;
+  ctx->leader_in_is_replay = 1;
+
   ctx->next_leader_slot = ULONG_MAX;
   ctx->reset_slot       = ULONG_MAX;
 
@@ -71,11 +76,14 @@ test_replay_frag_ingest( void ) {
   FD_TEST( ctx->next_leader_slot==500UL );
   FD_TEST( ctx->reset_slot==100UL );
 
-  /* A non-reset signal should be ignored */
+  /* A non-reset signal should be ignored.  Must not use
+     REPLAY_SIG_BECAME_LEADER: that sig is handled by the leader_in path,
+     which aliases this same in_idx when leader_in_is_replay is set. */
   ulong prev_next = ctx->next_leader_slot;
   ulong prev_rst  = ctx->reset_slot;
-  during_frag( ctx, in_idx, 0UL, REPLAY_SIG_RESET+1, 0UL, sizeof(fd_poh_reset_t), 0UL );
-  after_frag( ctx, in_idx, 0UL, REPLAY_SIG_RESET+1, sizeof(fd_poh_reset_t), 0UL, 0UL, NULL );
+  FD_STATIC_ASSERT( REPLAY_SIG_ROOT_ADVANCED!=REPLAY_SIG_RESET && REPLAY_SIG_ROOT_ADVANCED!=REPLAY_SIG_BECAME_LEADER, replay_sig );
+  during_frag( ctx, in_idx, 0UL, REPLAY_SIG_ROOT_ADVANCED, 0UL, sizeof(fd_poh_reset_t), 0UL );
+  after_frag( ctx, in_idx, 0UL, REPLAY_SIG_ROOT_ADVANCED, sizeof(fd_poh_reset_t), 0UL, 0UL, NULL );
   FD_TEST( ctx->next_leader_slot==prev_next );
   FD_TEST( ctx->reset_slot==prev_rst );
 
@@ -285,6 +293,11 @@ test_replay_triggers_sleep_transition( void ) {
   ctx->replay_in.mem     = wksp;
   ctx->replay_in.chunk0  = 0UL;
   ctx->replay_in.wmark   = 1UL;
+
+  /* In the Firedancer (ffire) topology, replay_out doubles as the leader
+     link, so leader_in aliases the same in_idx. */
+  ctx->leader_in.idx      = in_idx;
+  ctx->leader_in_is_replay = 1;
 
   /* Start asleep (mimicking has_replay_in initial state) */
   ctx->next_leader_slot  = ULONG_MAX;
