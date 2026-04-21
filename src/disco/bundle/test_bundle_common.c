@@ -171,6 +171,45 @@ test_bundle_env_mock_conn( test_bundle_env_t * env ) {
   FD_TEST( fd_h2_rbuf_free_sz( ctx->grpc_client->frame_tx )>=2048UL );
 }
 
+/* ========== Harmonic block mode helpers ========== */
+
+/* Enable harmonic block mode.  Since blocks now share the same connection
+   as bundles, this just sets the flag.  The wksp parameter is kept for
+   backwards compatibility but is not used. */
+FD_FN_UNUSED static void
+test_bundle_env_enable_harmonic_block_mode( test_bundle_env_t * env,
+                                            fd_wksp_t *         wksp ) {
+  (void)wksp;
+  fd_bundle_tile_t * ctx = env->state;
+  ctx->harmonic_block_mode = 1;
+}
+
+/* Mock the harmonic block stream being active.
+   Uses the main grpc_client since blocks share the bundle connection. */
+FD_FN_UNUSED static void
+test_bundle_env_mock_harmonic_block_stream( fd_bundle_tile_t * ctx ) {
+  ctx->harmonic_block_subscription_live = 1;
+
+  fd_grpc_h2_stream_t * stream = fd_grpc_client_stream_acquire( ctx->grpc_client, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks );
+  FD_TEST( stream );
+  stream->hdrs.h2_status     = 200;
+  stream->hdrs.is_grpc_proto = 1;
+}
+
+/* Mock the full connection state for harmonic blocks.
+   Since blocks share the bundle connection, this just sets up the stream. */
+FD_FN_UNUSED static void
+test_bundle_env_mock_harmonic_block_conn( test_bundle_env_t * env ) {
+  fd_bundle_tile_t * ctx = env->state;
+  test_bundle_env_mock_harmonic_block_stream( ctx );
+}
+
+/* Cleanup is a no-op since blocks share the bundle connection. */
+FD_FN_UNUSED static void
+test_bundle_env_cleanup_harmonic_block( test_bundle_env_t * env ) {
+  (void)env;
+}
+
 static void
 test_bundle_env_destroy( test_bundle_env_t * env ) {
   if( env && env->server_sock>=0 ) {
@@ -181,6 +220,8 @@ test_bundle_env_destroy( test_bundle_env_t * env ) {
     FD_TEST( 0==close( env->state->tcp_sock ) );
     env->state->tcp_sock = -1;
   }
+  /* Clean up harmonic block mode resources */
+  test_bundle_env_cleanup_harmonic_block( env );
   fd_wksp_free_laddr( fd_mcache_delete( fd_mcache_leave( env->out_mcache ) ) );
   fd_wksp_free_laddr( fd_dcache_delete( fd_dcache_leave( env->out_dcache ) ) );
   fd_wksp_free_laddr( env->state->grpc_client_mem );

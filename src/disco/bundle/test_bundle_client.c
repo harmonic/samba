@@ -1,5 +1,6 @@
 #include "test_bundle_common.c"
 #include "proto/block_engine.pb.h"
+#include "proto/packet.pb.h"
 #include "../../ballet/base58/fd_base58.h"
 #include "../../ballet/nanopb/pb_encode.h"
 
@@ -58,13 +59,8 @@ test_bundle_rx( fd_wksp_t * wksp ) {
   test_bundle_env_destroy( env );
 }
 
-static void
-test_bundle_rx_too_many_txns( fd_wksp_t * wksp ) {
-  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
-  fd_bundle_tile_t * state = env->state;
-
   /*
-  Contains a single bundle with 6 transactions
+  Contains a single bundle with 5/6 transactions
   {
     "bundles": [
       {
@@ -83,7 +79,7 @@ test_bundle_rx_too_many_txns( fd_wksp_t * wksp ) {
                 "sender_stake": 0
               }
             },
-            ...x5
+            ...x5/6
           ]
         },
         "uuid": [0, 0, 0]
@@ -91,16 +87,38 @@ test_bundle_rx_too_many_txns( fd_wksp_t * wksp ) {
     ]
   }
   */
-  static uchar subscribe_bundles_msg_x5[] = {
-    0x0a, 0x52, 0x0a, 0x4b, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12, 0x08,
-    0x08, 0x01, 0x12, 0x00, 0x18, 0x00, 0x28, 0x00, 0x1a, 0x0d, 0x0a,
-    0x01, 0x48, 0x12, 0x08, 0x08, 0x01, 0x12, 0x00, 0x18, 0x00, 0x28,
-    0x00, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12, 0x08, 0x08, 0x01, 0x12,
-    0x00, 0x18, 0x00, 0x28, 0x00, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12,
-    0x08, 0x08, 0x01, 0x12, 0x00, 0x18, 0x00, 0x28, 0x00, 0x1a, 0x0d,
-    0x0a, 0x01, 0x48, 0x12, 0x08, 0x08, 0x01, 0x12, 0x00, 0x18, 0x00,
-    0x28, 0x00, 0x12, 0x03, 0x00, 0x00, 0x00
-  };
+
+/* Reusable test message with 5 transactions in a bundle */
+static uchar subscribe_bundles_msg_x5[] = {
+  0x0a, 0x52, 0x0a, 0x4b, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12, 0x08,
+  0x08, 0x01, 0x12, 0x00, 0x18, 0x00, 0x28, 0x00, 0x1a, 0x0d, 0x0a,
+  0x01, 0x48, 0x12, 0x08, 0x08, 0x01, 0x12, 0x00, 0x18, 0x00, 0x28,
+  0x00, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12, 0x08, 0x08, 0x01, 0x12,
+  0x00, 0x18, 0x00, 0x28, 0x00, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12,
+  0x08, 0x08, 0x01, 0x12, 0x00, 0x18, 0x00, 0x28, 0x00, 0x1a, 0x0d,
+  0x0a, 0x01, 0x48, 0x12, 0x08, 0x08, 0x01, 0x12, 0x00, 0x18, 0x00,
+  0x28, 0x00, 0x12, 0x03, 0x00, 0x00, 0x00
+};
+
+
+
+static uchar subscribe_bundles_msg_x6[] = {
+  0x0a, 0x61, 0x0a, 0x5a, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12, 0x08,
+  0x08, 0x01, 0x12, 0x00, 0x18, 0x00, 0x28, 0x00, 0x1a, 0x0d, 0x0a,
+  0x01, 0x48, 0x12, 0x08, 0x08, 0x01, 0x12, 0x00, 0x18, 0x00, 0x28,
+  0x00, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12, 0x08, 0x08, 0x01, 0x12,
+  0x00, 0x18, 0x00, 0x28, 0x00, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12,
+  0x08, 0x08, 0x01, 0x12, 0x00, 0x18, 0x00, 0x28, 0x00, 0x1a, 0x0d,
+  0x0a, 0x01, 0x48, 0x12, 0x08, 0x08, 0x01, 0x12, 0x00, 0x18, 0x00,
+  0x28, 0x00, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12, 0x08, 0x08, 0x01,
+  0x12, 0x00, 0x18, 0x00, 0x28, 0x00, 0x12, 0x03, 0x00, 0x00, 0x00
+};
+
+static void
+test_bundle_rx_too_many_txns( fd_wksp_t * wksp ) {
+  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
+  fd_bundle_tile_t * state = env->state;
+
 
   state->builder_info_avail = 1;
   fd_bundle_client_grpc_rx_msg(
@@ -115,18 +133,7 @@ test_bundle_rx_too_many_txns( fd_wksp_t * wksp ) {
   test_bundle_env_create( env, wksp );
   state = env->state;
 
-  /* Same as above, now with 6 transactions. Should be a NOP */
-  static uchar subscribe_bundles_msg_x6[] = {
-    0x0a, 0x61, 0x0a, 0x5a, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12, 0x08,
-    0x08, 0x01, 0x12, 0x00, 0x18, 0x00, 0x28, 0x00, 0x1a, 0x0d, 0x0a,
-    0x01, 0x48, 0x12, 0x08, 0x08, 0x01, 0x12, 0x00, 0x18, 0x00, 0x28,
-    0x00, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12, 0x08, 0x08, 0x01, 0x12,
-    0x00, 0x18, 0x00, 0x28, 0x00, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12,
-    0x08, 0x08, 0x01, 0x12, 0x00, 0x18, 0x00, 0x28, 0x00, 0x1a, 0x0d,
-    0x0a, 0x01, 0x48, 0x12, 0x08, 0x08, 0x01, 0x12, 0x00, 0x18, 0x00,
-    0x28, 0x00, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12, 0x08, 0x08, 0x01,
-    0x12, 0x00, 0x18, 0x00, 0x28, 0x00, 0x12, 0x03, 0x00, 0x00, 0x00
-  };
+  /* Same as above, now with 6 transactions. Should be a NOP for bundles */
 
   state->builder_info_avail = 1;
   fd_bundle_client_grpc_rx_msg(
@@ -775,6 +782,486 @@ test_bundle_client_subscribe_packets( fd_wksp_t * wksp ) {
   FD_TEST( state->packet_subscription_wait==0 );
 
   test_bundle_env_destroy( env );
+}
+
+/* ========== Harmonic block tests ========== */
+
+/* Helper to encode a block message with given slot and txn count.
+   Returns the size of the encoded message. */
+static ulong
+encode_block_msg( uchar * buf, ulong buf_sz, ulong slot, ulong txn_cnt, ulong txn_sz ) {
+  /* Slot as string */
+  char slot_str[21];
+  ulong slot_str_len = 0;
+  ulong s = slot;
+  if( s==0 ) {
+    slot_str[slot_str_len++] = '0';
+  } else {
+    char tmp[21];
+    ulong tmp_len = 0;
+    while( s ) {
+      tmp[tmp_len++] = (char)('0' + (s % 10));
+      s /= 10;
+    }
+    for( ulong i=0; i<tmp_len; i++ ) {
+      slot_str[slot_str_len++] = tmp[tmp_len-1-i];
+    }
+  }
+  slot_str[slot_str_len] = '\0';
+
+  /* Create a single packet proto */
+  uchar single_pkt[2100];
+  pb_ostream_t pkt_stream = pb_ostream_from_buffer( single_pkt, sizeof(single_pkt) );
+  packet_Packet pkt = packet_Packet_init_default;
+  pkt.data.size = (pb_size_t)txn_sz;
+  memset( pkt.data.bytes, 0x42, txn_sz );
+  pkt.has_meta = 0;
+  if( !pb_encode( &pkt_stream, &packet_Packet_msg, &pkt ) ) {
+    FD_LOG_WARNING(( "pb_encode failed: %s", PB_GET_ERROR(&pkt_stream) ));
+    return 0;
+  }
+  ulong single_pkt_sz = pkt_stream.bytes_written;
+
+  /* Calculate Bundle size */
+  ulong bundle_content_sz = 0;
+  for( ulong i=0; i<txn_cnt; i++ ) {
+    bundle_content_sz += 1;  /* field tag 0x1a */
+    ulong sz = single_pkt_sz;
+    do { bundle_content_sz++; sz >>= 7; } while( sz );
+    bundle_content_sz += single_pkt_sz;
+  }
+
+  /* Calculate BundleUuid size */
+  ulong bundle_uuid_content_sz = 0;
+  bundle_uuid_content_sz += 1;  /* field tag 0x0a */
+  ulong sz = bundle_content_sz;
+  do { bundle_uuid_content_sz++; sz >>= 7; } while( sz );
+  bundle_uuid_content_sz += bundle_content_sz;
+  bundle_uuid_content_sz += 1;  /* field tag 0x12 */
+  sz = slot_str_len;
+  do { bundle_uuid_content_sz++; sz >>= 7; } while( sz );
+  bundle_uuid_content_sz += slot_str_len;
+
+  /* Helper macro to encode a varint */
+  #define ENCODE_VARINT(val) do { \
+    ulong _v = (val); \
+    while( _v >= 0x80 ) { \
+      *ptr++ = (uchar)((_v & 0x7F) | 0x80); \
+      _v >>= 7; \
+    } \
+    *ptr++ = (uchar)_v; \
+  } while(0)
+
+  /* Encode */
+  uchar * ptr = buf;
+  uchar * const end = buf + buf_sz;
+
+  /* Field 1: bundles */
+  *ptr++ = 0x0a;
+  ENCODE_VARINT( bundle_uuid_content_sz );
+
+  /* BundleUuid.bundle (field 1) */
+  *ptr++ = 0x0a;
+  ENCODE_VARINT( bundle_content_sz );
+
+  /* Bundle.packets */
+  for( ulong i=0; i<txn_cnt; i++ ) {
+    if( ptr + single_pkt_sz + 10 >= end ) {
+      FD_LOG_WARNING(( "Buffer overflow at packet %lu", i ));
+      return 0;
+    }
+    *ptr++ = 0x1a;
+    ENCODE_VARINT( single_pkt_sz );
+    memcpy( ptr, single_pkt, single_pkt_sz );
+    ptr += single_pkt_sz;
+  }
+
+  /* BundleUuid.uuid (field 2) */
+  *ptr++ = 0x12;
+  ENCODE_VARINT( slot_str_len );
+
+  #undef ENCODE_VARINT
+  memcpy( ptr, slot_str, slot_str_len );
+  ptr += slot_str_len;
+
+  return (ulong)(ptr - buf);
+}
+
+/* Static buffer for block message with slot 12345678 */
+static uchar subscribe_blocks_msg_slot_12345678[256];
+static ulong subscribe_blocks_msg_slot_12345678_sz = 0;
+
+/* Static buffer for block message with slot 99999999 */
+static uchar subscribe_blocks_msg_slot_99999999[512];
+static ulong subscribe_blocks_msg_slot_99999999_sz = 0;
+
+/* Initialize the block test messages (call once at start of tests) */
+static void
+init_block_test_messages( void ) {
+  /* 2 txns, 1 byte each, slot=12345678 */
+  subscribe_blocks_msg_slot_12345678_sz = encode_block_msg(
+      subscribe_blocks_msg_slot_12345678, sizeof(subscribe_blocks_msg_slot_12345678),
+      12345678UL, 2UL, 1UL );
+  FD_TEST( subscribe_blocks_msg_slot_12345678_sz > 0 );
+
+  /* 6 txns, 1 byte each, slot=99999999 */
+  subscribe_blocks_msg_slot_99999999_sz = encode_block_msg(
+      subscribe_blocks_msg_slot_99999999, sizeof(subscribe_blocks_msg_slot_99999999),
+      99999999UL, 6UL, 1UL );
+  FD_TEST( subscribe_blocks_msg_slot_99999999_sz > 0 );
+}
+
+/* Test that harmonic blocks correctly parse slot from uuid and tag txn_m */
+static void
+test_harmonic_block_slot_parsing( fd_wksp_t * wksp ) {
+  FD_LOG_NOTICE(( "Testing harmonic block slot parsing from uuid" ));
+  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
+  test_bundle_env_enable_harmonic_block_mode( env, wksp );
+  test_bundle_env_mock_harmonic_block_conn( env );
+  fd_bundle_tile_t * state = env->state;
+
+  state->builder_info_avail = 1;
+
+  /* Receive block with slot=12345678 */
+  fd_bundle_client_grpc_callbacks.rx_msg(
+      state,
+      subscribe_blocks_msg_slot_12345678, subscribe_blocks_msg_slot_12345678_sz,
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+  );
+
+  /* Verify slot was parsed correctly */
+  FD_TEST( state->harmonic_block_slot==12345678UL );
+  FD_TEST( state->harmonic_block_received_cnt==1UL );
+  FD_TEST( state->harmonic_block_txn_received_cnt==2UL );
+
+  /* Verify txn_m is tagged with correct slot */
+  fd_txn_m_t * txnm0 = fd_chunk_to_laddr( env->out_dcache, 0UL );
+  FD_TEST( txnm0->reference_slot==0UL );  /* resolv will populate from blockhash */
+  FD_TEST( txnm0->block_engine.block_slot==12345678UL );
+  FD_TEST( txnm0->source_tpu==FD_TXN_M_TPU_SOURCE_HARMONIC );
+
+  FD_LOG_NOTICE(( "Harmonic block slot parsing test passed (slot=12345678)" ));
+  test_bundle_env_destroy( env );
+}
+
+/* Test that harmonic blocks can have > 5 transactions (unlike regular bundles) */
+static void
+test_harmonic_block_rx_many_txns( fd_wksp_t * wksp ) {
+  FD_LOG_NOTICE(( "Testing harmonic block rx with many txns (no len=5 limit)" ));
+  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
+  test_bundle_env_enable_harmonic_block_mode( env, wksp );
+  test_bundle_env_mock_harmonic_block_conn( env );
+  fd_bundle_tile_t * state = env->state;
+
+  state->builder_info_avail = 1;
+
+  /* Test 6 transactions - should SUCCEED for harmonic blocks (no len=5 limit) */
+  fd_bundle_client_grpc_callbacks.rx_msg(
+      state,
+      subscribe_blocks_msg_slot_99999999, subscribe_blocks_msg_slot_99999999_sz,
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+  );
+
+  FD_TEST( state->harmonic_block_slot==99999999UL );
+  FD_TEST( state->harmonic_block_received_cnt==1UL );
+  FD_TEST( state->harmonic_block_txn_received_cnt==6UL );
+
+  /* Verify txn_m is tagged with correct slot */
+  fd_txn_m_t * txnm0 = fd_chunk_to_laddr( env->out_dcache, 0UL );
+  FD_TEST( txnm0->reference_slot==0UL );  /* resolv will populate from blockhash */
+  FD_TEST( txnm0->block_engine.block_slot==99999999UL );
+  FD_TEST( txnm0->source_tpu==FD_TXN_M_TPU_SOURCE_HARMONIC );
+
+  FD_LOG_NOTICE(( "Harmonic block rx many txns test passed (6 txns ok, slot=99999999)" ));
+  test_bundle_env_destroy( env );
+}
+
+/* Test ingestion from all 3 sources: packets, bundles, and harmonic blocks */
+static void
+test_all_three_sources( fd_wksp_t * wksp ) {
+  FD_LOG_NOTICE(( "Testing all 3 sources: packets, bundles, and harmonic blocks" ));
+  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
+  test_bundle_env_enable_harmonic_block_mode( env, wksp );
+  test_bundle_env_mock_harmonic_block_conn( env );
+  fd_bundle_tile_t * state = env->state;
+
+  state->builder_info_avail = 1;
+
+  /* Wipe timestamps */
+  for( ulong i=0UL; i<(env->stem_depths[0]); i++ ) {
+    env->out_mcache[ i ].tsorig = 0U;
+    env->out_mcache[ i ].tspub  = 0U;
+  }
+
+  /* 1. Receive packets (2 packets) */
+  static uchar subscribe_packets_msg[] = {
+    0x12, 0x13, 0x0a, 0x07, 0x0a, 0x01, 0x48, 0x12,
+    0x02, 0x08, 0x01, 0x0a, 0x08, 0x0a, 0x02, 0x48,
+    0x48, 0x12, 0x02, 0x08, 0x02
+  };
+  fd_bundle_client_grpc_rx_msg(
+      state,
+      subscribe_packets_msg, sizeof(subscribe_packets_msg),
+      FD_BUNDLE_CLIENT_REQ_Bundle_SubscribePackets
+  );
+  FD_TEST( state->metrics.packet_received_cnt==2UL );
+
+  /* 2. Receive bundles (5 txns) */
+  fd_bundle_client_grpc_rx_msg(
+      state,
+      subscribe_bundles_msg_x5, sizeof(subscribe_bundles_msg_x5),
+      FD_BUNDLE_CLIENT_REQ_Bundle_SubscribeBundles
+  );
+  FD_TEST( state->metrics.bundle_received_cnt==1UL );
+
+  /* 3. Receive harmonic blocks (6 txns - allowed for blocks, slot=99999999) */
+  fd_bundle_client_grpc_callbacks.rx_msg(
+      state,
+      subscribe_blocks_msg_slot_99999999, subscribe_blocks_msg_slot_99999999_sz,
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+  );
+  FD_TEST( state->harmonic_block_received_cnt==1UL );
+  FD_TEST( state->harmonic_block_txn_received_cnt==6UL );
+  FD_TEST( state->harmonic_block_slot==99999999UL );
+
+  /* Verify total transactions published: 2 packets + 5 bundle txns + 6 block txns = 13 */
+  ulong txn_cnt = 0UL;
+  for( ulong i=0UL; i<(env->stem_depths[0]); i++ ) {
+    txn_cnt += env->out_mcache[ i ].tspub!=0U;
+  }
+  FD_TEST( txn_cnt==13UL );
+
+  FD_LOG_NOTICE(( "All 3 sources test passed (2 packets + 5 bundle txns + 6 block txns = 13)" ));
+  test_bundle_env_destroy( env );
+}
+
+/* Test that harmonic blocks and bundles can be received interleaved */
+static void
+test_interleaved_sources( fd_wksp_t * wksp ) {
+  FD_LOG_NOTICE(( "Testing interleaved bundles and harmonic blocks" ));
+  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
+  test_bundle_env_enable_harmonic_block_mode( env, wksp );
+  test_bundle_env_mock_harmonic_block_conn( env );
+  fd_bundle_tile_t * state = env->state;
+
+  state->builder_info_avail = 1;
+
+  /* Wipe timestamps */
+  for( ulong i=0UL; i<(env->stem_depths[0]); i++ ) {
+    env->out_mcache[ i ].tsorig = 0U;
+    env->out_mcache[ i ].tspub  = 0U;
+  }
+
+  /* Interleave: bundle -> harmonic block -> bundle -> harmonic block */
+
+  /* Bundle 1 (5 txns) */
+  fd_bundle_client_grpc_rx_msg(
+      state,
+      subscribe_bundles_msg_x5, sizeof(subscribe_bundles_msg_x5),
+      FD_BUNDLE_CLIENT_REQ_Bundle_SubscribeBundles
+  );
+  FD_TEST( state->metrics.bundle_received_cnt==1UL );
+
+  /* Harmonic block 1 (6 txns, slot=99999999) */
+  fd_bundle_client_grpc_callbacks.rx_msg(
+      state,
+      subscribe_blocks_msg_slot_99999999, subscribe_blocks_msg_slot_99999999_sz,
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+  );
+  FD_TEST( state->harmonic_block_received_cnt==1UL );
+  FD_TEST( state->harmonic_block_slot==99999999UL );
+
+  /* Bundle 2 (5 txns) */
+  fd_bundle_client_grpc_rx_msg(
+      state,
+      subscribe_bundles_msg_x5, sizeof(subscribe_bundles_msg_x5),
+      FD_BUNDLE_CLIENT_REQ_Bundle_SubscribeBundles
+  );
+  FD_TEST( state->metrics.bundle_received_cnt==2UL );
+
+  /* Harmonic block 2 (2 txns, slot=12345678) */
+  fd_bundle_client_grpc_callbacks.rx_msg(
+      state,
+      subscribe_blocks_msg_slot_12345678, subscribe_blocks_msg_slot_12345678_sz,
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+  );
+  FD_TEST( state->harmonic_block_received_cnt==2UL );
+  FD_TEST( state->harmonic_block_slot==12345678UL );
+
+  /* Verify counts: 5 + 6 + 5 + 2 = 18 txns */
+  ulong txn_cnt = 0UL;
+  for( ulong i=0UL; i<(env->stem_depths[0]); i++ ) {
+    txn_cnt += env->out_mcache[ i ].tspub!=0U;
+  }
+  FD_TEST( txn_cnt==18UL );
+
+  FD_LOG_NOTICE(( "Interleaved sources test passed (5 + 6 + 5 + 2 = 18 txns)" ));
+  test_bundle_env_destroy( env );
+}
+
+/* Test oversized block: 50,000 transactions, 600 bytes each.
+   This tests that blocks have no len=5 limit and can handle large payloads. */
+static void
+test_harmonic_block_oversized( fd_wksp_t * wksp ) {
+  (void)wksp;  /* Use a separate larger workspace for this test */
+  FD_LOG_NOTICE(( "Testing oversized harmonic block (50000 txns x 600 bytes)" ));
+
+  ulong const txn_cnt  = 50000UL;
+  ulong const txn_sz   = 600UL;
+  ulong const slot     = 123456789UL;
+
+  /* Slot as string: "123456789" (9 chars) */
+  char const slot_str[] = "123456789";
+  ulong const slot_str_len = sizeof(slot_str) - 1UL;
+
+  /* Calculate buffer size needed for the protobuf message.
+     Each packet in protobuf is roughly:
+     - 2 bytes: field tag + length prefix for data
+     - txn_sz bytes: data
+     - ~12 bytes: meta fields
+     Plus overhead for BundleUuid, Bundle wrapper, etc. */
+  ulong const pkt_overhead = 20UL;
+  ulong const msg_sz = txn_cnt * (txn_sz + pkt_overhead) + 256UL;
+
+  /* Create a larger workspace for this test (~40MB message + overhead) */
+  ulong cpu_idx = fd_tile_cpu_id( fd_tile_idx() );
+  if( cpu_idx>fd_shmem_cpu_cnt() ) cpu_idx = 0UL;
+  // fd_wksp_t * big_wksp = fd_wksp_new_anonymous(
+  //     fd_cstr_to_shmem_page_sz( "gigantic" ),
+  //     2UL,  /* 2 gigantic pages = 2GB, but will only use what we need */
+  //     fd_shmem_cpu_idx( fd_shmem_numa_idx( cpu_idx ) ),
+  //     "big_wksp", 16UL );
+  // if( !big_wksp ) {
+    /* Fall back to huge pages if gigantic not available */
+  fd_wksp_t * big_wksp = fd_wksp_new_anonymous(
+        fd_cstr_to_shmem_page_sz( "huge" ),
+        32UL,  /* 32 huge pages = 64MB */
+        fd_shmem_cpu_idx( fd_shmem_numa_idx( cpu_idx ) ),
+        "big_wksp", 16UL );
+  // }
+  FD_TEST( big_wksp );
+
+  uchar * msg_buf = fd_wksp_alloc_laddr( big_wksp, 1UL, msg_sz, 1UL );
+  FD_TEST( msg_buf );
+
+  /* Build the protobuf message manually for efficiency.
+     Structure: SubscribeBundlesResponse { bundles: [ BundleUuid { bundle: Bundle { packets: [...] }, uuid: "123456789" } ] } */
+
+  uchar * ptr = msg_buf;
+  uchar * const msg_end = msg_buf + msg_sz;
+
+  /* Build packets data first to know sizes */
+  uchar txn_data[600];
+  memset( txn_data, 0x42, txn_sz );  /* Fill with 0x42 */
+
+  /* Create a single packet proto (will be repeated) */
+  uchar single_pkt[700];
+  pb_ostream_t pkt_stream = pb_ostream_from_buffer( single_pkt, sizeof(single_pkt) );
+  packet_Packet pkt = packet_Packet_init_default;
+  pkt.data.size = (pb_size_t)txn_sz;
+  memcpy( pkt.data.bytes, txn_data, txn_sz );
+  pkt.has_meta = 0;
+  FD_TEST( pb_encode( &pkt_stream, &packet_Packet_msg, &pkt ) );
+  ulong single_pkt_sz = pkt_stream.bytes_written;
+
+  /* Calculate Bundle size (packets field is repeated, field tag=3) */
+  ulong pkt_varint_len = 0; { ulong v = single_pkt_sz; do { pkt_varint_len++; v >>= 7; } while( v ); }
+  ulong bundle_content_sz = txn_cnt * (1UL + pkt_varint_len + single_pkt_sz);
+
+  /* Calculate varint length for bundle_content_sz */
+  ulong bundle_varint_len = 0; { ulong v = bundle_content_sz; do { bundle_varint_len++; v >>= 7; } while( v ); }
+
+  /* Calculate varint length for slot_str_len */
+  ulong slot_varint_len = 0; { ulong v = slot_str_len; do { slot_varint_len++; v >>= 7; } while( v ); }
+
+  /* Calculate BundleUuid size */
+  ulong bundle_uuid_content_sz = 0UL;
+  bundle_uuid_content_sz += 1UL;  /* field 1 tag */
+  bundle_uuid_content_sz += bundle_varint_len;
+  bundle_uuid_content_sz += bundle_content_sz;
+  bundle_uuid_content_sz += 1UL;  /* field 2 tag */
+  bundle_uuid_content_sz += slot_varint_len;
+  bundle_uuid_content_sz += slot_str_len;
+
+  /* Encode SubscribeBundlesResponse { bundles: [ ... ] } */
+  /* Field 1: bundles (repeated BundleUuid) */
+  *ptr++ = 0x0a;  /* field 1, wire type 2 (length-delimited) */
+
+  /* Encode varint for bundle_uuid size */
+  ulong remaining = bundle_uuid_content_sz;
+  while( remaining >= 0x80 ) {
+    *ptr++ = (uchar)((remaining & 0x7F) | 0x80);
+    remaining >>= 7;
+  }
+  *ptr++ = (uchar)remaining;
+
+  /* BundleUuid { bundle: Bundle, uuid: string } */
+  /* Field 1: bundle */
+  *ptr++ = 0x0a;  /* field 1, wire type 2 */
+
+  /* Encode varint for bundle size */
+  remaining = bundle_content_sz;
+  while( remaining >= 0x80 ) {
+    *ptr++ = (uchar)((remaining & 0x7F) | 0x80);
+    remaining >>= 7;
+  }
+  *ptr++ = (uchar)remaining;
+
+  /* Bundle { packets: [...] } - encode 50000 packets */
+  for( ulong i=0; i<txn_cnt; i++ ) {
+    FD_TEST( ptr + single_pkt_sz + 3 < msg_end );
+    *ptr++ = 0x1a;  /* field 3 (packets), wire type 2 */
+    /* Encode varint for packet size */
+    remaining = single_pkt_sz;
+    while( remaining >= 0x80 ) {
+      *ptr++ = (uchar)((remaining & 0x7F) | 0x80);
+      remaining >>= 7;
+    }
+    *ptr++ = (uchar)remaining;
+    memcpy( ptr, single_pkt, single_pkt_sz );
+    ptr += single_pkt_sz;
+  }
+
+  /* Field 2: uuid */
+  *ptr++ = 0x12;  /* field 2, wire type 2 */
+  *ptr++ = (uchar)slot_str_len;
+  memcpy( ptr, slot_str, slot_str_len );
+  ptr += slot_str_len;
+
+  ulong actual_msg_sz = (ulong)(ptr - msg_buf);
+  FD_LOG_NOTICE(( "Encoded oversized block message: %lu bytes", actual_msg_sz ));
+
+  /* Now test receiving this block - use the big workspace */
+  test_bundle_env_t env[1]; test_bundle_env_create( env, big_wksp );
+  test_bundle_env_enable_harmonic_block_mode( env, big_wksp );
+  test_bundle_env_mock_harmonic_block_conn( env );
+  fd_bundle_tile_t * state = env->state;
+
+  state->builder_info_avail = 1;
+
+  fd_bundle_client_grpc_callbacks.rx_msg(
+      state,
+      msg_buf, actual_msg_sz,
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+  );
+
+  /* Verify slot was parsed correctly */
+  FD_TEST( state->harmonic_block_slot==slot );
+  FD_TEST( state->harmonic_block_received_cnt==1UL );
+  FD_TEST( state->harmonic_block_txn_received_cnt==txn_cnt );
+
+  /* Verify first txn_m is tagged correctly */
+  fd_txn_m_t * txnm0 = fd_chunk_to_laddr( env->out_dcache, 0UL );
+  FD_TEST( txnm0->reference_slot==0UL );  /* resolv will populate from blockhash */
+  FD_TEST( txnm0->block_engine.block_slot==slot );
+  FD_TEST( txnm0->source_tpu==FD_TXN_M_TPU_SOURCE_HARMONIC );
+  FD_TEST( txnm0->payload_sz==txn_sz );
+
+  FD_LOG_NOTICE(( "Oversized harmonic block test passed (%lu txns x %lu bytes, slot=%lu)", txn_cnt, txn_sz, slot ));
+
+  test_bundle_env_destroy( env );
+  fd_wksp_free_laddr( msg_buf );
+  fd_wksp_delete_anonymous( big_wksp );
 }
 
 /* Verify that the client subscribes to bundles */
@@ -1477,6 +1964,105 @@ test_deque_overflow_guard( fd_wksp_t * wksp ) {
   test_bundle_env_destroy( env );
 }
 
+/* Verify that the client submits leader window info */
+
+static void
+test_bundle_client_submit_leader_window_info( fd_wksp_t * wksp ) {
+  test_bundle_env_t env[1];
+  test_bundle_env_create( env, wksp );
+  test_bundle_env_mock_conn( env );
+  fd_bundle_tile_t * const state       = env->state;
+  fd_grpc_client_t * const grpc_client = state->grpc_client;
+
+  FD_TEST( state->submit_leader_window_info_wait==0 );
+
+  /* But it's blocked on stream count ... */
+  FD_TEST( fd_grpc_client_request_is_blocked( state->grpc_client )==0 );
+  FD_TEST( state->grpc_client->stream_cnt==2 );
+  state->grpc_client->conn->peer_settings.max_concurrent_streams = 2;
+  FD_TEST( fd_grpc_client_request_is_blocked( state->grpc_client )==1 );
+  long const test_timestamp_ns = 1234567890123456789L;
+  ulong const test_slot = 999999UL;
+  fd_bundle_client_submit_leader_window_info( state, test_slot, test_timestamp_ns );
+  FD_TEST( state->submit_leader_window_info_wait==0 );
+
+  /* Unblock it ... */
+  state->grpc_client->conn->peer_settings.max_concurrent_streams = 3;
+  FD_TEST( fd_grpc_client_request_is_blocked( state->grpc_client )==0 );
+  fd_bundle_client_submit_leader_window_info( state, test_slot, test_timestamp_ns );
+  FD_TEST( state->submit_leader_window_info_wait==1 );
+
+  /* Get newly created stream */
+  FD_TEST( !grpc_client->request_stream ); /* request instantly flushed */
+  ulong const stream_id = state->grpc_client->stream_ids[ 2 ];
+  fd_grpc_h2_stream_t * stream = &state->grpc_client->stream_pool[ 2 ];
+  FD_TEST( stream->s.stream_id==stream_id );
+  FD_TEST( stream->request_ctx==FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo );
+
+  /* Request header */
+  char const * const hdrs[] = {
+    ":method",      "POST",
+    ":scheme",      "https",
+    ":path",        "/block_engine.BlockEngineValidator/SubmitLeaderWindowInfo",
+    "te",           "trailers",
+    "content-type", "application/grpc+proto",
+    "user-agent",   "grpc-firedancer/0.0.0",
+    NULL
+  };
+  expect_h2_hdr( grpc_client->frame_tx, stream_id, hdrs );
+
+  /* Request body */
+  fd_h2_frame_hdr_t frame_hdr;
+  FD_TEST( fd_h2_rbuf_used_sz( grpc_client->frame_tx )>=sizeof(fd_h2_frame_hdr_t) );
+  fd_h2_rbuf_pop_copy( grpc_client->frame_tx, &frame_hdr, sizeof(fd_h2_frame_hdr_t) );
+  FD_TEST( fd_h2_frame_type( frame_hdr.typlen )==FD_H2_FRAME_TYPE_DATA );
+  FD_TEST( fd_uint_bswap( frame_hdr.r_stream_id )==stream_id );
+  FD_TEST( frame_hdr.flags==FD_H2_FLAG_END_STREAM );
+  fd_grpc_hdr_t grpc_hdr;
+  FD_TEST( fd_h2_rbuf_used_sz( grpc_client->frame_tx )>=sizeof(fd_grpc_hdr_t) );
+  fd_h2_rbuf_pop_copy( grpc_client->frame_tx, &grpc_hdr, sizeof(fd_grpc_hdr_t) );
+  FD_TEST( grpc_hdr.compressed==0 );
+  FD_TEST( grpc_hdr.msg_sz>0 );
+
+  /* Skip the protobuf message data */
+  ulong frame_len = fd_h2_frame_length( frame_hdr.typlen );
+  ulong remaining = frame_len - sizeof(fd_grpc_hdr_t);
+  if( remaining > 0UL ) {
+    FD_TEST( fd_h2_rbuf_used_sz( grpc_client->frame_tx ) >= remaining );
+    fd_h2_rbuf_skip( grpc_client->frame_tx, remaining );
+  }
+
+  /* Inject a response */
+  fd_bundle_client_grpc_rx_start( state, FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo );
+
+  /* Protobuf encoder util */
+  uchar pb_buf[ 128 ];
+  ulong pb_sz = 0UL;
+  block_engine_SubmitLeaderWindowInfoResponse resp = block_engine_SubmitLeaderWindowInfoResponse_init_default;
+#define ENCODE_MSG() do { \
+    pb_ostream_t ostream = pb_ostream_from_buffer( pb_buf, sizeof(pb_buf) ); \
+    FD_TEST( pb_encode( &ostream, &block_engine_SubmitLeaderWindowInfoResponse_msg, &resp ) ); \
+    pb_sz = ostream.bytes_written; \
+  } while(0)
+
+  /* Valid response */
+  ENCODE_MSG();
+  fd_bundle_client_grpc_rx_msg( state, pb_buf, pb_sz, FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo );
+  FD_TEST( state->submit_leader_window_info_wait==1 );
+
+  /* End stream */
+  fd_grpc_resp_hdrs_t grpc_resp_hdrs = {
+    .h2_status   = 200,
+    .grpc_status = FD_GRPC_STATUS_OK
+  };
+  fd_bundle_client_grpc_rx_end( state, FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo, &grpc_resp_hdrs );
+  FD_TEST( state->submit_leader_window_info_wait==0 );
+
+#undef ENCODE_MSG
+
+  test_bundle_env_destroy( env );
+}
+
 int
 main( int     argc,
       char ** argv ) {
@@ -1492,6 +2078,9 @@ main( int     argc,
   fd_wksp_t * wksp = fd_wksp_new_anonymous( fd_cstr_to_shmem_page_sz( _page_sz ), page_cnt, fd_shmem_cpu_idx( numa_idx ), "wksp", 16UL );
   FD_TEST( wksp );
 
+  /* Initialize block test messages */
+  init_block_test_messages();
+
   test_bundle_rx( wksp );
   test_bundle_rx_too_many_txns( wksp );
   test_bundle_stream_ended( wksp );
@@ -1505,8 +2094,17 @@ main( int     argc,
   test_bundle_client_reset( wksp );
   test_bundle_no_builder_fee_info( wksp );
   test_bundle_client_request_builder_fee_info( wksp );
+  test_bundle_client_submit_leader_window_info( wksp );
   test_bundle_client_subscribe_packets( wksp );
   test_bundle_client_subscribe_bundles( wksp );
+
+  /* Harmonic block mode tests */
+  test_harmonic_block_slot_parsing( wksp );
+  test_harmonic_block_rx_many_txns( wksp );
+  test_harmonic_block_oversized( wksp );
+  test_all_three_sources( wksp );
+  test_interleaved_sources( wksp );
+
   test_packet_publish_after_credit( wksp );
   test_packet_publish_after_credit_atomic( wksp );
   test_bundle_publish_all_or_nothing( wksp );
