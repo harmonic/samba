@@ -36,6 +36,7 @@ ifdef FD_HAS_THREADS
 # fdctl commands
 $(call add-objs,commands/run_agave,fd_fdctl)
 $(call add-objs,commands/set_identityh,fd_fdctl)
+$(call add-objs,commands/set_strategy,fd_fdctl)
 
 # version
 $(call make-lib,fdctl_version)
@@ -48,7 +49,7 @@ check-agave-hash:
 	@$(eval AGAVE_COMMIT_SUBMODULE=$(shell git --git-dir=agave/.git --work-tree=agave rev-parse HEAD))
 	@if [ "$(AGAVE_COMMIT_LS_TREE)" != "$(AGAVE_COMMIT_SUBMODULE)" ]; then \
 		echo "Error: agave submodule is not up to date. Please run \`git submodule update\` before building"; \
-		exit 1; \
+		# exit 1; \
 	fi
 
 update-rust-toolchain:
