@@ -1341,6 +1341,10 @@ maybe_become_leader( fd_replay_tile_t *  ctx,
   msg->total_skipped_ticks = msg->ticks_per_slot*(ctx->next_leader_slot-ctx->reset_slot);
   msg->epoch = fd_slot_to_epoch( fd_bank_epoch_schedule_query( bank ), ctx->next_leader_slot, NULL );
 
+  /* cavey: check if we are leader next slot */
+  fd_pubkey_t const * next_slot_leader = fd_multi_epoch_leaders_get_leader_for_slot( ctx->mleaders, ctx->next_leader_slot+1UL );
+  msg->leader_next_slot = next_slot_leader && !memcmp( next_slot_leader->key, ctx->identity_pubkey->key, 32UL );
+
   fd_cost_tracker_t const * cost_tracker = fd_bank_cost_tracker_locking_query( bank );
 
   msg->limits.slot_max_cost = ctx->larger_max_cost_per_block ? LARGER_MAX_COST_PER_BLOCK : cost_tracker->block_cost_limit;
