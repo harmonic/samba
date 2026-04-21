@@ -427,6 +427,11 @@
 | <span class="metrics-name">bundle_&#8203;shredstream_&#8203;heartbeats</span> | counter | Number of ShredStream heartbeats successfully sent |
 | <span class="metrics-name">bundle_&#8203;keepalives</span> | counter | Number of HTTP/2 PINGs acknowledged by server |
 | <span class="metrics-name">bundle_&#8203;connected</span> | gauge | 1 if connected to the bundle server, 0 if not |
+| <span class="metrics-name">bundle_&#8203;tpu_&#8203;connected</span> | gauge | 1 if connected to the TPU endpoint, 0 if not |
+| <span class="metrics-name">bundle_&#8203;tpu_&#8203;packet_&#8203;received</span> | counter | Total count of packets received from TPU endpoint |
+| <span class="metrics-name">bundle_&#8203;tpu_&#8203;transaction_&#8203;received</span> | counter | Total count of transactions received from TPU endpoint |
+| <span class="metrics-name">bundle_&#8203;block_&#8203;received</span> | counter | Total count of blocks received |
+| <span class="metrics-name">bundle_&#8203;block_&#8203;transaction_&#8203;received</span> | counter | Total count of transactions received from blocks |
 | <span class="metrics-name">bundle_&#8203;rtt_&#8203;sample</span> | gauge | Latest RTT sample at scrape time (nanoseconds) |
 | <span class="metrics-name">bundle_&#8203;rtt_&#8203;smoothed</span> | gauge | RTT moving average (nanoseconds) |
 | <span class="metrics-name">bundle_&#8203;rtt_&#8203;var</span> | gauge | RTT variance (nanoseconds) |
@@ -447,6 +452,7 @@
 | <span class="metrics-name">verify_&#8203;transaction_&#8203;result</span><br/>{verify_&#8203;tile_&#8203;result="<span class="metrics-enum">parse_&#8203;failure</span>"} | counter | Count of transaction results through verify tile (Transaction failed to parse) |
 | <span class="metrics-name">verify_&#8203;transaction_&#8203;result</span><br/>{verify_&#8203;tile_&#8203;result="<span class="metrics-enum">dedup_&#8203;failure</span>"} | counter | Count of transaction results through verify tile (Transaction failed deduplication) |
 | <span class="metrics-name">verify_&#8203;transaction_&#8203;result</span><br/>{verify_&#8203;tile_&#8203;result="<span class="metrics-enum">verify_&#8203;failure</span>"} | counter | Count of transaction results through verify tile (Transaction failed signature verification) |
+| <span class="metrics-name">verify_&#8203;transaction_&#8203;result</span><br/>{verify_&#8203;tile_&#8203;result="<span class="metrics-enum">block_&#8203;peer_&#8203;failure</span>"} | counter | Count of transaction results through verify tile (Peer transaction in the block failed) |
 | <span class="metrics-name">verify_&#8203;gossiped_&#8203;votes_&#8203;received</span> | counter | Count of simple vote transactions received over gossip instead of via the normal TPU path |
 
 </div>
@@ -499,6 +505,7 @@
 | <span class="metrics-name">pack_&#8203;total_&#8203;transactions_&#8203;per_&#8203;microblock_&#8203;count</span> | histogram | Count of transactions in a scheduled microblock, including both votes and non-votes |
 | <span class="metrics-name">pack_&#8203;votes_&#8203;per_&#8203;microblock_&#8203;count</span> | histogram | Count of simple vote transactions in a scheduled microblock |
 | <span class="metrics-name">pack_&#8203;normal_&#8203;transaction_&#8203;received</span> | counter | Count of transactions received via the normal TPU path |
+| <span class="metrics-name">pack_&#8203;transaction_&#8203;inserted</span><br/>{pack_&#8203;txn_&#8203;insert_&#8203;return="<span class="metrics-enum">block_&#8203;failed</span>"} | counter | Result of inserting a transaction into the pack object (Harmonic block already failed validation) |
 | <span class="metrics-name">pack_&#8203;transaction_&#8203;inserted</span><br/>{pack_&#8203;txn_&#8203;insert_&#8203;return="<span class="metrics-enum">instr_&#8203;acct_&#8203;cnt</span>"} | counter | Result of inserting a transaction into the pack object (Transaction has an instruction that references too many accounts) |
 | <span class="metrics-name">pack_&#8203;transaction_&#8203;inserted</span><br/>{pack_&#8203;txn_&#8203;insert_&#8203;return="<span class="metrics-enum">nonce_&#8203;conflict</span>"} | counter | Result of inserting a transaction into the pack object (Bundle with two conflicting durable nonce transactions) |
 | <span class="metrics-name">pack_&#8203;transaction_&#8203;inserted</span><br/>{pack_&#8203;txn_&#8203;insert_&#8203;return="<span class="metrics-enum">bundle_&#8203;blacklist</span>"} | counter | Result of inserting a transaction into the pack object (Transaction uses an account on the bundle blacklist) |

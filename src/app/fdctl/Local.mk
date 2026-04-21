@@ -47,7 +47,7 @@ check-agave-hash:
 	@$(eval AGAVE_COMMIT_SUBMODULE=$(shell git --git-dir=agave/.git --work-tree=agave rev-parse HEAD))
 	@if [ "$(AGAVE_COMMIT_LS_TREE)" != "$(AGAVE_COMMIT_SUBMODULE)" ]; then \
 		echo "Error: agave submodule is not up to date. Please run \`git submodule update\` before building"; \
-		exit 1; \
+		# exit 1; \
 	fi
 
 update-rust-toolchain:

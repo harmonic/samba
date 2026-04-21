@@ -1,12 +1,16 @@
 #define _GNU_SOURCE
 #include "fd_bundle_tile_private.h"
 #include "fd_bundle_tile.h"
+#include "fd_bundle_tpu.h"
 #include "../fd_txn_m.h"
 #include "../metrics/fd_metrics.h"
 #include "../topo/fd_topo.h"
 #include "../keyguard/fd_keyload.h"
 #include "../../waltz/http/fd_url.h"
 #include "../../waltz/openssl/fd_openssl_tile.h"
+#include "../fd_disco_base.h"
+#include "../tiles.h"
+#include "../../discof/replay/fd_replay_tile.h" /* REPLAY_SIG_BECAME_LEADER */
 
 #if FD_HAS_OPENSSL
 #include <errno.h>
@@ -27,8 +31,35 @@
 /* Provided by fdctl/firedancer version.c */
 extern char const fdctl_version_string[];
 
-#define STEM_BURST (5UL)
+/* STEM_BURST bounds the number of fragments after_credit may publish
+   to verify_out in a single stem iteration.  before_credit never
+   publishes (all decode paths buffer into pending_txns or
+   harmonic_staging), so K1=0 and the burst check before after_credit
+   is the only barrier we need.  Sized to comfortably drain bundles
+   (up to FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE per iter atomically) and
+   keep harmonic block throughput high without wasting verify_out
+   credits. */
+#define STEM_BURST (32UL)
 FD_STATIC_ASSERT( FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE<=STEM_BURST, stem_burst );
+
+/* Count pending entries at deque head belonging to one bundle (sig==1,
+   matching bundle_seq).  Returns 0 if head is not a bundle txn. */
+
+static ulong
+pending_bundle_txn_cnt_at_head( fd_bundle_pending_txn_t * txns ) {
+  if( pending_txn_empty( txns ) ) return 0UL;
+  fd_bundle_pending_txn_t const * h0 = pending_txn_peek_head( txns );
+  if( FD_UNLIKELY( h0->sig!=1UL ) ) return 0UL;
+  ulong const seq   = h0->bundle_seq;
+  ulong const total = pending_txn_cnt( txns );
+  ulong n = 0UL;
+  for( ulong i=0UL; i<total; i++ ) {
+    fd_bundle_pending_txn_t const * e = pending_txn_peek_index( txns, i );
+    if( FD_LIKELY( e->sig==1UL && e->bundle_seq==seq ) ) n++;
+    else break;
+  }
+  return n;
+}
 
 FD_FN_CONST static ulong
 scratch_align( void ) {
@@ -41,8 +72,15 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   ulong l = FD_LAYOUT_INIT;
   l = FD_LAYOUT_APPEND( l, alignof(fd_bundle_tile_t), sizeof(fd_bundle_tile_t)                        );
   l = FD_LAYOUT_APPEND( l, fd_grpc_client_align(),    fd_grpc_client_footprint( tile->bundle.buf_sz ) );
+  /* Harmonic: second gRPC client for TPU endpoint */
+  l = FD_LAYOUT_APPEND( l, fd_grpc_client_align(),    fd_grpc_client_footprint( tile->bundle.buf_sz ) );
   l = FD_LAYOUT_APPEND( l, fd_alloc_align(),          fd_alloc_footprint()                            );
   l = FD_LAYOUT_APPEND( l, pending_txn_align(),       pending_txn_footprint( pending_max )            );
+  /* Harmonic staging: parallel buffer for harmonic block txns.  Sized
+     to out_depth so a single fd_h2_rx pass (bounded by the gRPC client
+     rx buf_sz) cannot produce more decoded txns than we can stage. */
+  l = FD_LAYOUT_APPEND( l, alignof(fd_bundle_harmonic_staged_txn_t),
+                           sizeof(fd_bundle_harmonic_staged_txn_t) * pending_max );
   return FD_LAYOUT_FINI( l, scratch_align() );
 }
 
@@ -55,15 +93,19 @@ loose_footprint( fd_topo_tile_t const * tile ) {
 
 static inline void
 metrics_write( fd_bundle_tile_t * ctx ) {
-  FD_MCNT_SET( BUNDLE, TRANSACTION_RECEIVED,   ctx->metrics.txn_received_cnt          );
-  FD_MCNT_SET( BUNDLE, BUNDLE_RECEIVED,        ctx->metrics.bundle_received_cnt       );
-  FD_MCNT_SET( BUNDLE, PACKET_RECEIVED,        ctx->metrics.packet_received_cnt       );
-  FD_MCNT_SET( BUNDLE, PROTO_RECEIVED_BYTES,   ctx->metrics.proto_received_bytes      );
-  FD_MCNT_SET( BUNDLE, SHREDSTREAM_HEARTBEATS, ctx->metrics.shredstream_heartbeat_cnt );
-  FD_MCNT_SET( BUNDLE, KEEPALIVES,             ctx->metrics.ping_ack_cnt              );
-  FD_MCNT_SET( BUNDLE, ERRORS_PROTOBUF,        ctx->metrics.decode_fail_cnt           );
-  FD_MCNT_SET( BUNDLE, ERRORS_TRANSPORT,       ctx->metrics.transport_fail_cnt        );
-  FD_MCNT_SET( BUNDLE, ERRORS_NO_FEE_INFO,     ctx->metrics.missing_builder_info_fail_cnt );
+  FD_MCNT_SET( BUNDLE, TRANSACTION_RECEIVED,       ctx->metrics.txn_received_cnt          );
+  FD_MCNT_SET( BUNDLE, BUNDLE_RECEIVED,            ctx->metrics.bundle_received_cnt       );
+  FD_MCNT_SET( BUNDLE, PACKET_RECEIVED,            ctx->metrics.packet_received_cnt       );
+  FD_MCNT_SET( BUNDLE, PROTO_RECEIVED_BYTES,       ctx->metrics.proto_received_bytes      );
+  FD_MCNT_SET( BUNDLE, SHREDSTREAM_HEARTBEATS,     ctx->metrics.shredstream_heartbeat_cnt );
+  FD_MCNT_SET( BUNDLE, KEEPALIVES,                 ctx->metrics.ping_ack_cnt              );
+  FD_MCNT_SET( BUNDLE, ERRORS_PROTOBUF,            ctx->metrics.decode_fail_cnt           );
+  FD_MCNT_SET( BUNDLE, ERRORS_TRANSPORT,           ctx->metrics.transport_fail_cnt        );
+  FD_MCNT_SET( BUNDLE, ERRORS_NO_FEE_INFO,         ctx->metrics.missing_builder_info_fail_cnt );
+  FD_MCNT_SET( BUNDLE, TPU_PACKET_RECEIVED,        ctx->metrics.tpu_packet_received_cnt   );
+  FD_MCNT_SET( BUNDLE, TPU_TRANSACTION_RECEIVED,   ctx->metrics.tpu_txn_received_cnt      );
+  FD_MCNT_SET( BUNDLE, BLOCK_RECEIVED,             ctx->harmonic_block_received_cnt       );
+  FD_MCNT_SET( BUNDLE, BLOCK_TRANSACTION_RECEIVED, ctx->harmonic_block_txn_received_cnt   );
   FD_MGAUGE_SET( BUNDLE, PENDING_TRANSACTIONS, pending_txn_cnt( ctx->pending_txns )   );
   FD_MCNT_SET  ( BUNDLE, TRANSACTION_DROPPED_BACKPRESSURE, ctx->metrics.backpressure_drop_cnt );
 #if FD_HAS_OPENSSL
@@ -88,6 +130,10 @@ metrics_write( fd_bundle_tile_t * ctx ) {
   int bundle_status = fd_bundle_client_status( ctx );
   FD_MGAUGE_SET( BUNDLE, CONNECTED, bundle_status==FD_BUNDLE_BLOCK_ENGINE_STATUS_CONNECTED );
   ctx->bundle_status_recent = (uchar)bundle_status;
+
+  int tpu_status = fd_bundle_tpu_client_status( ctx );
+  FD_MGAUGE_SET( BUNDLE, TPU_CONNECTED, tpu_status==FD_BUNDLE_BLOCK_ENGINE_STATUS_CONNECTED );
+  ctx->tpu_status_recent = (uchar)tpu_status;
 }
 
 void
@@ -103,6 +149,12 @@ fd_bundle_tile_housekeeping( fd_bundle_tile_t * ctx ) {
 
   if( FD_UNLIKELY( fd_keyswitch_state_query( ctx->keyswitch )==FD_KEYSWITCH_STATE_SWITCH_PENDING ) ) {
     fd_memcpy( ctx->auther.pubkey, ctx->keyswitch->bytes, 32UL );
+
+    /* cavey: also update TPU auther pubkey and reset TPU connection */
+    if( ctx->tpu_conn_enabled ) {
+      fd_memcpy( ctx->tpu_auther.pubkey, ctx->keyswitch->bytes, 32UL );
+      ctx->tpu_defer_reset = 1;
+    }
     fd_keyswitch_state( ctx->keyswitch, FD_KEYSWITCH_STATE_COMPLETED );
     ctx->defer_reset = 1;
   }
@@ -147,6 +199,15 @@ fd_bundle_tile_publish_block_engine_update(
   ctx->plugin_out.chunk = fd_dcache_compact_next( ctx->plugin_out.chunk, sizeof(fd_bundle_block_engine_update_t), ctx->plugin_out.chunk0, ctx->plugin_out.wmark );
 }
 
+/* Map TPU client status to what we advertise on bundle_gossi: CONNECTING and
+   DISCONNECTED both produce FD_BUNDLE_TPU_UPDATE_DISCONNECTED on the wire.
+   Tracking raw status (0 vs 1) caused duplicate publishes (CONNECTING then
+   DISCONNECTED within milliseconds) and pohh logged TPU disconnected twice. */
+static uchar
+fd_bundle_tile_tpu_gossip_bucket( int tpu_st ) {
+  return (uchar)( ( tpu_st==FD_BUNDLE_BLOCK_ENGINE_STATUS_CONNECTED ) ? 2 : 0 );
+}
+
 static void
 before_credit( fd_bundle_tile_t *  ctx,
                fd_stem_context_t * stem,
@@ -155,9 +216,64 @@ before_credit( fd_bundle_tile_t *  ctx,
     ctx->stem = stem;
   }
 
+  /* Defer gRPC while harmonic staging waits for after_credit so block
+     stream order cannot run ahead of verify_out publishes. */
+  if( FD_UNLIKELY( ctx->harmonic_pending_len ) ) return;
+
   if( pending_txn_empty( ctx->pending_txns ) ) {
     fd_bundle_client_step( ctx, charge_busy );
   }
+}
+
+/* Publish TPU connection update to gossip link.
+   For Frankendancer, the poh tile (Agave) receives this.
+   For full Firedancer, the gossip tile receives this. */
+static void
+fd_bundle_tile_publish_tpu_update(
+    fd_bundle_tile_t *  ctx,
+    fd_stem_context_t * stem
+) {
+  fd_bundle_tpu_update_t * update =
+      fd_chunk_to_laddr( ctx->gossip_out.mem, ctx->gossip_out.chunk );
+  memset( update, 0, sizeof(fd_bundle_tpu_update_t) );
+
+  /* Use live status (not metrics_write's tpu_status_recent): housekeeping can
+     lag IO by many stem iterations, so pohh would never see CONNECTED+addrs. */
+  int is_connected = ( fd_bundle_tpu_client_status( ctx ) == FD_BUNDLE_BLOCK_ENGINE_STATUS_CONNECTED );
+  update->status = is_connected ? FD_BUNDLE_TPU_UPDATE_CONNECTED : FD_BUNDLE_TPU_UPDATE_DISCONNECTED;
+
+  /* When connected, populate TPU addresses from cached GetTpuConfigs response */
+  if( is_connected && ctx->tpu_config_avail ) {
+    update->tpu_ip4_addr     = ctx->tpu_config_tpu_ip4_addr;
+    update->tpu_port         = ctx->tpu_config_tpu_port;
+    update->tpu_fwd_ip4_addr = ctx->tpu_config_tpu_fwd_ip4_addr;
+    update->tpu_fwd_port     = ctx->tpu_config_tpu_fwd_port;
+  }
+
+  if( is_connected ) {
+    FD_LOG_NOTICE(( "Publishing TPU update: status=CONNECTED tpu=%u.%u.%u.%u:%u tpu_fwd=%u.%u.%u.%u:%u",
+                    (update->tpu_ip4_addr    ) & 0xFFU, (update->tpu_ip4_addr>>8    ) & 0xFFU,
+                    (update->tpu_ip4_addr>>16) & 0xFFU, (update->tpu_ip4_addr>>24   ) & 0xFFU,
+                    update->tpu_port,
+                    (update->tpu_fwd_ip4_addr    ) & 0xFFU, (update->tpu_fwd_ip4_addr>>8    ) & 0xFFU,
+                    (update->tpu_fwd_ip4_addr>>16) & 0xFFU, (update->tpu_fwd_ip4_addr>>24   ) & 0xFFU,
+                    update->tpu_fwd_port ));
+  } else {
+    FD_LOG_NOTICE(( "Publishing TPU update: status=DISCONNECTED" ));
+  }
+
+  ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now() );
+  fd_stem_publish(
+      stem,
+      ctx->gossip_out.idx,
+      FD_BUNDLE_TPU_UPDATE,
+      ctx->gossip_out.chunk,
+      sizeof(fd_bundle_tpu_update_t),
+      0UL, /* ctl */
+      0UL, /* seq */
+      tspub
+  );
+  ctx->gossip_out.chunk = fd_dcache_compact_next( ctx->gossip_out.chunk, sizeof(fd_bundle_tpu_update_t), ctx->gossip_out.chunk0, ctx->gossip_out.wmark );
 }
 
 static void
@@ -165,48 +281,151 @@ after_credit( fd_bundle_tile_t *  ctx,
               fd_stem_context_t * stem,
               int *               opt_poll_in,
               int *               charge_busy ) {
-  if( !pending_txn_empty( ctx->pending_txns ) ) {
-    fd_bundle_pending_txn_t * head = pending_txn_peek_head( ctx->pending_txns );
-    ulong drain_seq = head->bundle_seq;
-    ulong drain_sig = head->sig;
-    ulong drain_cnt = 0UL;
+  /* Share one STEM_BURST budget across harmonic staging and pending
+     deque so we never publish more than STEM_BURST frags to verify_out
+     in a single after_credit. */
 
-    do {
-      fd_bundle_pending_txn_t const * txn = pending_txn_peek_head( ctx->pending_txns );
+  ulong verify_budget = STEM_BURST;
+
+  if( FD_UNLIKELY( ctx->harmonic_pending_len ) ) {
+    ulong const n = fd_ulong_min( ctx->harmonic_pending_len, verify_budget );
+    for( ulong i=0UL; i<n; i++ ) {
+      fd_bundle_harmonic_staged_txn_t const * s = &ctx->harmonic_staging[i];
 
       fd_txn_m_t * txnm = fd_chunk_to_laddr( ctx->verify_out.mem, ctx->verify_out.chunk );
       *txnm = (fd_txn_m_t) {
         .reference_slot = 0UL,
-        .payload_sz     = txn->payload_sz,
+        .payload_sz     = s->payload_sz,
         .txn_t_sz       = 0U,
-        .source_ipv4    = txn->source_ipv4,
-        .source_tpu     = FD_TXN_M_TPU_SOURCE_BUNDLE,
+        .source_ipv4    = s->source_ipv4,
+        .source_tpu     = FD_TXN_M_TPU_SOURCE_HARMONIC,
         .block_engine   = {
-          .bundle_id      = txn->bundle_seq,
-          .bundle_txn_cnt = txn->bundle_txn_cnt,
-          .commission     = txn->commission,
+          .block_slot     = s->block_slot,
+          .bundle_txn_cnt = s->block_txn_cnt,
+          .commission     = s->commission,
         },
       };
-      fd_memcpy( txnm->block_engine.commission_pubkey, txn->commission_pubkey, 32UL );
-      fd_memcpy( fd_txn_m_payload( txnm ), txn->payload, txn->payload_sz );
+      fd_memcpy( txnm->block_engine.commission_pubkey, s->commission_pubkey, 32UL );
+      fd_memcpy( fd_txn_m_payload( txnm ), s->payload, s->payload_sz );
 
       ulong sz    = fd_txn_m_realized_footprint( txnm, 0, 0 );
       ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now() );
-      fd_stem_publish( stem, ctx->verify_out.idx, txn->sig, ctx->verify_out.chunk, sz, 0UL, 0UL, tspub );
+      fd_stem_publish( stem, ctx->verify_out.idx, 2UL, ctx->verify_out.chunk, sz, 0UL, 0UL, tspub );
       ctx->verify_out.chunk = fd_dcache_compact_next( ctx->verify_out.chunk, sz, ctx->verify_out.chunk0, ctx->verify_out.wmark );
 
-      pending_txn_remove_head( ctx->pending_txns );
-      drain_cnt++;
-    } while( fd_bundle_drain_continue( ctx->pending_txns, drain_sig, drain_seq, drain_cnt, STEM_BURST ) );
-
+      ctx->harmonic_block_txn_received_cnt++;
+    }
+    verify_budget -= n;
+    ctx->harmonic_pending_len -= n;
+    if( FD_UNLIKELY( ctx->harmonic_pending_len ) ) {
+      memmove( ctx->harmonic_staging, ctx->harmonic_staging + n,
+               ctx->harmonic_pending_len * sizeof(fd_bundle_harmonic_staged_txn_t) );
+    }
     *charge_busy = 1;
     *opt_poll_in = 0;
+  }
+
+  if( FD_LIKELY( verify_budget && !pending_txn_empty( ctx->pending_txns ) ) ) {
+    fd_bundle_pending_txn_t * head = pending_txn_peek_head( ctx->pending_txns );
+
+    if( FD_UNLIKELY( head->sig==1UL ) ) {
+      ulong const bsz = pending_bundle_txn_cnt_at_head( ctx->pending_txns );
+      if( FD_LIKELY( bsz && bsz<=verify_budget ) ) {
+        for( ulong i=0UL; i<bsz; i++ ) {
+          fd_bundle_pending_txn_t const * txn = pending_txn_peek_head( ctx->pending_txns );
+
+          fd_txn_m_t * txnm = fd_chunk_to_laddr( ctx->verify_out.mem, ctx->verify_out.chunk );
+          *txnm = (fd_txn_m_t) {
+            .reference_slot = 0UL,
+            .payload_sz     = txn->payload_sz,
+            .txn_t_sz       = 0U,
+            .source_ipv4    = txn->source_ipv4,
+            .source_tpu     = txn->source_tpu,
+            .block_engine   = {
+              .bundle_id      = txn->bundle_seq,
+              .bundle_txn_cnt = (ushort)txn->bundle_txn_cnt,
+              .commission     = txn->commission,
+            },
+          };
+          fd_memcpy( txnm->block_engine.commission_pubkey, txn->commission_pubkey, 32UL );
+          fd_memcpy( fd_txn_m_payload( txnm ), txn->payload, txn->payload_sz );
+
+          ulong sz    = fd_txn_m_realized_footprint( txnm, 0, 0 );
+          ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now() );
+          fd_stem_publish( stem, ctx->verify_out.idx, txn->sig, ctx->verify_out.chunk, sz, 0UL, 0UL, tspub );
+          ctx->verify_out.chunk = fd_dcache_compact_next( ctx->verify_out.chunk, sz, ctx->verify_out.chunk0, ctx->verify_out.wmark );
+
+          pending_txn_remove_head( ctx->pending_txns );
+        }
+        verify_budget -= bsz;
+        *charge_busy = 1;
+        *opt_poll_in = 0;
+      }
+    } else {
+      ulong drain_seq    = head->bundle_seq;
+      ulong drain_sig    = head->sig;
+      ulong drain_cnt    = 0UL;
+      ulong drain_budget = verify_budget;
+
+      do {
+        fd_bundle_pending_txn_t const * txn = pending_txn_peek_head( ctx->pending_txns );
+
+        fd_txn_m_t * txnm = fd_chunk_to_laddr( ctx->verify_out.mem, ctx->verify_out.chunk );
+        *txnm = (fd_txn_m_t) {
+          .reference_slot = 0UL,
+          .payload_sz     = txn->payload_sz,
+          .txn_t_sz       = 0U,
+          .source_ipv4    = txn->source_ipv4,
+          .source_tpu     = txn->source_tpu,
+          .block_engine   = {
+            .bundle_id      = txn->bundle_seq,
+            .bundle_txn_cnt = (ushort)txn->bundle_txn_cnt,
+            .commission     = txn->commission,
+          },
+        };
+        fd_memcpy( txnm->block_engine.commission_pubkey, txn->commission_pubkey, 32UL );
+        fd_memcpy( fd_txn_m_payload( txnm ), txn->payload, txn->payload_sz );
+
+        ulong sz    = fd_txn_m_realized_footprint( txnm, 0, 0 );
+        ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now() );
+        fd_stem_publish( stem, ctx->verify_out.idx, txn->sig, ctx->verify_out.chunk, sz, 0UL, 0UL, tspub );
+        ctx->verify_out.chunk = fd_dcache_compact_next( ctx->verify_out.chunk, sz, ctx->verify_out.chunk0, ctx->verify_out.wmark );
+
+        pending_txn_remove_head( ctx->pending_txns );
+        drain_cnt++;
+        verify_budget--;
+      } while( verify_budget && fd_bundle_drain_continue( ctx->pending_txns, drain_sig, drain_seq, drain_cnt, drain_budget ) );
+
+      *charge_busy = 1;
+      *opt_poll_in = 0;
+    }
+  }
+
+  /* Drive the TPU endpoint if enabled */
+  if( FD_UNLIKELY( ctx->tpu_conn_enabled ) ) {
+    fd_bundle_tpu_client_step( ctx, charge_busy );
   }
 
   if( ctx->plugin_out.mem ) {
     if( FD_UNLIKELY( ctx->bundle_status_recent != ctx->bundle_status_plugin ) ) {
       fd_bundle_tile_publish_block_engine_update( ctx, stem );
       ctx->bundle_status_plugin = (uchar)ctx->bundle_status_recent;
+      *charge_busy = 1;
+    }
+  }
+
+  /* Publish TPU updates to pohh/gossip when connection status changes or when
+     GetTpuConfigs returns new addresses while staying connected. */
+  if( FD_UNLIKELY( ctx->gossip_out.mem && ctx->tpu_conn_enabled ) ) {
+    int const tpu_st = fd_bundle_tpu_client_status( ctx );
+    uchar const gossip_bucket = fd_bundle_tile_tpu_gossip_bucket( tpu_st );
+    int const cfg_changed = ( tpu_st==FD_BUNDLE_BLOCK_ENGINE_STATUS_CONNECTED &&
+                             ctx->tpu_config_avail &&
+                             ctx->tpu_config_seq!=ctx->tpu_gossip_cfg_seq );
+    if( FD_UNLIKELY( gossip_bucket!=ctx->tpu_status_gossip || cfg_changed ) ) {
+      fd_bundle_tile_publish_tpu_update( ctx, stem );
+      ctx->tpu_status_gossip    = gossip_bucket;
+      ctx->tpu_gossip_cfg_seq = ctx->tpu_config_seq;
       *charge_busy = 1;
     }
   }
@@ -240,6 +459,49 @@ fd_bundle_tile_parse_endpoint( fd_bundle_tile_t *     ctx,
   }
 
   ctx->is_ssl = !!is_ssl;
+#if !FD_HAS_OPENSSL
+  if( FD_UNLIKELY( is_ssl ) ) {
+    FD_LOG_ERR(( "This build does not include OpenSSL. To install OpenSSL, re-run ./deps.sh and do a clean re build." ));
+  }
+#endif
+}
+
+/* Parse the TPU endpoint URL if configured */
+static void
+fd_bundle_tile_parse_tpu_endpoint( fd_bundle_tile_t *     ctx,
+                                   fd_topo_tile_t const * tile ) {
+  /* Check if TPU endpoint is configured */
+  if( FD_UNLIKELY( !tile->bundle.tpu_url_len ) ) {
+    ctx->tpu_conn_enabled = 0;
+    return;
+  }
+
+  fd_url_t url[1];
+  _Bool is_ssl = 0;
+  if( FD_UNLIKELY( fd_url_parse_endpoint( url,
+                                          tile->bundle.tpu_url,
+                                          tile->bundle.tpu_url_len,
+                                          &ctx->tpu_server_tcp_port,
+                                          &is_ssl,
+                                          "[tiles.bundle.tpu_url]" ) ) ) {
+    FD_LOG_ERR(( "Could not parse [tiles.bundle.tpu_url]" ));
+  }
+  if( FD_UNLIKELY( url->host_len > 255 ) ) {
+    FD_LOG_CRIT(( "Invalid tpu_url->host_len" )); /* unreachable */
+  }
+  fd_cstr_fini( fd_cstr_append_text( fd_cstr_init( ctx->tpu_server_fqdn ), url->host, url->host_len ) );
+  ctx->tpu_server_fqdn_len = url->host_len;
+
+  if( FD_UNLIKELY( tile->bundle.tpu_sni_len ) ) {
+    fd_cstr_fini( fd_cstr_append_text( fd_cstr_init( ctx->tpu_server_sni ), tile->bundle.tpu_sni, tile->bundle.tpu_sni_len ) );
+    ctx->tpu_server_sni_len = tile->bundle.tpu_sni_len;
+  } else {
+    fd_cstr_fini( fd_cstr_append_text( fd_cstr_init( ctx->tpu_server_sni ), url->host, url->host_len ) );
+    ctx->tpu_server_sni_len = url->host_len;
+  }
+
+  ctx->tpu_is_ssl = !!is_ssl;
+  ctx->tpu_conn_enabled = 1;
 #if !FD_HAS_OPENSSL
   if( FD_UNLIKELY( is_ssl ) ) {
     FD_LOG_ERR(( "This build does not include OpenSSL. To install OpenSSL, re-run ./deps.sh and do a clean re build." ));
@@ -317,11 +579,15 @@ privileged_init( fd_topo_t *      topo,
   ulong const pending_max = tile->bundle.out_depth;
 
   FD_SCRATCH_ALLOC_INIT( l, scratch );
-  fd_bundle_tile_t * ctx         = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_bundle_tile_t), sizeof(fd_bundle_tile_t)                        );
-  void *             grpc_mem    = FD_SCRATCH_ALLOC_APPEND( l, fd_grpc_client_align(),    fd_grpc_client_footprint( tile->bundle.buf_sz ) );
-  void *             alloc_mem   = FD_SCRATCH_ALLOC_APPEND( l, fd_alloc_align(),          fd_alloc_footprint()                            );
-  void *             deque_mem   = FD_SCRATCH_ALLOC_APPEND( l, pending_txn_align(),        pending_txn_footprint( pending_max )            );
-  ulong              scratch_end = FD_SCRATCH_ALLOC_FINI( l, scratch_align() );
+  fd_bundle_tile_t * ctx          = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_bundle_tile_t), sizeof(fd_bundle_tile_t)                        );
+  void *             grpc_mem     = FD_SCRATCH_ALLOC_APPEND( l, fd_grpc_client_align(),    fd_grpc_client_footprint( tile->bundle.buf_sz ) );
+  void *             grpc_tpu_mem = FD_SCRATCH_ALLOC_APPEND( l, fd_grpc_client_align(),    fd_grpc_client_footprint( tile->bundle.buf_sz ) );
+  void *             alloc_mem    = FD_SCRATCH_ALLOC_APPEND( l, fd_alloc_align(),          fd_alloc_footprint()                            );
+  void *             deque_mem    = FD_SCRATCH_ALLOC_APPEND( l, pending_txn_align(),       pending_txn_footprint( pending_max )            );
+  void *             harmonic_staging_mem = FD_SCRATCH_ALLOC_APPEND( l,
+      alignof(fd_bundle_harmonic_staged_txn_t),
+      sizeof(fd_bundle_harmonic_staged_txn_t) * pending_max );
+  ulong              scratch_end  = FD_SCRATCH_ALLOC_FINI( l, scratch_align() );
   (void)alloc_mem; /* potentially unused */
 
   if( FD_UNLIKELY( (ulong)ctx != (ulong)scratch ) ) {
@@ -332,16 +598,23 @@ privileged_init( fd_topo_t *      topo,
   }
 
   memset( ctx, 0, sizeof(fd_bundle_tile_t) );
-  ctx->grpc_client_mem = grpc_mem;
-  ctx->grpc_buf_max    = tile->bundle.buf_sz;
-  ctx->tcp_sock        = -1;
-  ctx->pending_txns    = pending_txn_join( pending_txn_new( deque_mem, pending_max ) );
+  ctx->grpc_client_mem     = grpc_mem;
+  ctx->grpc_client_tpu_mem = grpc_tpu_mem;
+  ctx->grpc_buf_max        = tile->bundle.buf_sz;
+  ctx->tcp_sock            = -1;
+  ctx->tpu_tcp_sock        = -1;
+  ctx->pending_txns        = pending_txn_join( pending_txn_new( deque_mem, pending_max ) );
+  ctx->harmonic_staging    = harmonic_staging_mem;
+  ctx->harmonic_staging_max = pending_max;
 
   fd_bundle_auther_init( &ctx->auther );
   uchar const * public_key = fd_keyload_load( tile->bundle.identity_key_path, 1 /* public key only */ );
   fd_memcpy( ctx->auther.pubkey, public_key, 32UL );
 
   ctx->keylog_fd = -1;
+
+  /* Initialize harmonic block mode state */
+  ctx->harmonic_block_mode = tile->bundle.harmonic_block_mode;
 
 # if FD_HAS_OPENSSL
 
@@ -400,6 +673,16 @@ unprivileged_init( fd_topo_t *      topo,
     FD_LOG_ERR(( "There can only be one bundle tile" ));
   }
 
+  /* Set thread-local netdb fds for DNS resolution on the tile thread.
+     fd_netdb_open_fds was called in privileged_init on the main thread,
+     but fd_get_resolv_conf / fd_lookup_name read thread-local globals.
+     Without this, the bundle tile DNS path falls back to 127.0.0.1 and
+     /etc/hosts is not consulted. */
+  extern FD_TL int fd_etc_resolv_conf_fd;
+  extern FD_TL int fd_etc_hosts_fd;
+  fd_etc_resolv_conf_fd = ctx->netdb_fds->etc_resolv_conf;
+  fd_etc_hosts_fd       = ctx->netdb_fds->etc_hosts;
+
   ulong sign_in_idx = fd_topo_find_tile_in_link( topo, tile, "sign_bundle", tile->kind_id );
   if( FD_UNLIKELY( sign_in_idx==ULONG_MAX ) ) FD_LOG_ERR(( "Missing sign_bundle link" ));
   fd_topo_link_t const * sign_in  = &topo->links[ tile->in_link_id[ sign_in_idx ] ];
@@ -433,6 +716,14 @@ unprivileged_init( fd_topo_t *      topo,
     ctx->plugin_out = (fd_bundle_out_ctx_t){ .idx=ULONG_MAX };
   }
 
+  /* Initialize gossip output for TPU updates */
+  ulong gossip_out_idx = fd_topo_find_tile_out_link( topo, tile, "bundle_gossi", tile->kind_id );
+  if( gossip_out_idx!=ULONG_MAX ) {
+    ctx->gossip_out = bundle_out_link( topo, &topo->links[ tile->out_link_id[ gossip_out_idx ] ], gossip_out_idx );
+  } else {
+    ctx->gossip_out = (fd_bundle_out_ctx_t){ .idx=ULONG_MAX };
+  }
+
   /* Set socket receive buffer size */
   ulong so_rcvbuf = tile->bundle.buf_sz;
   if( FD_UNLIKELY( so_rcvbuf < 2048UL  ) ) FD_LOG_ERR(( "Invalid [development.bundle.buffer_size_kib]: too small" ));
@@ -446,6 +737,11 @@ unprivileged_init( fd_topo_t *      topo,
   ctx->bundle_status_recent = FD_BUNDLE_BLOCK_ENGINE_STATUS_DISCONNECTED;
   ctx->last_bundle_status_log_nanos = fd_log_wallclock();
 
+  ctx->tpu_status_gossip = 127;  /* Force initial update */
+  ctx->tpu_status_recent = FD_BUNDLE_BLOCK_ENGINE_STATUS_DISCONNECTED;
+  ctx->tpu_config_seq     = 0UL;
+  ctx->tpu_gossip_cfg_seq = 0UL;
+
   fd_bundle_tile_parse_endpoint( ctx, tile );
 
   ctx->grpc_client = fd_grpc_client_new( ctx->grpc_client_mem, &fd_bundle_client_grpc_callbacks, ctx->grpc_metrics, ctx, ctx->grpc_buf_max, ctx->map_seed );
@@ -455,9 +751,47 @@ unprivileged_init( fd_topo_t *      topo,
   fd_grpc_client_set_version( ctx->grpc_client, fdctl_version_string, strlen( fdctl_version_string ) );
   fd_grpc_client_set_authority( ctx->grpc_client, ctx->server_sni, ctx->server_sni_len, ctx->server_tcp_port );
 
+  /* Initialize TPU endpoint if configured */
+  fd_bundle_tile_parse_tpu_endpoint( ctx, tile );
+  if( ctx->tpu_conn_enabled ) {
+    fd_bundle_auther_init( &ctx->tpu_auther );
+    fd_memcpy( ctx->tpu_auther.pubkey, ctx->auther.pubkey, 32UL );
+
+    ctx->tpu_grpc_client = fd_grpc_client_new( ctx->grpc_client_tpu_mem, &fd_bundle_tpu_client_grpc_callbacks, ctx->tpu_grpc_metrics, ctx, ctx->grpc_buf_max, ctx->map_seed );
+    if( FD_UNLIKELY( !ctx->tpu_grpc_client ) ) {
+      FD_LOG_CRIT(( "fd_grpc_client_new for TPU endpoint failed" )); /* unreachable */
+    }
+    fd_grpc_client_set_version( ctx->tpu_grpc_client, fdctl_version_string, strlen( fdctl_version_string ) );
+    fd_grpc_client_set_authority( ctx->tpu_grpc_client, ctx->tpu_server_sni, ctx->tpu_server_sni_len, ctx->tpu_server_tcp_port );
+
+    FD_LOG_NOTICE(( "TPU bundle endpoint configured: %.*s", (int)ctx->tpu_server_fqdn_len, ctx->tpu_server_fqdn ));
+  }
+
+  if( ctx->harmonic_block_mode ) {
+    FD_LOG_NOTICE(( "Harmonic block mode enabled" ));
+  }
+
   fd_histf_new( ctx->metrics.msg_rx_delay,
       FD_MHIST_MIN( BUNDLE, MESSAGE_RX_DELAY_NANOS ),
       FD_MHIST_MAX( BUNDLE, MESSAGE_RX_DELAY_NANOS ) );
+
+  /* Get poh_pack/pohh_pack or replay_out link (franken: pohh_pack, ffire: replay_out).  */
+  ulong leader_in_idx;
+  if( ULONG_MAX!=(leader_in_idx=fd_topo_find_tile_in_link( topo, tile, "pohh_pack", tile->kind_id )) ) {
+    ctx->leader_in_is_replay = 0;
+  } else if( ULONG_MAX!=(leader_in_idx=fd_topo_find_tile_in_link( topo, tile, "poh_pack", tile->kind_id )) ) {
+    ctx->leader_in_is_replay = 0;
+  } else if( ULONG_MAX!=(leader_in_idx=fd_topo_find_tile_in_link( topo, tile, "replay_out", tile->kind_id )) ) {
+    ctx->leader_in_is_replay = 1;
+  } else {
+    FD_LOG_ERR(( "bundle tile requires either pohh_pack, poh_pack, or replay_out link" ));
+  }
+  fd_topo_link_t const * leader_link = &topo->links[ tile->in_link_id[ leader_in_idx ] ];
+  ctx->leader_in.idx    = leader_in_idx;
+  ctx->leader_in.mem    = topo->workspaces[ topo->objs[ leader_link->dcache_obj_id ].wksp_id ].wksp;
+  ctx->leader_in.chunk0 = fd_dcache_compact_chunk0( ctx->leader_in.mem, leader_link->dcache );
+  ctx->leader_in.wmark  = fd_dcache_compact_wmark( ctx->leader_in.mem, leader_link->dcache, leader_link->mtu );
+  ctx->leader_in.chunk  = ctx->leader_in.chunk0;
 }
 
 static ulong
@@ -498,6 +832,93 @@ populate_allowed_fds( fd_topo_t const *      topo,
   return out_cnt;
 }
 
+static int
+before_frag( fd_bundle_tile_t * ctx,
+             ulong              in_idx,
+             ulong              seq FD_PARAM_UNUSED,
+             ulong              sig ) {
+  (void)seq;
+
+  /* Ignore messages from leader link that are not became_leader */
+  if( FD_UNLIKELY( in_idx == ctx->leader_in.idx ) ) {
+    if( FD_LIKELY( ctx->leader_in_is_replay ) ) {
+      /* replay_out uses REPLAY_SIG_BECAME_LEADER */
+      if( FD_UNLIKELY( sig != REPLAY_SIG_BECAME_LEADER ) ) return 1; /* Discard */
+    } else {
+      /* poh_pack/pohh_pack uses POH_PKT_TYPE_BECAME_LEADER */
+      if( FD_UNLIKELY( fd_disco_poh_sig_pkt_type( sig ) != POH_PKT_TYPE_BECAME_LEADER ) ) return 1; /* Discard */
+    }
+  }
+
+  return 0;
+}
+
+static void
+during_frag( fd_bundle_tile_t * ctx,
+             ulong              in_idx,
+             ulong              seq FD_PARAM_UNUSED,
+             ulong              sig FD_PARAM_UNUSED,
+             ulong              chunk,
+             ulong              sz,
+             ulong              ctl FD_PARAM_UNUSED ) {
+  (void)seq;
+  (void)sig;
+  (void)ctl;
+
+  /* Only process messages from leader link */
+  if( FD_UNLIKELY( in_idx != ctx->leader_in.idx ) ) return;
+
+  /* Verify this is a became_leader message with correct size */
+  if( FD_UNLIKELY( chunk < ctx->leader_in.chunk0
+                || chunk > ctx->leader_in.wmark
+                || sz != sizeof(fd_became_leader_t) ) )
+    FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu] or wrong size %lu (expected %lu)",
+                 chunk, sz, ctx->leader_in.chunk0, ctx->leader_in.wmark, sz, sizeof(fd_became_leader_t) ));
+
+  /* Copy the became_leader message */
+  uchar const * dcache_entry = fd_chunk_to_laddr_const( ctx->leader_in.mem, chunk );
+  fd_memcpy( ctx->_became_leader, dcache_entry, sizeof(fd_became_leader_t) );
+}
+
+static void
+after_frag( fd_bundle_tile_t *  ctx,
+            ulong               in_idx,
+            ulong               seq    FD_PARAM_UNUSED,
+            ulong               sig    FD_PARAM_UNUSED,
+            ulong               sz     FD_PARAM_UNUSED,
+            ulong               tsorig FD_PARAM_UNUSED,
+            ulong               tspub  FD_PARAM_UNUSED,
+            fd_stem_context_t * stem   FD_PARAM_UNUSED ) {
+  (void)seq;
+  (void)sig;
+  (void)sz;
+  (void)tsorig;
+  (void)tspub;
+  (void)stem;
+
+  /* Only process messages from leader link */
+  if( FD_UNLIKELY( in_idx != ctx->leader_in.idx ) ) return;
+
+  if( FD_UNLIKELY( ctx->submit_leader_window_info_wait ) ) {
+    FD_LOG_WARNING(( "CAVEY DEBUG: Received became_leader message for slot=%lu, but SubmitLeaderWindowInfo request already in-flight",
+                     ctx->_became_leader->slot ));
+    return; /* Request already in-flight */
+  }
+  /* Notify auction house that we are leader */
+  fd_bundle_client_submit_leader_window_info(
+      ctx,
+      ctx->_became_leader->slot,
+      ctx->_became_leader->slot_start_ns
+  );
+  if( FD_UNLIKELY( !ctx->submit_leader_window_info_wait ) ) {
+    FD_LOG_WARNING(( "SubmitLeaderWindowInfo request for slot=%lu was NOT initiated (client not ready or blocked)",
+                     ctx->_became_leader->slot ));
+  } else {
+    FD_LOG_NOTICE(( "SubmitLeaderWindowInfo request for slot=%lu successfully queued",
+                    ctx->_became_leader->slot ));
+  }
+}
+
 #define STEM_LAZY ((long)10e6)
 
 #define STEM_CALLBACK_CONTEXT_TYPE  fd_bundle_tile_t
@@ -507,6 +928,10 @@ populate_allowed_fds( fd_topo_t const *      topo,
 #define STEM_CALLBACK_METRICS_WRITE       metrics_write
 #define STEM_CALLBACK_BEFORE_CREDIT       before_credit
 #define STEM_CALLBACK_AFTER_CREDIT        after_credit
+#define STEM_CALLBACK_BEFORE_FRAG         before_frag
+#define STEM_CALLBACK_DURING_FRAG         during_frag
+#define STEM_CALLBACK_AFTER_FRAG          after_frag
+
 
 #include "../stem/fd_stem.c"
 
