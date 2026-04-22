@@ -31,8 +31,35 @@
 /* Provided by fdctl/firedancer version.c */
 extern char const fdctl_version_string[];
 
-#define STEM_BURST (5UL)
+/* STEM_BURST bounds the number of fragments after_credit may publish
+   to verify_out in a single stem iteration.  before_credit never
+   publishes (all decode paths buffer into pending_txns or
+   harmonic_staging), so K1=0 and the burst check before after_credit
+   is the only barrier we need.  Sized to comfortably drain bundles
+   (up to FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE per iter atomically) and
+   keep harmonic block throughput high without wasting verify_out
+   credits. */
+#define STEM_BURST (32UL)
 FD_STATIC_ASSERT( FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE<=STEM_BURST, stem_burst );
+
+/* Count pending entries at deque head belonging to one bundle (sig==1,
+   matching bundle_seq).  Returns 0 if head is not a bundle txn. */
+
+static ulong
+pending_bundle_txn_cnt_at_head( fd_bundle_pending_txn_t * txns ) {
+  if( pending_txn_empty( txns ) ) return 0UL;
+  fd_bundle_pending_txn_t const * h0 = pending_txn_peek_head( txns );
+  if( FD_UNLIKELY( h0->sig!=1UL ) ) return 0UL;
+  ulong const seq   = h0->bundle_seq;
+  ulong const total = pending_txn_cnt( txns );
+  ulong n = 0UL;
+  for( ulong i=0UL; i<total; i++ ) {
+    fd_bundle_pending_txn_t const * e = pending_txn_peek_index( txns, i );
+    if( FD_LIKELY( e->sig==1UL && e->bundle_seq==seq ) ) n++;
+    else break;
+  }
+  return n;
+}
 
 FD_FN_CONST static ulong
 scratch_align( void ) {
@@ -49,6 +76,11 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   l = FD_LAYOUT_APPEND( l, fd_grpc_client_align(),    fd_grpc_client_footprint( tile->bundle.buf_sz ) );
   l = FD_LAYOUT_APPEND( l, fd_alloc_align(),          fd_alloc_footprint()                            );
   l = FD_LAYOUT_APPEND( l, pending_txn_align(),       pending_txn_footprint( pending_max )            );
+  /* Harmonic staging: parallel buffer for harmonic block txns.  Sized
+     to out_depth so a single fd_h2_rx pass (bounded by the gRPC client
+     rx buf_sz) cannot produce more decoded txns than we can stage. */
+  l = FD_LAYOUT_APPEND( l, alignof(fd_bundle_harmonic_staged_txn_t),
+                           sizeof(fd_bundle_harmonic_staged_txn_t) * pending_max );
   return FD_LAYOUT_FINI( l, scratch_align() );
 }
 
@@ -175,6 +207,10 @@ before_credit( fd_bundle_tile_t *  ctx,
     ctx->stem = stem;
   }
 
+  /* Defer gRPC while harmonic staging waits for after_credit so block
+     stream order cannot run ahead of verify_out publishes. */
+  if( FD_UNLIKELY( ctx->harmonic_pending_len ) ) return;
+
   if( pending_txn_empty( ctx->pending_txns ) ) {
     fd_bundle_client_step( ctx, charge_busy );
   }
@@ -234,42 +270,124 @@ after_credit( fd_bundle_tile_t *  ctx,
               fd_stem_context_t * stem,
               int *               opt_poll_in,
               int *               charge_busy ) {
-  if( !pending_txn_empty( ctx->pending_txns ) ) {
-    fd_bundle_pending_txn_t * head = pending_txn_peek_head( ctx->pending_txns );
-    ulong drain_seq = head->bundle_seq;
-    ulong drain_sig = head->sig;
-    ulong drain_cnt = 0UL;
+  /* Share one STEM_BURST budget across harmonic staging and pending
+     deque so we never publish more than STEM_BURST frags to verify_out
+     in a single after_credit. */
 
-    do {
-      fd_bundle_pending_txn_t const * txn = pending_txn_peek_head( ctx->pending_txns );
+  ulong verify_budget = STEM_BURST;
+
+  if( FD_UNLIKELY( ctx->harmonic_pending_len ) ) {
+    ulong const n = fd_ulong_min( ctx->harmonic_pending_len, verify_budget );
+    for( ulong i=0UL; i<n; i++ ) {
+      fd_bundle_harmonic_staged_txn_t const * s = &ctx->harmonic_staging[i];
 
       fd_txn_m_t * txnm = fd_chunk_to_laddr( ctx->verify_out.mem, ctx->verify_out.chunk );
       *txnm = (fd_txn_m_t) {
         .reference_slot = 0UL,
-        .payload_sz     = txn->payload_sz,
+        .payload_sz     = s->payload_sz,
         .txn_t_sz       = 0U,
-        .source_ipv4    = txn->source_ipv4,
-        .source_tpu     = txn->source_tpu,
+        .source_ipv4    = s->source_ipv4,
+        .source_tpu     = FD_TXN_M_TPU_SOURCE_HARMONIC,
         .block_engine   = {
-          .bundle_id      = txn->bundle_seq,
-          .bundle_txn_cnt = (ushort)txn->bundle_txn_cnt,
-          .commission     = txn->commission,
+          .block_slot     = s->block_slot,
+          .bundle_txn_cnt = s->block_txn_cnt,
+          .commission     = s->commission,
         },
       };
-      fd_memcpy( txnm->block_engine.commission_pubkey, txn->commission_pubkey, 32UL );
-      fd_memcpy( fd_txn_m_payload( txnm ), txn->payload, txn->payload_sz );
+      fd_memcpy( txnm->block_engine.commission_pubkey, s->commission_pubkey, 32UL );
+      fd_memcpy( fd_txn_m_payload( txnm ), s->payload, s->payload_sz );
 
       ulong sz    = fd_txn_m_realized_footprint( txnm, 0, 0 );
       ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now() );
-      fd_stem_publish( stem, ctx->verify_out.idx, txn->sig, ctx->verify_out.chunk, sz, 0UL, 0UL, tspub );
+      fd_stem_publish( stem, ctx->verify_out.idx, 2UL, ctx->verify_out.chunk, sz, 0UL, 0UL, tspub );
       ctx->verify_out.chunk = fd_dcache_compact_next( ctx->verify_out.chunk, sz, ctx->verify_out.chunk0, ctx->verify_out.wmark );
 
-      pending_txn_remove_head( ctx->pending_txns );
-      drain_cnt++;
-    } while( fd_bundle_drain_continue( ctx->pending_txns, drain_sig, drain_seq, drain_cnt, STEM_BURST ) );
-
+      ctx->harmonic_block_txn_received_cnt++;
+    }
+    verify_budget -= n;
+    ctx->harmonic_pending_len -= n;
+    if( FD_UNLIKELY( ctx->harmonic_pending_len ) ) {
+      memmove( ctx->harmonic_staging, ctx->harmonic_staging + n,
+               ctx->harmonic_pending_len * sizeof(fd_bundle_harmonic_staged_txn_t) );
+    }
     *charge_busy = 1;
     *opt_poll_in = 0;
+  }
+
+  if( FD_LIKELY( verify_budget && !pending_txn_empty( ctx->pending_txns ) ) ) {
+    fd_bundle_pending_txn_t * head = pending_txn_peek_head( ctx->pending_txns );
+
+    if( FD_UNLIKELY( head->sig==1UL ) ) {
+      ulong const bsz = pending_bundle_txn_cnt_at_head( ctx->pending_txns );
+      if( FD_LIKELY( bsz && bsz<=verify_budget ) ) {
+        for( ulong i=0UL; i<bsz; i++ ) {
+          fd_bundle_pending_txn_t const * txn = pending_txn_peek_head( ctx->pending_txns );
+
+          fd_txn_m_t * txnm = fd_chunk_to_laddr( ctx->verify_out.mem, ctx->verify_out.chunk );
+          *txnm = (fd_txn_m_t) {
+            .reference_slot = 0UL,
+            .payload_sz     = txn->payload_sz,
+            .txn_t_sz       = 0U,
+            .source_ipv4    = txn->source_ipv4,
+            .source_tpu     = txn->source_tpu,
+            .block_engine   = {
+              .bundle_id      = txn->bundle_seq,
+              .bundle_txn_cnt = (ushort)txn->bundle_txn_cnt,
+              .commission     = txn->commission,
+            },
+          };
+          fd_memcpy( txnm->block_engine.commission_pubkey, txn->commission_pubkey, 32UL );
+          fd_memcpy( fd_txn_m_payload( txnm ), txn->payload, txn->payload_sz );
+
+          ulong sz    = fd_txn_m_realized_footprint( txnm, 0, 0 );
+          ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now() );
+          fd_stem_publish( stem, ctx->verify_out.idx, txn->sig, ctx->verify_out.chunk, sz, 0UL, 0UL, tspub );
+          ctx->verify_out.chunk = fd_dcache_compact_next( ctx->verify_out.chunk, sz, ctx->verify_out.chunk0, ctx->verify_out.wmark );
+
+          pending_txn_remove_head( ctx->pending_txns );
+        }
+        verify_budget -= bsz;
+        *charge_busy = 1;
+        *opt_poll_in = 0;
+      }
+    } else {
+      ulong drain_seq    = head->bundle_seq;
+      ulong drain_sig    = head->sig;
+      ulong drain_cnt    = 0UL;
+      ulong drain_budget = verify_budget;
+
+      do {
+        fd_bundle_pending_txn_t const * txn = pending_txn_peek_head( ctx->pending_txns );
+
+        fd_txn_m_t * txnm = fd_chunk_to_laddr( ctx->verify_out.mem, ctx->verify_out.chunk );
+        *txnm = (fd_txn_m_t) {
+          .reference_slot = 0UL,
+          .payload_sz     = txn->payload_sz,
+          .txn_t_sz       = 0U,
+          .source_ipv4    = txn->source_ipv4,
+          .source_tpu     = txn->source_tpu,
+          .block_engine   = {
+            .bundle_id      = txn->bundle_seq,
+            .bundle_txn_cnt = (ushort)txn->bundle_txn_cnt,
+            .commission     = txn->commission,
+          },
+        };
+        fd_memcpy( txnm->block_engine.commission_pubkey, txn->commission_pubkey, 32UL );
+        fd_memcpy( fd_txn_m_payload( txnm ), txn->payload, txn->payload_sz );
+
+        ulong sz    = fd_txn_m_realized_footprint( txnm, 0, 0 );
+        ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now() );
+        fd_stem_publish( stem, ctx->verify_out.idx, txn->sig, ctx->verify_out.chunk, sz, 0UL, 0UL, tspub );
+        ctx->verify_out.chunk = fd_dcache_compact_next( ctx->verify_out.chunk, sz, ctx->verify_out.chunk0, ctx->verify_out.wmark );
+
+        pending_txn_remove_head( ctx->pending_txns );
+        drain_cnt++;
+        verify_budget--;
+      } while( verify_budget && fd_bundle_drain_continue( ctx->pending_txns, drain_sig, drain_seq, drain_cnt, drain_budget ) );
+
+      *charge_busy = 1;
+      *opt_poll_in = 0;
+    }
   }
 
   /* Drive the TPU endpoint if enabled */
@@ -448,6 +566,9 @@ privileged_init( fd_topo_t *      topo,
   void *             grpc_tpu_mem = FD_SCRATCH_ALLOC_APPEND( l, fd_grpc_client_align(),    fd_grpc_client_footprint( tile->bundle.buf_sz ) );
   void *             alloc_mem    = FD_SCRATCH_ALLOC_APPEND( l, fd_alloc_align(),          fd_alloc_footprint()                            );
   void *             deque_mem    = FD_SCRATCH_ALLOC_APPEND( l, pending_txn_align(),       pending_txn_footprint( pending_max )            );
+  void *             harmonic_staging_mem = FD_SCRATCH_ALLOC_APPEND( l,
+      alignof(fd_bundle_harmonic_staged_txn_t),
+      sizeof(fd_bundle_harmonic_staged_txn_t) * pending_max );
   ulong              scratch_end  = FD_SCRATCH_ALLOC_FINI( l, scratch_align() );
   (void)alloc_mem; /* potentially unused */
 
@@ -465,6 +586,8 @@ privileged_init( fd_topo_t *      topo,
   ctx->tcp_sock            = -1;
   ctx->tpu_tcp_sock        = -1;
   ctx->pending_txns        = pending_txn_join( pending_txn_new( deque_mem, pending_max ) );
+  ctx->harmonic_staging    = harmonic_staging_mem;
+  ctx->harmonic_staging_max = pending_max;
 
   fd_bundle_auther_init( &ctx->auther );
   uchar const * public_key = fd_keyload_load( tile->bundle.identity_key_path, 1 /* public key only */ );

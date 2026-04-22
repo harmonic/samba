@@ -83,6 +83,17 @@ test_bundle_env_create( test_bundle_env_t * env,
   state->pending_txns = pending_txn_join( pending_txn_new( env->deque_mem, pending_max ) );
   FD_TEST( state->pending_txns );
 
+  /* Allocate harmonic staging buffer (mirrors privileged_init).  Sized
+     to pending_max so the test environment matches production where
+     staging is sized to bundle.out_depth. */
+  state->harmonic_staging = fd_wksp_alloc_laddr(
+      wksp,
+      alignof(fd_bundle_harmonic_staged_txn_t),
+      sizeof(fd_bundle_harmonic_staged_txn_t) * pending_max,
+      1UL );
+  FD_TEST( state->harmonic_staging );
+  state->harmonic_staging_max = pending_max;
+
   FD_TEST( fd_rng_new( state->rng, 0U, 0UL ) );
   long ka_interval = (long)1e9;
   long ka_timeout  = (long)1e9;
@@ -226,5 +237,8 @@ test_bundle_env_destroy( test_bundle_env_t * env ) {
   fd_wksp_free_laddr( fd_dcache_delete( fd_dcache_leave( env->out_dcache ) ) );
   fd_wksp_free_laddr( env->state->grpc_client_mem );
   fd_wksp_free_laddr( pending_txn_delete( pending_txn_leave( env->state->pending_txns ) ) );
+  if( env->state->harmonic_staging ) {
+    fd_wksp_free_laddr( env->state->harmonic_staging );
+  }
   fd_memset( env, 0, sizeof(test_bundle_env_t) );
 }

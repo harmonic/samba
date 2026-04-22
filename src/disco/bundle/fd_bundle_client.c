@@ -56,6 +56,9 @@ fd_bundle_client_reset( fd_bundle_tile_t * ctx ) {
   ctx->bundle_subscription_wait = 0;
   ctx->harmonic_block_subscription_live = 0;
   ctx->harmonic_block_subscription_wait = 0;
+  ctx->harmonic_pending_len             = 0UL;
+  ctx->harmonic_staged_block_slot       = 0UL;
+  ctx->harmonic_staged_block_txn_cnt    = 0;
 
   fd_memset( ctx->rtt, 0, sizeof(fd_rtt_estimate_t) );
 
@@ -1260,62 +1263,9 @@ fd_bundle_request_ctx_cstr( ulong request_ctx ) {
 
 /* ========== Block mode protobuf handlers ========== */
 
-/* Forward block transaction to tango message bus.
-   Block transactions have no len=5 limit.
-   For blocks, the slot is parsed from the uuid field. */
-static void
-fd_harmonic_block_tile_publish_block_txn(
-    fd_bundle_tile_t * ctx,
-    void const *       txn,
-    ulong              txn_sz,
-    ulong              block_txn_cnt,
-    uint               source_ipv4
-) {
-  fd_txn_m_t * txnm = fd_chunk_to_laddr( ctx->verify_out.mem, ctx->verify_out.chunk );
-  *txnm = (fd_txn_m_t) {
-    .reference_slot = 0UL,
-    .payload_sz     = (ushort)txn_sz,
-    .txn_t_sz       = 0U,
-    .source_ipv4    = source_ipv4,
-    .source_tpu     = FD_TXN_M_TPU_SOURCE_HARMONIC,
-    .block_engine   = {
-      .block_slot     = ctx->harmonic_block_slot,  /* Intended landing slot */
-      .bundle_txn_cnt = (ushort)block_txn_cnt,
-      .commission     = (uchar)ctx->builder_commission
-    },
-  };
-  memcpy( txnm->block_engine.commission_pubkey, ctx->builder_pubkey, 32UL );
-  fd_memcpy( fd_txn_m_payload( txnm ), txn, txn_sz );
-
-  ulong sz  = fd_txn_m_realized_footprint( txnm, 0, 0 );
-  ulong sig = 2UL; /* Use sig=2 to distinguish block txns from bundle txns (sig=1) */
-
-  if( FD_UNLIKELY( !ctx->stem ) ) {
-    FD_LOG_CRIT(( "ctx->stem not set. This is a bug." ));
-  }
-
-  ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now() );
-  fd_stem_publish( ctx->stem, ctx->verify_out.idx, sig, ctx->verify_out.chunk, sz, 0UL, 0UL, tspub );
-  ctx->verify_out.chunk = fd_dcache_compact_next( ctx->verify_out.chunk, sz, ctx->verify_out.chunk0, ctx->verify_out.wmark );
-  ctx->harmonic_block_txn_received_cnt++;
-}
-
-/* Called for each transaction in a block.  Counts transactions. */
+/* Append one harmonic block txn to in-tile staging (published from after_credit). */
 static bool
-fd_harmonic_block_client_visit_pb_block_txn_preflight(
-    pb_istream_t *     istream,
-    pb_field_t const * field,
-    void **            arg
-) {
-  (void)istream; (void)field;
-  fd_bundle_tile_t * ctx = *arg;
-  ctx->harmonic_block_txn_cnt++;
-  return true;
-}
-
-/* Called for each transaction in a block.  Publishes each transaction. */
-static bool
-fd_harmonic_block_client_visit_pb_block_txn(
+fd_harmonic_block_client_visit_pb_block_txn_stage(
     pb_istream_t *     istream,
     pb_field_t const * field,
     void **            arg
@@ -1340,14 +1290,45 @@ fd_harmonic_block_client_visit_pb_block_txn(
     return true;
   }
 
-  uint _ip4; uint ip4 = fd_uint_if( packet.has_meta, fd_cstr_to_ip4_addr( packet.meta.addr, &_ip4 ) ? _ip4 : ctx->server_ip4_addr, ctx->server_ip4_addr );
-  fd_harmonic_block_tile_publish_block_txn(
-      ctx,
-      packet.data.bytes, packet.data.size,
-      ctx->harmonic_block_txn_cnt,
-      ip4
-  );
+  if( FD_UNLIKELY( ctx->harmonic_pending_len>=ctx->harmonic_staging_max ) ) {
+    /* Safety net.  This should not occur in practice: staging is sized
+       to bundle.out_depth (default 16384) and one fd_h2_rx pass is
+       bounded by rbuf_rx capacity.  If we ever do hit this, drop the
+       in-progress decode so the SubscribeBundlesResponse parse fails
+       and the gRPC stream is torn down + reconnected; that is
+       preferable to silently truncating a block. */
+    FD_LOG_WARNING(( "harmonic staging full (%lu/%lu)",
+                     ctx->harmonic_pending_len, ctx->harmonic_staging_max ));
+    return false;
+  }
 
+  uint _ip4; uint ip4 = fd_uint_if( packet.has_meta, fd_cstr_to_ip4_addr( packet.meta.addr, &_ip4 ) ? _ip4 : ctx->server_ip4_addr, ctx->server_ip4_addr );
+
+  fd_bundle_harmonic_staged_txn_t * s = &ctx->harmonic_staging[ ctx->harmonic_pending_len ];
+  fd_memcpy( s->payload, packet.data.bytes, packet.data.size );
+  s->payload_sz    = (ushort)packet.data.size;
+  s->source_ipv4   = ip4;
+  /* Snapshot per-block metadata so we can drain entries from
+     different blocks correctly in after_credit. */
+  s->block_slot    = ctx->harmonic_staged_block_slot;
+  s->block_txn_cnt = ctx->harmonic_staged_block_txn_cnt;
+  s->commission    = (uchar)ctx->builder_commission;
+  fd_memcpy( s->commission_pubkey, ctx->builder_pubkey, 32UL );
+  ctx->harmonic_pending_len++;
+
+  return true;
+}
+
+/* Called for each transaction in a block.  Counts transactions. */
+static bool
+fd_harmonic_block_client_visit_pb_block_txn_preflight(
+    pb_istream_t *     istream,
+    pb_field_t const * field,
+    void **            arg
+) {
+  (void)istream; (void)field;
+  fd_bundle_tile_t * ctx = *arg;
+  ctx->harmonic_block_txn_cnt++;
   return true;
 }
 
@@ -1402,18 +1383,6 @@ fd_harmonic_block_client_visit_pb_block_uuid(
 
   /* No len=5 limit for blocks! */
 
-  ctx->harmonic_block_seq++;
-  bundle = (bundle_BundleUuid)bundle_BundleUuid_init_default;
-  bundle.bundle.packets = (pb_callback_t) {
-    .funcs.decode = fd_harmonic_block_client_visit_pb_block_txn,
-    .arg          = ctx
-  };
-
-  ctx->harmonic_block_received_cnt++;
-
-  FD_LOG_DEBUG(( "Received block slot=%lu, %lu packets",
-                 ctx->harmonic_block_slot, ctx->harmonic_block_txn_cnt ));
-
   /* Harmonic: bundle_txn_cnt is a ushort. Reject blocks exceeding USHORT_MAX.
      In practice, blocks typically have O(≈1000) txns */
   if( FD_UNLIKELY( ctx->harmonic_block_txn_cnt > USHORT_MAX ) ) {
@@ -1422,14 +1391,43 @@ fd_harmonic_block_client_visit_pb_block_uuid(
     return true;  /* Skip this block but continue processing */
   }
 
+  ctx->harmonic_block_seq++;
+  ctx->harmonic_block_received_cnt++;
+
+  FD_LOG_DEBUG(( "Received block slot=%lu, %lu packets",
+                 ctx->harmonic_block_slot, ctx->harmonic_block_txn_cnt ));
+
+  bundle = (bundle_BundleUuid)bundle_BundleUuid_init_default;
+
+  /* Snapshot block-scoped metadata so the per-txn stage callback can
+     attach it to each entry.  Multiple BundleUuids may be staged
+     before after_credit drains them, so we cannot rely on these ctx
+     fields at drain time — they only reflect the most-recently-seen
+     block.  Keeping them updated here preserves observability via
+     the existing fields. */
+  ulong  const len_before = ctx->harmonic_pending_len;
+  ctx->harmonic_staged_block_slot    = ctx->harmonic_block_slot;
+  ctx->harmonic_staged_block_txn_cnt = (ushort)ctx->harmonic_block_txn_cnt;
+
+  bundle.bundle.packets = (pb_callback_t) {
+    .funcs.decode = fd_harmonic_block_client_visit_pb_block_txn_stage,
+    .arg          = ctx
+  };
+
   if( FD_UNLIKELY( !pb_decode( istream, &bundle_BundleUuid_msg, &bundle ) ) ) {
     ctx->metrics.decode_fail_cnt++;
     FD_LOG_WARNING(( "Protobuf decode of block (bundle.BundleUuid) failed (internal error): %s", istream->errmsg ));
+    /* Roll back partially-staged txns from THIS block only; keep
+       previously-staged blocks intact so they still get published. */
+    ctx->harmonic_pending_len = len_before;
     return false;
   }
 
-  FD_LOG_DEBUG(( "CAVEY DEBUG: bundle published all %lu block txns for slot=%lu",
-                  ctx->harmonic_block_txn_cnt, ctx->harmonic_block_slot ));
+  if( FD_UNLIKELY( ctx->harmonic_pending_len==len_before && ctx->harmonic_block_txn_cnt ) ) {
+    FD_LOG_WARNING(( "HARMONIC: block had %lu packets in preflight but none staged (slot=%lu)",
+                     ctx->harmonic_block_txn_cnt, ctx->harmonic_block_slot ));
+    return false;
+  }
 
   return true;
 }

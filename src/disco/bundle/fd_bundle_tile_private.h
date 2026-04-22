@@ -14,9 +14,33 @@
 #include "../tiles.h"
 #define FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE (5UL)
 
-/* Pending transaction buffer.  gRPC callbacks push decoded transactions
-   here.  after_credit drains one bundle per call by writing to dcache
-   and calling fd_stem_publish.
+/* Harmonic block transactions are copied into an in-tile staging buffer
+   and published only from after_credit (sharing per-iteration verify
+   budget with pending txns).  The staging buffer is sized to match the
+   verify_out link depth (tile->bundle.out_depth) so that one call to
+   fd_h2_rx (bounded by rbuf_rx capacity) cannot overflow it in
+   practice; this lets us accept multiple BundleUuids back-to-back
+   without dropping any.
+
+   Each staged txn carries its own block metadata (block_slot,
+   block_txn_cnt, commission, commission_pubkey) so that staged txns
+   from different blocks can coexist in the buffer without losing
+   per-block context. */
+
+typedef struct {
+  ushort payload_sz;
+  uint   source_ipv4;
+  ulong  block_slot;
+  ushort block_txn_cnt;
+  uchar  commission;
+  uchar  commission_pubkey[ 32 ];
+  uchar  payload[ FD_TXN_MTU ];
+} fd_bundle_harmonic_staged_txn_t;
+
+/* Pending transaction buffer.  gRPC callbacks push decoded bundle and
+   packet transactions here.  after_credit drains by writing to dcache
+   and calling fd_stem_publish.  Harmonic block txns use the parallel
+   harmonic_staging[] buffer with the same drain pattern.
 
    Sized to match the bundle_verif output link depth. */
 
@@ -269,6 +293,26 @@ struct fd_bundle_tile {
   /* Harmonic block metrics */
   ulong harmonic_block_received_cnt;
   ulong harmonic_block_txn_received_cnt;
+
+  /* Staging for harmonic batches.  Filled during gRPC decode; drained
+     in after_credit.  When harmonic_pending_len!=0, before_credit
+     defers fd_bundle_client_step so the stream cannot run ahead of
+     published order.  Sized to bundle.out_depth so a single fd_h2_rx
+     pass (bounded by rbuf_rx) cannot overflow it.
+
+     Per-entry block_slot/block_txn_cnt/commission/commission_pubkey
+     allow multiple distinct blocks to coexist in the staging buffer
+     when the server pipelines BundleUuids across one or more gRPC
+     messages decoded in the same I/O turn.
+
+     harmonic_staged_block_slot/_txn_cnt mirror the most recently
+     staged block's metadata for diagnostics/observability only;
+     after_credit reads per-entry metadata. */
+  fd_bundle_harmonic_staged_txn_t * harmonic_staging;
+  ulong                             harmonic_staging_max;
+  ulong                             harmonic_pending_len;
+  ulong                             harmonic_staged_block_slot;
+  ushort                            harmonic_staged_block_txn_cnt;
 
   /* PoH became_leader message */
   fd_became_leader_t _became_leader[1];
