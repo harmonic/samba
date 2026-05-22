@@ -1919,6 +1919,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->bundle.keepalive_interval_nanos = config->tiles.bundle.keepalive_interval_millis * (ulong)1e6;
     tile->bundle.tls_cert_verify = !!config->tiles.bundle.tls_cert_verify;
     tile->bundle.harmonic_block_mode = config->tiles.bundle.harmonic_block_mode;
+    tile->bundle.strategy = config->tiles.bundle.strategy_enum;
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "accdb" ) ) ) {
 

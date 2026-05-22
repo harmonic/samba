@@ -616,6 +616,9 @@ privileged_init( fd_topo_t *      topo,
   /* Initialize harmonic block mode state */
   ctx->harmonic_block_mode = tile->bundle.harmonic_block_mode;
 
+  /* Scheduling strategy (block_engine_SchedulingStrategy; validated by fd_config) */
+  ctx->strategy = tile->bundle.strategy;
+
 # if FD_HAS_OPENSSL
 
   if( FD_UNLIKELY( tile->bundle.key_log_path[0] ) ) {

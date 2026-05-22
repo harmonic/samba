@@ -291,6 +291,9 @@ struct fd_topo_tile {
       int   harmonic_block_mode; /* If set, enables a third stream (subscribeBundles) for
                                     harmonic block subscriptions. Normal bundle subscriptions
                                     (len<=5) remain active. */
+
+      /* Block engine scheduling strategy for Harmonic block mode */
+      int   strategy;
     } bundle;
 
     struct {
