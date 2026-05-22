@@ -50,6 +50,8 @@ fd_bundle_client_reset( fd_bundle_tile_t * ctx ) {
   ctx->builder_info_avail       = 0;
   ctx->builder_info_wait        = 0;
   ctx->submit_leader_window_info_wait = 0;
+  ctx->set_strategy_done        = 0;
+  ctx->set_strategy_wait        = 0;
   ctx->packet_subscription_live = 0;
   ctx->packet_subscription_wait = 0;
   ctx->bundle_subscription_live = 0;
@@ -326,6 +328,42 @@ fd_bundle_client_send_ping( fd_bundle_tile_t * ctx ) {
   }
 }
 
+static char const *
+fd_bundle_strategy_cstr( int strategy ) {
+  switch( strategy ) {
+  case block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_FBA:  return "fba";
+  case block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_MREV: return "mrev";
+  case block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_FIFO: return "fifo";
+  default:                                                       return "unknown";
+  }
+}
+
+static void
+fd_bundle_client_set_strategy( fd_bundle_tile_t * ctx ) {
+  if( FD_UNLIKELY( fd_grpc_client_request_is_blocked( ctx->grpc_client ) ) ) return;
+
+  block_engine_SetStrategyRequest req = block_engine_SetStrategyRequest_init_default;
+  req.strategy = (block_engine_SchedulingStrategy)ctx->strategy;
+
+  static char const path[] = "/block_engine.BlockEngineValidator/SetStrategy";
+  fd_grpc_h2_stream_t * request = fd_grpc_client_request_start(
+      ctx->grpc_client,
+      path, sizeof(path)-1,
+      FD_BUNDLE_CLIENT_REQ_SetStrategy,
+      &block_engine_SetStrategyRequest_msg, &req,
+      ctx->auther.access_token, ctx->auther.access_token_sz,
+      0 /* is_streaming */
+  );
+  if( FD_UNLIKELY( !request ) ) return;
+  fd_grpc_client_deadline_set(
+      request,
+      FD_GRPC_DEADLINE_RX_END,
+      fd_log_wallclock() + FD_BUNDLE_CLIENT_REQUEST_TIMEOUT );
+
+  ctx->set_strategy_wait = 1;
+  FD_LOG_INFO(( "Setting scheduling strategy: %s", fd_bundle_strategy_cstr( ctx->strategy ) ));
+}
+
 void
 fd_bundle_client_submit_leader_window_info( fd_bundle_tile_t * ctx,
                                             ulong              slot,
@@ -366,6 +404,12 @@ fd_bundle_client_step_reconnect( fd_bundle_tile_t * ctx,
     return 1;
   }
   if( FD_UNLIKELY( ctx->auther.state!=FD_BUNDLE_AUTH_STATE_DONE_WAIT ) ) return 0;
+
+  /* Set scheduling strategy */
+  if( FD_UNLIKELY( !ctx->set_strategy_done && !ctx->set_strategy_wait ) ) {
+    fd_bundle_client_set_strategy( ctx );
+    return 1;
+  }
 
   /* Request block builder info */
   int const builder_info_expired = ( ctx->builder_info_valid_until - now )<0;
@@ -1009,6 +1053,15 @@ fd_bundle_client_grpc_rx_msg(
     }
     break;
   }
+  case FD_BUNDLE_CLIENT_REQ_SetStrategy: {
+    /* Handle SetStrategyResponse (empty response) */
+    block_engine_SetStrategyResponse res = block_engine_SetStrategyResponse_init_default;
+    if( FD_UNLIKELY( !pb_decode( &istream, &block_engine_SetStrategyResponse_msg, &res ) ) ) {
+      ctx->metrics.decode_fail_cnt++;
+      FD_LOG_WARNING(( "Protobuf decode of (block_engine.SetStrategyResponse) failed: %s", istream.errmsg ));
+    }
+    break;
+  }
   default:
     FD_LOG_ERR(( "Received unexpected gRPC message (request_ctx=%lu)", request_ctx ));
   }
@@ -1059,6 +1112,13 @@ fd_bundle_client_grpc_rx_end(
     if( FD_UNLIKELY( request_ctx==FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo ) ) {
       ctx->submit_leader_window_info_wait = 0;
     }
+    if( FD_UNLIKELY( request_ctx==FD_BUNDLE_CLIENT_REQ_SetStrategy ) ) {
+      /* TODO: fail the connection here once all block engines implement SetStrategy */
+      ctx->set_strategy_wait = 0;
+      ctx->set_strategy_done = 1;
+      FD_LOG_WARNING(( "SetStrategy returned HTTP %u; continuing without setting strategy", resp->h2_status ));
+      return;
+    }
     fd_bundle_client_request_failed( ctx, request_ctx );
     return;
   }
@@ -1100,6 +1160,11 @@ fd_bundle_client_grpc_rx_end(
   case FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo:
     ctx->submit_leader_window_info_wait = 0;
     break;
+  case FD_BUNDLE_CLIENT_REQ_SetStrategy:
+    /* TODO: stop ignoring gRPC errors here once all block engines implement SetStrategy */
+    ctx->set_strategy_wait = 0;
+    ctx->set_strategy_done = 1;
+    break;
   default:
     break;
   }
@@ -1128,6 +1193,9 @@ fd_bundle_client_grpc_rx_timeout(
   fd_bundle_tile_t * ctx = app_ctx;
   if( FD_UNLIKELY( request_ctx==FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo ) ) {
     ctx->submit_leader_window_info_wait = 0;
+  }
+  if( FD_UNLIKELY( request_ctx==FD_BUNDLE_CLIENT_REQ_SetStrategy ) ) {
+    ctx->set_strategy_wait = 0;
   }
   ctx->defer_reset = 1;
 }
@@ -1271,6 +1339,8 @@ fd_bundle_request_ctx_cstr( ulong request_ctx ) {
     return "SubscribeBlocks";
   case FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo:
     return "SubmitLeaderWindowInfo";
+  case FD_BUNDLE_CLIENT_REQ_SetStrategy:
+    return "SetStrategy";
   case FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU:
     return "SubscribePacketsTPU";
   default:
