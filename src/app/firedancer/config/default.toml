@@ -1297,6 +1297,15 @@ telemetry = true
         # this option to 'false'.
         tls_cert_verify = true
 
+        # Scheduling strategy to pass to the block engine.  Accepted values:
+        #
+        #   "fifo" - First-in, first-out continuous availability sequencing
+        #   "fba"  - Frequent batch auction: discrete batches ordered by
+        #            priority fees and tips (default - matches salsa)
+        #   "mrev" - Maximum revenue: continuous streaming with
+        #            revenue-prioritizing selection
+        strategy = "fba"
+
     # The pack tile takes incoming transactions that have been verified
     # by the verify tile and then deduplicated, and attempts to order
     # them in an optimal way to generate the most fees per compute

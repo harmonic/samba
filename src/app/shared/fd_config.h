@@ -431,6 +431,9 @@ struct fd_config {
       int   tls_cert_verify;
       /* Harmonic config */
       int  harmonic_block_mode;
+      /* Harmonic block mode scheduling strategy */
+      char strategy[ 8 ];
+      int  strategy_enum;
     } bundle;
 
     struct {
