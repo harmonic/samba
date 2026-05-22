@@ -179,6 +179,11 @@ struct fd_bundle_tile {
   /* Leader window info submission */
   uchar submit_leader_window_info_wait : 1;  /* Request already in-flight? */
 
+  /* Scheduling strategy selection */
+  int   strategy;            /* block_engine_SchedulingStrategy value */
+  uchar set_strategy_done : 1;  /* SetStrategy RPC succeeded for this connection */
+  uchar set_strategy_wait : 1;  /* Request already in-flight? */
+
   /* Bundle subscriptions */
   uchar packet_subscription_live : 1;  /* Want to subscribe to a stream? */
   uchar packet_subscription_wait : 1;  /* Request already in-flight? */
@@ -358,6 +363,9 @@ typedef struct fd_bundle_tile fd_bundle_tile_t;
 /* TPU endpoint request context IDs */
 #define FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU                9
 #define FD_BUNDLE_CLIENT_REQ_GetTpuConfigs                      10
+
+/* Scheduling strategy selection */
+#define FD_BUNDLE_CLIENT_REQ_SetStrategy                        11
 
 FD_PROTOTYPES_BEGIN
 
