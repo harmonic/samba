@@ -1233,12 +1233,16 @@ test_harmonic_before_credit_gate( fd_wksp_t * wksp ) {
   FD_TEST( flush_harmonic_staging( state )==2UL );
   FD_TEST( state->harmonic_pending_len==0UL );
 
-  /* Now before_credit would check pending_txns (non-empty → still no
-     gRPC step).  Drain the pending deque too. */
-  FD_TEST( publish_after_credit( state )==1UL );
-  FD_TEST( pending_txn_empty( state->pending_txns ) );
+  /* P0: pending_txns is still occupied, but harmonic subscription is live so
+     before_credit would still drive gRPC.  Verify a new block batch can be
+     received while pending_txns is non-empty. */
+  FD_TEST( !pending_txn_empty( state->pending_txns ) );
+  FD_TEST( state->harmonic_block_mode );
+  FD_TEST( state->harmonic_block_subscription_live );
+  int const drive_io = pending_txn_empty( state->pending_txns )
+                    || ( state->harmonic_block_mode && state->harmonic_block_subscription_live );
+  FD_TEST( drive_io );
 
-  /* Both gates are now open.  A new harmonic block can be received. */
   fd_bundle_client_grpc_callbacks.rx_msg(
       state,
       subscribe_blocks_msg_slot_99999999, subscribe_blocks_msg_slot_99999999_sz,
@@ -1249,9 +1253,56 @@ test_harmonic_before_credit_gate( fd_wksp_t * wksp ) {
   FD_TEST( state->harmonic_block_received_cnt==2UL );
 
   FD_TEST( flush_harmonic_staging( state )==6UL );
+
+  /* Drain the pending deque. */
+  FD_TEST( publish_after_credit( state )==1UL );
+  FD_TEST( pending_txn_empty( state->pending_txns ) );
+
   FD_TEST( published_txn_cnt( env )==9UL );
 
   FD_LOG_NOTICE(( "before_credit gate test passed" ));
+  test_bundle_env_destroy( env );
+}
+
+/* Verify slot-level batch failure latch rejects further batches. */
+static void
+test_harmonic_block_failed_slot_latch( fd_wksp_t * wksp ) {
+  FD_LOG_NOTICE(( "Testing harmonic block failed-slot latch" ));
+  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
+  test_bundle_env_enable_harmonic_block_mode( env, wksp );
+  test_bundle_env_mock_harmonic_block_conn( env );
+  fd_bundle_tile_t * state = env->state;
+
+  state->builder_info_avail = 1;
+
+  fd_bundle_client_grpc_callbacks.rx_msg(
+      state,
+      subscribe_blocks_msg_slot_12345678, subscribe_blocks_msg_slot_12345678_sz,
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+  );
+  FD_TEST( state->harmonic_pending_len==2UL );
+  FD_TEST( flush_harmonic_staging( state )==2UL );
+
+  state->harmonic_block_failed_slot = 12345678UL;
+
+  fd_bundle_client_grpc_callbacks.rx_msg(
+      state,
+      subscribe_blocks_msg_slot_12345678, subscribe_blocks_msg_slot_12345678_sz,
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+  );
+  FD_TEST( state->harmonic_pending_len==0UL );
+  FD_TEST( state->harmonic_block_failed_slot==12345678UL );
+
+  state->harmonic_block_failed_slot = 0UL;
+
+  fd_bundle_client_grpc_callbacks.rx_msg(
+      state,
+      subscribe_blocks_msg_slot_99999999, subscribe_blocks_msg_slot_99999999_sz,
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+  );
+  FD_TEST( state->harmonic_pending_len==6UL );
+
+  FD_LOG_NOTICE(( "harmonic block failed-slot latch test passed" ));
   test_bundle_env_destroy( env );
 }
 
@@ -2423,6 +2474,7 @@ main( int     argc,
   test_deque_overflow_guard( wksp );
   test_harmonic_staging_partial_drain( wksp );
   test_harmonic_before_credit_gate( wksp );
+  test_harmonic_block_failed_slot_latch( wksp );
   test_reset_clears_harmonic_state( wksp );
 
   /* Check for memory leaks */

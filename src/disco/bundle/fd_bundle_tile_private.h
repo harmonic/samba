@@ -306,6 +306,14 @@ struct fd_bundle_tile {
   ulong harmonic_block_received_cnt;
   ulong harmonic_block_txn_received_cnt;
 
+  /* Set when a block batch fails decode/staging for slot S.  Further batches
+     for S are rejected until the next became_leader clears this. */
+  ulong harmonic_block_failed_slot;
+
+  /* harmonic_pending_len at the start of the in-flight SubscribeBundlesResponse
+     decode.  Used to roll back the entire response on batch failure. */
+  ulong harmonic_block_response_staging_len;
+
   /* Staging for harmonic batches.  Filled during gRPC decode; drained
      in after_credit.  When harmonic_pending_len!=0, before_credit
      defers fd_bundle_client_step so the stream cannot run ahead of

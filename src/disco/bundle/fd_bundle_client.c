@@ -58,9 +58,11 @@ fd_bundle_client_reset( fd_bundle_tile_t * ctx ) {
   ctx->bundle_subscription_wait = 0;
   ctx->harmonic_block_subscription_live = 0;
   ctx->harmonic_block_subscription_wait = 0;
-  ctx->harmonic_pending_len             = 0UL;
-  ctx->harmonic_staged_block_slot       = 0UL;
-  ctx->harmonic_staged_block_txn_cnt    = 0;
+  ctx->harmonic_pending_len                  = 0UL;
+  ctx->harmonic_staged_block_slot            = 0UL;
+  ctx->harmonic_staged_block_txn_cnt         = 0;
+  ctx->harmonic_block_failed_slot            = 0UL;
+  ctx->harmonic_block_response_staging_len   = 0UL;
 
   fd_memset( ctx->rtt, 0, sizeof(fd_rtt_estimate_t) );
 
@@ -1353,6 +1355,19 @@ fd_bundle_request_ctx_cstr( ulong request_ctx ) {
 
 /* ========== Block mode protobuf handlers ========== */
 
+/* ========== Harmonic block client implementation ========== */
+
+static void
+fd_harmonic_block_batch_fail( fd_bundle_tile_t * ctx,
+                              ulong              slot,
+                              ulong              rollback_len ) {
+  ctx->harmonic_pending_len = rollback_len;
+  if( slot ) ctx->harmonic_block_failed_slot = slot;
+  else if( ctx->harmonic_block_slot ) ctx->harmonic_block_failed_slot = ctx->harmonic_block_slot;
+  FD_LOG_WARNING(( "CAVEY DEBUG: harmonic block batch failed for slot=%lu (staging rolled back to %lu)",
+                   ctx->harmonic_block_failed_slot, rollback_len ));
+}
+
 /* Append one harmonic block txn to in-tile staging (published from after_credit). */
 static bool
 fd_harmonic_block_client_visit_pb_block_txn_stage(
@@ -1372,12 +1387,12 @@ fd_harmonic_block_client_visit_pb_block_txn_stage(
 
   if( FD_UNLIKELY( packet.data.size == 0 ) ) {
     FD_LOG_WARNING(( "Block server delivered an empty packet, ignoring" ));
-    return true;
+    return false;
   }
 
   if( FD_UNLIKELY( packet.data.size > FD_TXN_MTU ) ) {
     FD_LOG_WARNING(( "Block server delivered an oversize transaction, ignoring" ));
-    return true;
+    return false;
   }
 
   if( FD_UNLIKELY( ctx->harmonic_pending_len>=ctx->harmonic_staging_max ) ) {
@@ -1448,6 +1463,7 @@ fd_harmonic_block_client_visit_pb_block_uuid(
   if( FD_UNLIKELY( !pb_decode( &peek, &bundle_BundleUuid_msg, &bundle ) ) ) {
     ctx->metrics.decode_fail_cnt++;
     FD_LOG_WARNING(( "Protobuf decode of block (bundle.BundleUuid) failed: %s", peek.errmsg ));
+    fd_harmonic_block_batch_fail( ctx, 0UL, ctx->harmonic_block_response_staging_len );
     return false;
   }
 
@@ -1469,6 +1485,14 @@ fd_harmonic_block_client_visit_pb_block_uuid(
     FD_LOG_WARNING(( "Invalid block uuid size: %lu", (ulong)bundle.uuid.size ));
     ctx->metrics.decode_fail_cnt++;
     return true;  /* Skip this block but continue processing */
+  }
+
+  if( FD_UNLIKELY( ctx->harmonic_block_failed_slot &&
+                   ctx->harmonic_block_slot==ctx->harmonic_block_failed_slot ) ) {
+    FD_LOG_WARNING(( "CAVEY DEBUG: rejecting block batch for latched-failed slot=%lu",
+                     ctx->harmonic_block_slot ));
+    fd_harmonic_block_batch_fail( ctx, ctx->harmonic_block_slot, ctx->harmonic_block_response_staging_len );
+    return false;
   }
 
   /* No len=5 limit for blocks! */
@@ -1507,15 +1531,22 @@ fd_harmonic_block_client_visit_pb_block_uuid(
   if( FD_UNLIKELY( !pb_decode( istream, &bundle_BundleUuid_msg, &bundle ) ) ) {
     ctx->metrics.decode_fail_cnt++;
     FD_LOG_WARNING(( "Protobuf decode of block (bundle.BundleUuid) failed (internal error): %s", istream->errmsg ));
-    /* Roll back partially-staged txns from THIS block only; keep
-       previously-staged blocks intact so they still get published. */
-    ctx->harmonic_pending_len = len_before;
+    fd_harmonic_block_batch_fail( ctx, ctx->harmonic_block_slot, ctx->harmonic_block_response_staging_len );
     return false;
   }
 
-  if( FD_UNLIKELY( ctx->harmonic_pending_len==len_before && ctx->harmonic_block_txn_cnt ) ) {
+  ulong const staged = ctx->harmonic_pending_len - len_before;
+  if( FD_UNLIKELY( staged != ctx->harmonic_block_txn_cnt ) ) {
+    FD_LOG_WARNING(( "CAVEY DEBUG: harmonic block batch txn count mismatch slot=%lu preflight=%lu staged=%lu",
+                     ctx->harmonic_block_slot, ctx->harmonic_block_txn_cnt, staged ));
+    fd_harmonic_block_batch_fail( ctx, ctx->harmonic_block_slot, ctx->harmonic_block_response_staging_len );
+    return false;
+  }
+
+  if( FD_UNLIKELY( !staged && ctx->harmonic_block_txn_cnt ) ) {
     FD_LOG_WARNING(( "HARMONIC: block had %lu packets in preflight but none staged (slot=%lu)",
                      ctx->harmonic_block_txn_cnt, ctx->harmonic_block_slot ));
+    fd_harmonic_block_batch_fail( ctx, ctx->harmonic_block_slot, ctx->harmonic_block_response_staging_len );
     return false;
   }
 
@@ -1529,6 +1560,8 @@ fd_bundle_client_handle_block_batch(
     fd_bundle_tile_t * ctx,
     pb_istream_t *     istream
 ) {
+  ctx->harmonic_block_response_staging_len = ctx->harmonic_pending_len;
+
   block_engine_SubscribeBundlesResponse res = block_engine_SubscribeBundlesResponse_init_default;
   res.bundles = (pb_callback_t) {
     .funcs.decode = fd_harmonic_block_client_visit_pb_block_uuid,
@@ -1537,6 +1570,7 @@ fd_bundle_client_handle_block_batch(
   if( FD_UNLIKELY( !pb_decode( istream, &block_engine_SubscribeBundlesResponse_msg, &res ) ) ) {
     ctx->metrics.decode_fail_cnt++;
     FD_LOG_WARNING(( "Protobuf decode of (block_engine.SubscribeBundlesResponse) for blocks failed: %s", istream->errmsg ));
+    fd_harmonic_block_batch_fail( ctx, ctx->harmonic_block_slot, ctx->harmonic_block_response_staging_len );
     return;
   }
 }

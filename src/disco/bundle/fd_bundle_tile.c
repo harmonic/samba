@@ -220,7 +220,13 @@ before_credit( fd_bundle_tile_t *  ctx,
      stream order cannot run ahead of verify_out publishes. */
   if( FD_UNLIKELY( ctx->harmonic_pending_len ) ) return;
 
-  if( pending_txn_empty( ctx->pending_txns ) ) {
+  /* Drive gRPC when the MEV pending deque is empty, or when harmonic block
+     subscription is live (P0).  Harmonic blocks use harmonic_staging[], not
+     pending_txns; blocking IO on pending_txns starved block batch reads. */
+  int const drive_io = pending_txn_empty( ctx->pending_txns )
+                    || ( ctx->harmonic_block_mode
+                      && ctx->harmonic_block_subscription_live );
+  if( drive_io ) {
     fd_bundle_client_step( ctx, charge_busy );
   }
 }
@@ -901,6 +907,8 @@ after_frag( fd_bundle_tile_t *  ctx,
 
   /* Only process messages from leader link */
   if( FD_UNLIKELY( in_idx != ctx->leader_in.idx ) ) return;
+
+  ctx->harmonic_block_failed_slot = 0UL;
 
   if( FD_UNLIKELY( ctx->submit_leader_window_info_wait ) ) {
     FD_LOG_WARNING(( "CAVEY DEBUG: Received became_leader message for slot=%lu, but SubmitLeaderWindowInfo request already in-flight",
