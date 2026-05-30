@@ -177,6 +177,12 @@ union fdctl_args {
   struct {
     ulong ready_slot;
   } ready;
+
+  struct {
+    char strategy[ 8 ];
+    int  strategy_enum;
+  } set_strategy;
+
 };
 
 typedef union fdctl_args args_t;
