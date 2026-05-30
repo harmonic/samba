@@ -96,6 +96,7 @@ extern action_t fd_action_get_identity;
 extern action_t fd_action_help;
 extern action_t fd_action_version;
 extern action_t fd_action_metrics;
+extern action_t fd_action_set_strategy;
 
 action_t * ACTIONS[] = {
   &fd_action_run,
@@ -112,6 +113,7 @@ action_t * ACTIONS[] = {
   &fd_action_help,
   &fd_action_version,
   &fd_action_metrics,
+  &fd_action_set_strategy,
   NULL,
 };
 

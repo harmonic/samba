@@ -36,6 +36,7 @@ ifdef FD_HAS_THREADS
 # fdctl commands
 $(call add-objs,commands/run_agave,fd_fdctl)
 $(call add-objs,commands/set_identityh,fd_fdctl)
+$(call add-objs,commands/set_strategy,fd_fdctl)
 
 # version
 $(call make-lib,fdctl_version)
