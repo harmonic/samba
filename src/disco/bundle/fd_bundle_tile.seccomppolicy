@@ -72,8 +72,14 @@ shutdown: (eq (arg 1) "SHUT_WR")
 close
 
 # bundle: Make TCP connection non-blocking
-fcntl: (and (eq (arg 1) "F_SETFL")
-            (eq (arg 2) "O_NONBLOCK"))
+#
+# bundle: Dup sockets off stdio fds (0-2).  After sandbox closes stdio,
+#         socket() can return a low fd; those get invalidated, so bump
+#         them above stderr with F_DUPFD.
+fcntl: (or (and (eq (arg 1) "F_SETFL")
+                (eq (arg 2) "O_NONBLOCK"))
+           (and (eq (arg 1) "F_DUPFD")
+                (eq (arg 2) 3)))
 
 # resolv: Bind DNS request socket
 bind: (or (eq (arg 2) "sizeof(struct sockaddr_in)")
