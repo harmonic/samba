@@ -30,7 +30,7 @@
 
    50ms is used to match Agave's behaviour:
    https://github.com/anza-xyz/agave/blob/v4.2/poh/src/poh_service.rs#L47 */
-#define FD_TARGET_SLOT_ADJUSTMENT_NS (50000000UL)
+#define FD_TARGET_SLOT_ADJUSTMENT_NS (0UL)
 
 /* Runtime parameters that need to change when the slot time changes
    due to one of the reduce_slot_time feature gates.
