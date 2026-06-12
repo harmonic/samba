@@ -293,6 +293,11 @@ struct fd_topo_tile {
       ulong url_len;
       char  sni[ 256 ];
       ulong sni_len;
+      /* Second gRPC endpoint (subscribePackets) for harmonic TPU stream */
+      char  tpu_url[ 256 ];
+      ulong tpu_url_len;
+      char  tpu_sni[ 256 ];
+      ulong tpu_sni_len;
       char  identity_key_path[ PATH_MAX ];
       char  key_log_path[ PATH_MAX ];
       ulong buf_sz;
@@ -300,6 +305,7 @@ struct fd_topo_tile {
       ulong ssl_heap_sz;
       ulong keepalive_interval_nanos;
       uchar tls_cert_verify : 1;
+      int   harmonic_block_mode;
     } bundle;
 
     struct {
@@ -325,6 +331,7 @@ struct fd_topo_tile {
         ulong commission_bps;
         char  identity_key_path[ PATH_MAX ];
         char  vote_account_path[ PATH_MAX ]; /* or pubkey is okay */
+        int   harmonic_block_mode; /* If set, processes harmonic blocks */
       } bundle;
       ulong acct_blocklist_cnt;
       fd_pubkey_t acct_blocklist[ FD_PACK_ACCT_BLOCKLIST_MAX ];
