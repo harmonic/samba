@@ -89,6 +89,12 @@ struct fd_gossip_tile_ctx {
   ulong peer_sat_hwm;        /* high-water mark of peer count       */
   long  peer_sat_hwm_nanos;  /* wallclock when HWM last increased   */
   int   peer_sat_published;  /* one-shot latch (0 -> 1)             */
+
+  /* Local TPU sockets — saved at startup for reverting when bundle disconnects */
+  fd_gossip_socket_t local_tpu_addr;
+  fd_gossip_socket_t local_tpu_quic_addr;
+  fd_gossip_socket_t local_tpu_fwd_addr;
+  fd_gossip_socket_t local_tpu_fwd_quic_addr;
 };
 
 typedef struct fd_gossip_tile_ctx fd_gossip_tile_ctx_t;
