@@ -272,6 +272,10 @@ fd_pack_avail_txn_cnt( fd_pack_t const * pack ) {
   return *((ulong const *)((uchar const *)pack + FD_PACK_PENDING_TXN_CNT_OFF));
 }
 
+/* fd_pack_avail_vote_cnt returns the number of pending vote transactions
+   available to schedule. */
+ulong fd_pack_avail_vote_cnt( fd_pack_t const * pack );
+
 /* fd_pack_current_block_cost returns the number of CUs that have been
    scheduled in the current block, net of any rebates.  It should be
    between 0 and the specified value of max_cost_per_block, but it can
@@ -426,14 +430,15 @@ void fd_pack_get_pending_smallest( fd_pack_t * pack, fd_pack_smallest_t * opt_pe
 #define FD_PACK_INSERT_REJECT_ACCT_BLOCKLIST        (-14)
 #define FD_PACK_INSERT_REJECT_NONCE_CONFLICT        (-15)
 #define FD_PACK_INSERT_REJECT_INSTR_ACCT_CNT        (-16)
+#define FD_PACK_INSERT_REJECT_BLOCK_FAILED          (-17) /* harmonic: block already failed or wrong mode */
 
 /* The FD_PACK_INSERT_{ACCEPT, REJECT}_* values defined above are in the
    range [-FD_PACK_INSERT_RETVAL_OFF,
    -FD_PACK_INSERT_RETVAL_OFF+FD_PACK_INSERT_RETVAL_CNT ) */
-#define FD_PACK_INSERT_RETVAL_OFF 16
-#define FD_PACK_INSERT_RETVAL_CNT 23
+#define FD_PACK_INSERT_RETVAL_OFF 17
+#define FD_PACK_INSERT_RETVAL_CNT 24
 
-FD_STATIC_ASSERT( FD_PACK_INSERT_REJECT_INSTR_ACCT_CNT>=-FD_PACK_INSERT_RETVAL_OFF, pack_retval );
+FD_STATIC_ASSERT( FD_PACK_INSERT_REJECT_BLOCK_FAILED>=-FD_PACK_INSERT_RETVAL_OFF, pack_retval );
 FD_STATIC_ASSERT( FD_PACK_INSERT_ACCEPT_NONCE_NONVOTE_REPLACE<FD_PACK_INSERT_RETVAL_CNT-FD_PACK_INSERT_RETVAL_OFF, pack_retval );
 
 /* fd_pack_insert_txn_{init,fini,cancel} execute the process of
@@ -652,6 +657,21 @@ void fd_pack_set_initializer_bundles_ready( fd_pack_t * pack );
 #define FD_PACK_SCHEDULE_BUNDLE 2
 #define FD_PACK_SCHEDULE_TXN    4
 
+/* FD_PACK_HARMONIC_VOTE_TAIL_NS: last portion of the leader slot reserved for
+   vote/sprint scheduling after harmonic block txns are cut off.
+   harmonic_cutoff_ns = slot_end_ns - VOTE_TAIL_NS. */
+#define FD_PACK_HARMONIC_VOTE_TAIL_NS ( 20000000L )
+
+#define HARMONIC_MODE_UNDECIDED   (0)
+#define HARMONIC_MODE_HARMONIC   (1)
+#define HARMONIC_MODE_SPRINT     (-1)
+#define HARMONIC_MODE_FAILED     (-2)
+#define HARMONIC_MODE_VOTE_ONLY  (-4)
+#define HARMONIC_MODE_DONE       (-3)
+
+#define FD_PACK_END_FLAG_HARMONIC_TIMEOUT (1<<0)
+#define FD_PACK_END_FLAG_VOTE_DRAIN       (1<<1)
+
 /* fd_pack_schedule_next_microblock schedules pending transactions.
    These transaction either form a microblock, which is a set of
    non-conflicting transactions, or a bundle.  The semantics of this
@@ -716,7 +736,42 @@ fd_pack_schedule_next_microblock( fd_pack_t  * pack,
                                   float        vote_fraction,
                                   ulong        bank_tile,
                                   int          schedule_flags,
+                                  int          harmonic,
                                   fd_txn_e_t * out );
+
+void fd_pack_harmonic_reset( fd_pack_t * pack, ulong leader_slot, int leader_next_slot );
+
+int fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
+                                  fd_txn_e_t   * txne,
+                                  ulong          block_slot,
+                                  ulong          block_txn_expected,
+                                  void   const * block_meta,
+                                  int            is_ib,
+                                  long           txn_arrival_ns,
+                                  long           harmonic_threshold_ns,
+                                  long           harmonic_cutoff_ns,
+                                  ulong        * opt_delete_cnt );
+
+FD_FN_PURE int   fd_pack_harmonic_state          ( fd_pack_t const * pack );
+FD_FN_PURE int   fd_pack_harmonic_done           ( fd_pack_t const * pack );
+FD_FN_PURE ulong fd_pack_harmonic_pending_cnt    ( fd_pack_t const * pack );
+FD_FN_PURE ulong fd_pack_harmonic_inflight_cnt   ( fd_pack_t const * pack );
+FD_FN_PURE int   fd_pack_harmonic_pool_full      ( fd_pack_t const * pack );
+FD_FN_PURE int   fd_pack_harmonic_end_flags      ( fd_pack_t const * pack );
+
+
+void fd_pack_harmonic_signal_fail( fd_pack_t * pack, ulong failed_slot );
+
+void fd_pack_harmonic_state_crank( fd_pack_t * pack,
+                                   long        approx_wallclock_ns,
+                                   long        harmonic_threshold_ns,
+                                   long        harmonic_cutoff_ns,
+                                   int         past_end_time,
+                                   ulong       pending_votes,
+                                   ulong       schedule_cnt,
+                                   int         tried_votes );
+
+void const * fd_pack_peek_harmonic_meta( fd_pack_t const * pack );
 
 
 /* fd_pack_rebate_cus adjusts the compute unit accounting for the
@@ -752,7 +807,9 @@ void fd_pack_rebate_cus( fd_pack_t * pack, fd_pack_rebate_t const * rebate );
    times after a microblock or even if bank_tile does not have a
    previously scheduled; in this case, the function will return 0 and
    act as a no-op.  Returns 1 if the bank_tile had an outstanding,
-   previously scheduled microblock to mark as completed. */
+   previously scheduled microblock to mark as completed.  When that
+   microblock was a harmonic block txn (pending_blocks), decrements
+   harmonic_inflight for this bank only. */
 int fd_pack_microblock_complete( fd_pack_t * pack, ulong bank_tile );
 
 /* fd_pack_expire_before deletes all available transactions with
