@@ -309,9 +309,11 @@
 #include "../../disco/tiles.h"
 #include "../../disco/fd_txn_m.h"
 #include "../../disco/bundle/fd_bundle_crank.h"
+#include "../../disco/bundle/fd_bundle_tpu.h"
 #include "../../disco/pack/fd_pack.h"
 #include "../../disco/pack/fd_pack_cost.h"
 #include "../../ballet/sha256/fd_sha256.h"
+#include "../../ballet/base58/fd_base58.h"
 #include "../../disco/metrics/fd_metrics.h"
 #include "../../util/pod/fd_pod.h"
 #include "../../disco/shred/fd_shredder.h"
@@ -353,6 +355,7 @@
 #define IN_KIND_BANK  (0)
 #define IN_KIND_PACK  (1)
 #define IN_KIND_EPOCH (2)
+#define IN_KIND_BUNDLE_GOSSIP (3)
 
 
 struct fd_pohh_in {
@@ -562,7 +565,6 @@ struct fd_pohh_tile {
     fd_bundle_crank_gen_t gen[1];
   } bundle;
 
-
   /* The Agave client needs to be notified when the leader changes,
      so that they can resume the replay stage if it was suspended waiting. */
   void * signal_leader_change;
@@ -571,6 +573,9 @@ struct fd_pohh_tile {
      after_frag once the frag has been validated as not overrun. */
   uchar _txns[ USHORT_MAX ];
   fd_microblock_trailer_t _microblock_trailer[ 1 ];
+
+  /* TPU update from bundle tile, set in during_frag for after_frag */
+  fd_bundle_tpu_update_t _tpu_update[ 1 ];
 
   int in_kind[ 64 ];
   fd_pohh_in_t in[ 64 ];
@@ -779,6 +784,19 @@ extern CALLED_FROM_RUST void fd_ext_bank_acquire( void const * bank );
 extern CALLED_FROM_RUST void fd_ext_bank_release( void const * bank );
 extern CALLED_FROM_RUST void fd_ext_poh_signal_leader_change( void * sender );
 extern                  void fd_ext_poh_register_tick( void const * bank, uchar const * hash );
+
+/* fd_ext_tpu_update is called when the bundle tile sends a TPU connection
+   status update.  Agave should update the node's gossip contact info to
+   advertise the new TPU address.
+
+   status: 0 = disconnected, 1 = connected
+   tpu_ip4_addr, tpu_port: TPU address (network byte order for IP)
+   tpu_fwd_ip4_addr, tpu_fwd_port: TPU forwards address */
+extern void fd_ext_tpu_update( int    status,
+                               uint   tpu_ip4_addr,
+                               ushort tpu_port,
+                               uint   tpu_fwd_ip4_addr,
+                               ushort tpu_fwd_port );
 
 /* fd_ext_poh_initialize is called by Agave on startup to
    initialize the PoH tile with some static configuration, and the
@@ -1094,6 +1112,11 @@ publish_became_leader( fd_pohh_tile_t * ctx,
   leader->bundle->config[0]       = config[0];
   leader->slot                    = slot;
 
+  /* Check if we are also the leader for slot+1 (consecutive leader slots).
+     Used by pack to decide VOTE_ONLY vs SPRINT after harmonic block completes. */
+  fd_pubkey_t const * next_slot_leader = fd_multi_epoch_leaders_get_leader_for_slot( ctx->mleaders, slot+1UL );
+  leader->leader_next_slot = next_slot_leader && !memcmp( next_slot_leader->key, ctx->identity_key.uc, 32UL );
+
   leader->limits.slot_max_cost                     = ctx->limits.slot_max_cost;
   leader->limits.slot_max_vote_cost                = ctx->limits.slot_max_vote_cost;
   leader->limits.slot_max_write_cost_per_acct      = ctx->limits.slot_max_write_cost_per_acct;
@@ -1372,21 +1395,7 @@ fd_ext_poh_reset( ulong         completed_bank_slot, /* The slot that successful
   }
 
   ctx->leader_bank_start_ns = fd_log_wallclock(); /* safe to call from Rust */
-  if( FD_UNLIKELY( ctx->expect_sequential_leader_slot==(completed_bank_slot+1UL) ) ) {
-    /* If we are being reset onto a slot, it means some block was fully
-       processed, so we reset to build on top of it.  Typically we want
-       to update the reset_slot_start_ns to the current time, because
-       the network will give the next leader 400ms to publish,
-       regardless of how long the prior leader took.
-
-       But: if we were leader in the prior slot, and the block was our
-       own we can do better.  We know that the next slot should start
-       exactly 400ms after the prior one started, so we can use that as
-       the reset slot start time instead. */
-    ctx->reset_slot_start_ns = ctx->reset_slot_start_ns + (long)((double)((completed_bank_slot+1UL)-ctx->reset_slot)*ctx->slot_duration_ns);
-  } else {
     ctx->reset_slot_start_ns = ctx->leader_bank_start_ns;
-  }
   ctx->expect_sequential_leader_slot = ULONG_MAX;
 
   memcpy( ctx->reset_hash, reset_blockhash, 32UL );
@@ -1977,6 +1986,20 @@ during_frag( fd_pohh_tile_t * ctx,
     return;
   }
 
+  /* Bundle gossip messages: copy TPU update for after_frag */
+  if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_BUNDLE_GOSSIP ) ) {
+    if( FD_UNLIKELY( chunk<ctx->in[ in_idx ].chunk0 || chunk>ctx->in[ in_idx ].wmark ) )
+      FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu]", chunk, sz,
+            ctx->in[ in_idx ].chunk0, ctx->in[ in_idx ].wmark ));
+    if( FD_LIKELY( sz==sizeof(fd_bundle_tpu_update_t) ) ) {
+      fd_memcpy( ctx->_tpu_update, fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk ), sz );
+      ctx->skip_frag = 0;
+    } else {
+      ctx->skip_frag = 1;
+    }
+    return;
+  }
+
   ulong slot;
   switch( ctx->in_kind[ in_idx ] ) {
     case IN_KIND_BANK:
@@ -2159,8 +2182,6 @@ after_frag( fd_pohh_tile_t *    ctx,
   }
 
   FD_TEST( ctx->current_leader_bank );
-  FD_TEST( ctx->microblocks_lower_bound<ctx->max_microblocks_per_slot );
-  ctx->microblocks_lower_bound += 1UL;
 
   ulong txn_cnt = (sz-sizeof(fd_microblock_trailer_t))/sizeof(fd_txn_p_t);
   fd_txn_p_t * txns = (fd_txn_p_t *)(ctx->_txns);
@@ -2181,7 +2202,14 @@ after_frag( fd_pohh_tile_t *    ctx,
      transactions failed to execute, the microblock would be empty,
      causing agave to think it's a tick and complain.  Instead, we just
      skip the microblock and don't hash or update the hashcnt. */
-  if( FD_UNLIKELY( !executed_txn_cnt ) ) return;
+  if( FD_UNLIKELY( !executed_txn_cnt ) ) {
+    FD_TEST( ctx->microblocks_lower_bound<ctx->max_microblocks_per_slot );
+    ctx->microblocks_lower_bound += 1UL;
+    return;
+  }
+
+  FD_TEST( ctx->microblocks_lower_bound<ctx->max_microblocks_per_slot );
+  ctx->microblocks_lower_bound += 1UL;
 
   uchar data[ 64 ];
   fd_memcpy( data, ctx->hash, 32UL );
@@ -2515,6 +2543,8 @@ unprivileged_init( fd_topo_t const *      topo,
       ctx->in_kind[ i ] = IN_KIND_PACK;
     } else if( !strcmp( link->name, "bank_pohh"  ) ) {
       ctx->in_kind[ i ] = IN_KIND_BANK;
+    } else if( !strcmp( link->name, "bundle_gossi" ) ) {
+      ctx->in_kind[ i ] = IN_KIND_BUNDLE_GOSSIP;
     } else {
       FD_LOG_ERR(( "unexpected input link name %s", link->name ));
     }

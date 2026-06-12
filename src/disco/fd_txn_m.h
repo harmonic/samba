@@ -11,6 +11,12 @@
 #define FD_TXN_M_TPU_SOURCE_GOSSIP (3UL)
 #define FD_TXN_M_TPU_SOURCE_BUNDLE (4UL)
 #define FD_TXN_M_TPU_SOURCE_TXSEND (5UL)
+#define FD_TXN_M_TPU_SOURCE_HARMONIC (6UL)
+#define FD_TXN_M_TPU_SOURCE_HTPU    (7UL)
+
+/* High bits of stem `sig` on resolv→pack: harmonic block marker and failure signal */
+#define FD_TXN_M_SIG_BLOCK_FLAG      (1UL<<62)
+#define FD_TXN_M_SIG_BLOCK_FAIL_FLAG (1UL<<63)
 
 struct fd_txn_m {
   /* The computed slot that this transaction is referencing, aka. the
@@ -50,13 +56,21 @@ struct fd_txn_m {
        the block engine, and the validator will crank the tip payment
        program with these values, if it is not using them already.
        These fields are only provided on the first transaction in a
-       bundle. */
-    ulong bundle_id;
-    ulong bundle_txn_cnt;
+       bundle.
+
+       For harmonic transactions (source_tpu==FD_TXN_M_TPU_SOURCE_HARMONIC),
+       block_slot contains the intended slot from the block server.
+       Use source_tpu to determine which union member applies. */
+    union {
+      ulong bundle_id;   /* For bundles: sequential bundle ID */
+      ulong block_slot;  /* For blocks: intended slot from server */
+    };
+
+    ushort bundle_txn_cnt; /* Harmonic: shrunk from ulong - never exceeds 65535 */
     uchar commission;
     uchar commission_pubkey[ 32 ];
 
-    /* alignof is 8, so 7 bytes of padding here */
+    /* alignof is 8, so 5 bytes of padding here */
 
   } block_engine;
 
