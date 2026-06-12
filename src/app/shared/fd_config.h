@@ -468,12 +468,16 @@ struct fd_config {
       int  enabled;
       char url[ FD_URL_MAX ];
       char tls_domain_name[ FD_SNI_BUF_MAX ];
+      char tpu_url[ FD_URL_MAX ];
+      char tpu_tls_domain_name[ FD_SNI_BUF_MAX ];
       char tip_distribution_program_addr[ FD_BASE58_ENCODED_32_SZ ];
       char tip_payment_program_addr[ FD_BASE58_ENCODED_32_SZ ];
       char tip_distribution_authority[ FD_BASE58_ENCODED_32_SZ ];
       uint commission_bps;
       ulong keepalive_interval_millis;
       int   tls_cert_verify;
+      /* Harmonic config */
+      int  harmonic_block_mode;
     } bundle;
 
     struct {

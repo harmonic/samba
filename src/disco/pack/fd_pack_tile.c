@@ -29,6 +29,7 @@
 #define IN_KIND_SIGN         (3UL)
 #define IN_KIND_REPLAY       (4UL)
 #define IN_KIND_EXECUTED_TXN (5UL)
+#define IN_KIND_BLOCK_FAIL   (6UL)
 
 /* Pace microblocks, but only slightly.  This helps keep performance
    more stable.  This limit is 2,000 microblocks/second/execle.  At
@@ -53,6 +54,10 @@ FD_STATIC_ASSERT( (ulong)LONG_MAX+TIME_OFFSET==ULONG_MAX, time_offset );
 
 /* 1.6 M cost units, enough for 1 max size transaction */
 const ulong CUS_PER_MICROBLOCK = 1600000UL;
+
+/* TEMPORARY: 1 = do not tighten max microblocks from remaining slot time
+   (see compute_dynamic_max_microblocks). Set to 0 to restore. */
+#define FD_PACK_DISABLE_DYNAMIC_MICROBLOCK_LIMIT 1
 
 const float VOTE_FRACTION = 1.0f; /* schedule all available votes first */
 #define EFFECTIVE_TXN_PER_MICROBLOCK 1UL
@@ -117,7 +122,15 @@ typedef struct {
 typedef struct {
   fd_pack_t *  pack;
   fd_txn_e_t * cur_spot;
-  int          is_bundle; /* is the current transaction a bundle */
+
+#define TXN_TYPE_NORMAL  0
+#define TXN_TYPE_BUNDLE  1
+#define TXN_TYPE_HARMONIC   2
+  int          txn_type;
+
+  /* Harmonic transaction info (valid when txn_type==TXN_TYPE_HARMONIC) */
+  ulong        block_slot;
+  ulong        block_txn_expected;
 
   uchar executed_txn_sig[ 64UL ];
   uchar txn_committed;
@@ -185,6 +198,7 @@ typedef struct {
 
   /* The end wallclock time of the leader slot we are currently packing
      for, if we are currently packing for a slot.*/
+  long slot_start_ns;
   long slot_end_ns;
 
   /* The current dynamic upper bound on total microblocks for this slot.
@@ -195,6 +209,9 @@ typedef struct {
      slot_max_microblocks.  Consumed by after_credit which publishes
      the updated bound to POH over the pack_poh link. */
   int pending_reduce_mb_bound;
+  /* harmonic_cutoff_ns = slot_end_ns - FD_PACK_HARMONIC_VOTE_TAIL_NS: last
+     time a harmonic block txn may arrive; tail is vote/sprint. */
+  long harmonic_cutoff_ns;
 
   /* pacer is used for pacing CUs through the slot, i.e. deciding when
      to schedule a microblock given the number of CUs that have been
@@ -290,6 +307,10 @@ typedef struct {
 
     ulong                 metrics[4];
   } crank[1];
+
+  /* Harmonic: harmonic_threshold_ns = slot_start + (slot_end-slot_start)/2. */
+  long harmonic_threshold_ns;
+  int  harmonic; /* If set, processes harmonic blocks */
 
 
   /* Used between during_frag and after_frag */
@@ -428,6 +449,7 @@ metrics_write( fd_pack_ctx_t * ctx ) {
   fd_pack_metrics_write( ctx->pack );
 }
 
+#if !FD_PACK_DISABLE_DYNAMIC_MICROBLOCK_LIMIT
 /* compute_dynamic_max_microblocks: Computes the upper bound on total
    microblocks based on remaining time and bank count.
 
@@ -461,6 +483,7 @@ compute_dynamic_max_microblocks( fd_pack_ctx_t * ctx ) {
 
   return cnt + fd_ulong_min( R, can_execute );
 }
+#endif /* !FD_PACK_DISABLE_DYNAMIC_MICROBLOCK_LIMIT */
 
 static inline void
 during_housekeeping( fd_pack_ctx_t * ctx ) {
@@ -474,6 +497,7 @@ during_housekeeping( fd_pack_ctx_t * ctx ) {
   }
 
   if( FD_LIKELY( ctx->leader_slot!=ULONG_MAX ) ) {
+# if !FD_PACK_DISABLE_DYNAMIC_MICROBLOCK_LIMIT
     ulong raw = compute_dynamic_max_microblocks( ctx );
     ulong prev = ctx->slot_dynamic_max_microblocks;
 
@@ -499,6 +523,7 @@ during_housekeeping( fd_pack_ctx_t * ctx ) {
 
       ctx->pending_reduce_mb_bound = 1; /* publish bound decrease */
     }
+# endif
   }
 }
 
@@ -508,7 +533,7 @@ before_credit( fd_pack_ctx_t *     ctx,
                int *               charge_busy ) {
   (void)stem;
 
-  if( FD_UNLIKELY( (ctx->cur_spot!=NULL) & !ctx->is_bundle ) ) {
+  if( FD_UNLIKELY( (ctx->cur_spot!=NULL) & (ctx->txn_type==TXN_TYPE_NORMAL) ) ) {
     *charge_busy = 1;
 
     /* If we were overrun while processing a frag from an in, then
@@ -572,6 +597,8 @@ after_credit( fd_pack_ctx_t *     ctx,
 
   long now = fd_tickcount();
 
+  int past_end_time = fd_clock_tile_tickcount_to_wallclock( ctx->clock, now )>=ctx->slot_end_ns;
+
   ulong execle_cnt = ctx->execle_cnt;
 
   int pacing_execle_cnt = (int)fd_ulong_min( fd_pack_pacing_enabled_bank_cnt( ctx->pacer, now ), execle_cnt );
@@ -623,30 +650,34 @@ after_credit( fd_pack_ctx_t *     ctx,
   }
 
 
-  /* If we time out on our slot, then stop being leader. */
-  if( FD_UNLIKELY( ctx->leader_slot!=ULONG_MAX &&
-                   fd_clock_tile_tickcount_to_wallclock( ctx->clock, now )>=ctx->slot_end_ns ) ) {
-    *charge_busy = 1;
+  /* If we time out on our slot (including harmonic slot_end buffer), then
+     stop being leader — unless harmonic mode still needs to drain votes
+     before DONE (fd_pack_harmonic_done). */
+  if( FD_UNLIKELY( past_end_time && ctx->leader_slot!=ULONG_MAX ) ) {
+    if( FD_LIKELY( !ctx->harmonic || fd_pack_harmonic_done( ctx->pack ) ) ) {
+      *charge_busy = 1;
 
-    fd_done_packing_t * done_packing = fd_chunk_to_laddr( ctx->poh_out.mem, ctx->poh_out.chunk );
-    get_done_packing( ctx, done_packing, FD_PACK_END_SLOT_REASON_TIME ); /* needs to be called before fd_pack_end_block */
-    fd_pack_end_block( ctx->pack );
-    fd_pack_get_top_writers( ctx->pack, done_packing->limits_usage->top_writers ); /* needs to be called after fd_pack_end_block */
+      fd_done_packing_t * done_packing = fd_chunk_to_laddr( ctx->poh_out.mem, ctx->poh_out.chunk );
+      get_done_packing( ctx, done_packing, FD_PACK_END_SLOT_REASON_TIME ); /* needs to be called before fd_pack_end_block */
+      fd_pack_end_block( ctx->pack );
+      fd_pack_get_top_writers( ctx->pack, done_packing->limits_usage->top_writers ); /* needs to be called after fd_pack_end_block */
 
-    fd_stem_publish( stem, ctx->poh_out.out_idx, fd_disco_execle_sig( ctx->leader_slot, ctx->pack_idx ), ctx->poh_out.chunk, sizeof(fd_done_packing_t), 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
-    ctx->poh_out.chunk = fd_dcache_compact_next( ctx->poh_out.chunk, sizeof(fd_done_packing_t), ctx->poh_out.chunk0, ctx->poh_out.wmark );
-    ctx->pack_idx++;
+      fd_stem_publish( stem, ctx->poh_out.out_idx, fd_disco_execle_sig( ctx->leader_slot, ctx->pack_idx ), ctx->poh_out.chunk, sizeof(fd_done_packing_t), 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
+      ctx->poh_out.chunk = fd_dcache_compact_next( ctx->poh_out.chunk, sizeof(fd_done_packing_t), ctx->poh_out.chunk0, ctx->poh_out.wmark );
+      ctx->pack_idx++;
 
-    log_end_block_metrics( ctx, now, "time", done_packing->limits_usage->block_cost );
-    ctx->drain_execle        = 1;
-    ctx->leader_slot         = ULONG_MAX;
-    ctx->slot_microblock_cnt = 0UL;
-    remove_ib( ctx );
+      log_end_block_metrics( ctx, now, "time", done_packing->limits_usage->block_cost );
+      ctx->drain_execle        = 1;
+      ctx->leader_slot         = ULONG_MAX;
+      ctx->slot_microblock_cnt = 0UL;
+      remove_ib( ctx );
 
-    update_metric_state( ctx, now, FD_PACK_METRIC_STATE_LEADER,       0 );
-    update_metric_state( ctx, now, FD_PACK_METRIC_STATE_EXECLES,      0 );
-    update_metric_state( ctx, now, FD_PACK_METRIC_STATE_MICROBLOCKS,  0 );
-    return;
+      update_metric_state( ctx, now, FD_PACK_METRIC_STATE_LEADER,       0 );
+      update_metric_state( ctx, now, FD_PACK_METRIC_STATE_EXECLES,      0 );
+      update_metric_state( ctx, now, FD_PACK_METRIC_STATE_MICROBLOCKS,  0 );
+      return;
+    }
+    /* Harmonic: past nominal end but state machine not DONE yet — keep scheduling votes below. */
   }
 
   /* Am I in drain mode?  If so, check if I can exit it */
@@ -696,16 +727,54 @@ after_credit( fd_pack_ctx_t *     ctx,
     return;
   }
 
-  /* Have I sent the max allowed microblocks? Nothing to do. */
-  if( FD_UNLIKELY( ctx->slot_microblock_cnt>=ctx->slot_dynamic_max_microblocks ) ) return;
+  /* Have I sent the max allowed microblocks? Nothing to do.  Still need
+     to crank the harmonic state machine so it can reach DONE and allow
+     done_packing to be sent. */
+  if( FD_UNLIKELY( ctx->slot_microblock_cnt>=ctx->slot_dynamic_max_microblocks ) ) {
+    if( FD_UNLIKELY( ctx->harmonic ) ) {
+      fd_pack_harmonic_state_crank( ctx->pack, fd_clock_tile_now( ctx->clock ), ctx->harmonic_threshold_ns,
+                                    ctx->harmonic_cutoff_ns, past_end_time, fd_pack_avail_vote_cnt( ctx->pack ),
+                                    0UL, past_end_time );
+    }
+    return;
+  }
 
   int any_ready     = 0;
   int any_scheduled = 0;
 
+  ulong harmonic_sched_cnt = 0UL;
+
   *charge_busy = 1;
 
   if( FD_LIKELY( ctx->crank->enabled ) ) {
-    block_builder_info_t const * top_meta = fd_pack_peek_bundle_meta( ctx->pack );
+    int harmonic_crank = 0;
+    block_builder_info_t const * top_meta = NULL;
+    int harmonic_state = fd_pack_harmonic_state( ctx->pack );
+
+    if( FD_LIKELY( !ctx->harmonic ) ) {
+      /* Non-harmonic mode: use regular bundle meta */
+      top_meta = fd_pack_peek_bundle_meta( ctx->pack );
+    } else {
+      /* Harmonic mode enabled */
+      switch( harmonic_state ) {
+        case HARMONIC_MODE_HARMONIC:
+          /* In HARMONIC mode: only use harmonic meta (don't touch regular bundles) */
+          top_meta = fd_pack_peek_harmonic_meta( ctx->pack );
+          harmonic_crank = 1;
+          break;
+        case HARMONIC_MODE_SPRINT:
+        case HARMONIC_MODE_FAILED:
+          /* SPRINT/FAILED: harmonic block done/failed, use regular bundle meta */
+          top_meta = fd_pack_peek_bundle_meta( ctx->pack );
+          break;
+        case HARMONIC_MODE_VOTE_ONLY:
+        case HARMONIC_MODE_UNDECIDED:
+        case HARMONIC_MODE_DONE:
+        default:
+          /* VOTE_ONLY/UNDECIDED/DONE: no bundle cranking */
+          break;
+      }
+    }
     if( FD_UNLIKELY( top_meta ) ) {
       /* Have bundles, in a reasonable state to crank. */
 
@@ -736,12 +805,22 @@ after_credit( fd_pack_ctx_t *     ctx,
 
         ctx->crank->ib_inserted = 1;
         ulong deleted;
-        int retval = fd_pack_insert_bundle_fini( ctx->pack, bundle, 1UL, ctx->leader_slot-1UL, 1, NULL, &deleted );
+        int retval;
+        if( !harmonic_crank ) {
+          retval = fd_pack_insert_bundle_fini( ctx->pack, bundle, 1UL, ctx->leader_slot-1UL, 1, NULL, &deleted );
+        } else {
+          /* For locally-generated crank, use current wallclock as arrival time */
+          long crank_arrival_ns = fd_clock_tile_now( ctx->clock );
+          FD_LOG_INFO(( "HARMONIC: inserting crank for slot=%lu, block_txn_expected=%lu", ctx->block_slot, ctx->block_txn_expected ));
+          retval = fd_pack_harmonic_insert_fini( ctx->pack, bundle[0], ctx->block_slot, ctx->block_txn_expected, ctx->blk_engine_cfg, 1,
+                                                  crank_arrival_ns, ctx->harmonic_threshold_ns, ctx->harmonic_cutoff_ns, &deleted );
+          ctx->block_txn_expected++;
+        }
         FD_MCNT_INC( PACK, TXN_DELETED, deleted );
         ctx->insert_result[ retval + FD_PACK_INSERT_RETVAL_OFF ]++;
         if( FD_UNLIKELY( retval<0 ) ) {
-          ctx->crank->metrics[ 3 ]++; /* BUNDLE_CRANK_RESULT_INSERTION_FAILED */
-          FD_LOG_WARNING(( "inserting initializer bundle returned %i", retval ));
+          ctx->crank->metrics[ 3 ]++; /* BUNDLE_CRANK_STATUS_INSERTION_FAILED */
+          FD_LOG_WARNING(( "inserting initializer bundle returned %i (harmonic=%d)", retval, harmonic_crank ));
         } else {
           /* Update the cached copy of the on-chain state.  This seems a
              little dangerous, since we're updating it as if the bundle
@@ -779,28 +858,33 @@ after_credit( fd_pack_ctx_t *     ctx,
     int i = fd_ulong_find_lsb( ctx->execle_idle_bitset );
 
     int flags;
-
-    switch( ctx->strategy ) {
-      default:
-      case FD_PACK_STRATEGY_PERF:
-        flags = FD_PACK_SCHEDULE_VOTE | FD_PACK_SCHEDULE_BUNDLE | FD_PACK_SCHEDULE_TXN;
-        break;
-      case FD_PACK_STRATEGY_BALANCED:
-        /* We want to exempt votes from pacing, so we always allow
-           scheduling votes.  It doesn't really make much sense to pace
-           bundles, because they get scheduled in FIFO order.  However,
-           we keep pacing for normal transactions.  For example, if
-           pacing_execle_cnt is 0, then pack won't schedule normal
-           transactions to any execle tile. */
-        flags = FD_PACK_SCHEDULE_VOTE | fd_int_if( i==0,                FD_PACK_SCHEDULE_BUNDLE, 0 )
-                                      | fd_int_if( i<pacing_execle_cnt, FD_PACK_SCHEDULE_TXN,    0 );
-        break;
+    if( FD_UNLIKELY( past_end_time ) ) {
+      /* Past slot end (+ buffer): drain votes only so harmonic state machine can reach DONE. */
+      flags = FD_PACK_SCHEDULE_VOTE;
+    } else {
+      switch( ctx->strategy ) {
+        default:
+        case FD_PACK_STRATEGY_PERF:
+          flags = FD_PACK_SCHEDULE_VOTE | FD_PACK_SCHEDULE_BUNDLE | FD_PACK_SCHEDULE_TXN;
+          break;
+        case FD_PACK_STRATEGY_BALANCED:
+          /* We want to exempt votes from pacing, so we always allow
+             scheduling votes.  It doesn't really make much sense to pace
+             bundles, because they get scheduled in FIFO order.  However,
+             we keep pacing for normal transactions.  For example, if
+             pacing_execle_cnt is 0, then pack won't schedule normal
+             transactions to any execle tile. */
+          flags = FD_PACK_SCHEDULE_VOTE | fd_int_if( i==0,                FD_PACK_SCHEDULE_BUNDLE, 0 )
+                                        | fd_int_if( i<pacing_execle_cnt, FD_PACK_SCHEDULE_TXN,    0 );
+          break;
+      }
     }
 
     fd_pack_out_ctx_t * execle_out = &ctx->execle_out[ i ];
     fd_txn_e_t * microblock_dst = fd_chunk_to_laddr( execle_out->mem, execle_out->chunk );
     long schedule_duration = -fd_tickcount();
-    ulong schedule_cnt = fd_pack_schedule_next_microblock( ctx->pack, CUS_PER_MICROBLOCK, VOTE_FRACTION, (ulong)i, flags, microblock_dst );
+    ulong schedule_cnt = fd_pack_schedule_next_microblock( ctx->pack, CUS_PER_MICROBLOCK, VOTE_FRACTION, (ulong)i, flags, ctx->harmonic, microblock_dst );
+    harmonic_sched_cnt = schedule_cnt;
     schedule_duration      += fd_tickcount();
     fd_histf_sample( (schedule_cnt>0UL) ? ctx->schedule_duration : ctx->no_sched_duration, (ulong)schedule_duration );
 
@@ -846,6 +930,12 @@ after_credit( fd_pack_ctx_t *     ctx,
          schedule attempt. */
       fd_long_store_if( ctx->use_consumed_cus, &(ctx->skip_cnt), (long)(ctx->execle_cnt + 1) );
     }
+  }
+
+  if( FD_UNLIKELY( ctx->harmonic ) ) {
+    fd_pack_harmonic_state_crank( ctx->pack, fd_clock_tile_now( ctx->clock ), ctx->harmonic_threshold_ns,
+                                  ctx->harmonic_cutoff_ns, past_end_time, fd_pack_avail_vote_cnt( ctx->pack ),
+                                  harmonic_sched_cnt, any_ready );
   }
 
   update_metric_state( ctx, now, FD_PACK_METRIC_STATE_EXECLES,     any_ready     );
@@ -899,6 +989,39 @@ after_credit( fd_pack_ctx_t *     ctx,
 
 /* At this point, we have started receiving frag seq with details in
     mline at time now.  Speculatively process it here. */
+
+/* before_frag: called before reading fragment data.
+   if harmonic_block_mode is on and the harmonic pool is exhausted,
+   delay processing from resolv (return -1) to apply backpressure.
+   still process everything else. */
+static inline int
+before_frag( fd_pack_ctx_t * ctx,
+             ulong           in_idx,
+             ulong           seq FD_PARAM_UNUSED,
+             ulong           sig ) {
+
+  /* Handle block-fail signals from verify_packf / dedup_packf links */
+  if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_BLOCK_FAIL ) ) {
+    fd_pack_harmonic_signal_fail( ctx->pack, sig );
+    return 1; /* Discard - no payload to process */
+  }
+
+  /* Handle block-fail signals piggybacked on the resolv_pack link */
+  if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_RESOLV &&
+                   ( sig & FD_TXN_M_SIG_BLOCK_FAIL_FLAG ) ) ) {
+    fd_pack_harmonic_signal_fail( ctx->pack, sig & ~FD_TXN_M_SIG_BLOCK_FAIL_FLAG );
+    return 1; /* Discard - no payload to process */
+  }
+
+  /* Only apply backpressure to resolv when harmonic pool is full */
+  if( FD_UNLIKELY( ctx->harmonic &&
+                   ctx->in_kind[ in_idx ]==IN_KIND_RESOLV &&
+                   fd_pack_harmonic_pool_full( ctx->pack ) ) ) {
+    return -1; /* Delay processing, requeue for later */
+  }
+
+  return 0; /* Process normally */
+}
 
 static inline void
 during_frag( fd_pack_ctx_t * ctx,
@@ -969,7 +1092,10 @@ during_frag( fd_pack_ctx_t * ctx,
     ulong addr_table_sz = 32UL*txn->addr_table_adtl_cnt;
     FD_TEST( addr_table_sz<=32UL*FD_TXN_ACCT_ADDR_MAX );
 
-    if( FD_UNLIKELY( (ctx->leader_slot==ULONG_MAX) & (sig>ctx->highest_observed_slot) ) ) {
+    /* Harmonic: Mask off the block flag to get the reference slot. Block
+       txns from resolv have FD_TXN_M_SIG_BLOCK_FLAG set in the high bit. */
+    ulong reference_slot = sig & ~FD_TXN_M_SIG_BLOCK_FLAG;
+    if( FD_UNLIKELY( (ctx->leader_slot==ULONG_MAX) & (reference_slot>ctx->highest_observed_slot) ) ) {
       /* Using the resolv tile's knowledge of the current slot is a bit
          of a hack, since we don't get any info if there are no
          transactions and we're not leader.  We're actually in exactly
@@ -978,15 +1104,38 @@ during_frag( fd_pack_ctx_t * ctx,
          drop new but low-fee-paying transactions when pack is clogged
          with expired but high-fee-paying transactions.  That can only
          happen if we are getting transactions. */
-      ctx->highest_observed_slot = sig;
+      ctx->highest_observed_slot = reference_slot;
       ulong exp_cnt = fd_pack_expire_before( ctx->pack, fd_ulong_max( ctx->highest_observed_slot, TRANSACTION_LIFETIME_SLOTS )-TRANSACTION_LIFETIME_SLOTS );
       FD_MCNT_INC( PACK, TXN_EXPIRED, exp_cnt );
     }
 
+    /* Handle block transactions (harmonic block mode) */
+    int is_block = source_tpu == FD_TXN_M_TPU_SOURCE_HARMONIC;
+    if( FD_UNLIKELY( ctx->harmonic && is_block ) ) {
+      ctx->txn_type = TXN_TYPE_HARMONIC;
+      ctx->block_slot         = txnm->block_engine.block_slot;
+      ctx->block_txn_expected = txnm->block_engine.bundle_txn_cnt;
+      ctx->cur_spot = fd_pack_insert_txn_init( ctx->pack );
+
+      /* Extract block builder commission info */
+      ctx->blk_engine_cfg->commission = txnm->block_engine.commission;
+      memcpy( ctx->blk_engine_cfg->commission_pubkey->b, txnm->block_engine.commission_pubkey, 32UL );
+
+      fd_memcpy( ctx->cur_spot->txnp->payload, fd_txn_m_payload( txnm ), payload_sz    );
+      fd_memcpy( TXN(ctx->cur_spot->txnp),     txn,                      txn_t_sz      );
+      fd_memcpy( ctx->cur_spot->alt_accts,     fd_txn_m_alut( txnm ),    addr_table_sz );
+      ctx->cur_spot->txnp->scheduler_arrival_time_nanos = fd_clock_tile_now( ctx->clock );
+      ctx->cur_spot->txnp->first_seen_nanos = txnm->first_seen_nanos;
+      ctx->cur_spot->txnp->payload_sz  = payload_sz;
+      ctx->cur_spot->txnp->source_ipv4 = source_ipv4;
+      ctx->cur_spot->txnp->source_tpu  = source_tpu;
+      break;
+    }
 
     ulong bundle_id = txnm->block_engine.bundle_id;
-    if( FD_UNLIKELY( bundle_id ) ) {
-      ctx->is_bundle = 1;
+    int is_bundle = (source_tpu == FD_TXN_M_TPU_SOURCE_BUNDLE) && bundle_id;
+    if( FD_UNLIKELY( is_bundle ) ) {
+      ctx->txn_type = TXN_TYPE_BUNDLE;
       if( FD_LIKELY( bundle_id!=ctx->current_bundle->id ) ) {
         if( FD_UNLIKELY( ctx->current_bundle->bundle ) ) {
           FD_MCNT_INC( PACK, TXN_PARTIAL_BUNDLE, ctx->current_bundle->txn_received );
@@ -1010,7 +1159,7 @@ during_frag( fd_pack_ctx_t * ctx,
       ctx->cur_spot                           = ctx->current_bundle->bundle[ ctx->current_bundle->txn_received ];
       ctx->current_bundle->min_blockhash_slot = fd_ulong_min( ctx->current_bundle->min_blockhash_slot, sig );
     } else {
-      ctx->is_bundle = 0;
+      ctx->txn_type = TXN_TYPE_NORMAL;
 #if FD_PACK_USE_EXTRA_STORAGE
       if( FD_LIKELY( ctx->leader_slot!=ULONG_MAX || fd_pack_avail_txn_cnt( ctx->pack )<ctx->max_pending_transactions ) ) {
         ctx->cur_spot = fd_pack_insert_txn_init( ctx->pack );
@@ -1053,6 +1202,8 @@ during_frag( fd_pack_ctx_t * ctx,
     fd_memcpy( ctx->executed_txn_sig, dcache_entry, sz );
     break;
   }
+  case IN_KIND_BLOCK_FAIL:
+    return; /* unreachable. handled in before_frag */
   }
 }
 
@@ -1198,9 +1349,27 @@ after_frag( fd_pack_ctx_t *     ctx,
 
     update_metric_state( ctx, fd_tickcount(), FD_PACK_METRIC_STATE_LEADER, 1 );
 
+    ctx->slot_start_ns = ctx->_became_leader->slot_start_ns;
     ctx->slot_end_ns = ctx->_became_leader->slot_end_ns;
     ctx->slot_dynamic_max_microblocks  = ctx->slot_max_microblocks;
     ctx->pending_reduce_mb_bound       = 0;
+    long slot_dur = ctx->slot_end_ns - ctx->slot_start_ns;
+    if( FD_UNLIKELY( slot_dur < 0L ) ) slot_dur = 0L;
+    ctx->harmonic_threshold_ns = ctx->slot_start_ns + slot_dur/2L;
+    ctx->harmonic_cutoff_ns    = ctx->slot_end_ns - (long)FD_PACK_HARMONIC_VOTE_TAIL_NS;
+
+    /* Reset harmonic state for new slot.
+       Note: pack's acct_in_use is cleared by fd_pack_end_block, so we don't
+       need to explicitly clear account locks here.
+       Set harmonic_block_slot to leader_slot so block txns for other slots are dropped. */
+    if( FD_UNLIKELY( ctx->harmonic ) ) {
+      fd_pack_harmonic_reset( ctx->pack, leader_slot, ctx->_became_leader->leader_next_slot );
+      FD_LOG_INFO(( "HARMONIC: new leader slot=%lu, start=%ld end=%ld threshold_ns=%ld cutoff_ns=%ld leader_next_slot=%d",
+                    ctx->leader_slot, ctx->slot_start_ns, ctx->slot_end_ns,
+                    ctx->harmonic_threshold_ns, ctx->harmonic_cutoff_ns,
+                    ctx->_became_leader->leader_next_slot ));
+    }
+
     fd_pack_limits_t limits[ 1 ];
     limits->max_cost_per_block = ctx->limits.slot_max_cost;
     limits->max_data_bytes_per_block = ctx->slot_max_data;
@@ -1224,13 +1393,41 @@ after_frag( fd_pack_ctx_t *     ctx,
     break;
   }
   case IN_KIND_RESOLV: {
+    /* Block transactions */
+    if( FD_UNLIKELY( ctx->txn_type==TXN_TYPE_HARMONIC ) ) {
+      /* Check block slot matches leader slot */
+      if( FD_UNLIKELY( ctx->block_slot != ctx->leader_slot ) ) {
+        FD_LOG_INFO(( "HARMONIC: dropping block txn for wrong slot=%lu, cur slot=%lu", ctx->block_slot, ctx->leader_slot ));
+        fd_pack_insert_txn_cancel( ctx->pack, ctx->cur_spot );
+        ctx->cur_spot = NULL;
+        break;
+      }
+
+      long insert_wall_ns = fd_clock_tile_now( ctx->clock );
+      ulong deleted;
+      long insert_duration = -fd_tickcount();
+      int result = fd_pack_harmonic_insert_fini( ctx->pack, ctx->cur_spot, ctx->block_slot, ctx->block_txn_expected, ctx->blk_engine_cfg, 0,
+                                                  insert_wall_ns, ctx->harmonic_threshold_ns, ctx->harmonic_cutoff_ns, &deleted );
+      insert_duration      += fd_tickcount();
+      fd_histf_sample( ctx->insert_duration, (ulong)insert_duration );
+      FD_MCNT_INC( PACK, TXN_DELETED, deleted );
+      if( FD_UNLIKELY( result < 0 ) ) {
+        FD_LOG_INFO(( "HARMONIC: failed to insert block txn for slot=%lu (result=%d)", ctx->block_slot, result ));
+      } else {
+        FD_LOG_INFO(( "HARMONIC: inserted block txn for slot=%lu, pending_cnt=%lu",
+                      ctx->block_slot, fd_pack_harmonic_pending_cnt( ctx->pack ) ));
+      }
+      ctx->cur_spot = NULL;
+      break;
+    }
+
     /* Normal transaction case */
 #if FD_PACK_USE_EXTRA_STORAGE
     if( FD_LIKELY( !ctx->insert_to_extra ) ) {
 #else
     if( 1 ) {
 #endif
-    if( FD_UNLIKELY( ctx->is_bundle ) ) {
+    if( FD_UNLIKELY( ctx->txn_type==TXN_TYPE_BUNDLE ) ) {
       if( FD_UNLIKELY( ctx->current_bundle->txn_cnt==0UL ) ) return;
       if( FD_UNLIKELY( ++(ctx->current_bundle->txn_received)==ctx->current_bundle->txn_cnt ) ) {
         ulong deleted;
@@ -1263,6 +1460,8 @@ after_frag( fd_pack_ctx_t *     ctx,
     FD_MCNT_INC( PACK, TXN_ALREADY_EXECUTED, deleted );
     break;
   }
+  case IN_KIND_BLOCK_FAIL:
+    return; /* unreachable. handled in before_frag */
   }
 
   update_metric_state( ctx, now, FD_PACK_METRIC_STATE_TRANSACTIONS, fd_pack_avail_txn_cnt( ctx->pack )>0 );
@@ -1360,6 +1559,8 @@ unprivileged_init( fd_topo_t const *      topo,
     else if( FD_LIKELY( !strcmp( link->name, "sign_pack"    ) ) ) ctx->in_kind[ i ] = IN_KIND_SIGN;
     else if( FD_LIKELY( !strcmp( link->name, "replay_out"   ) ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY;
     else if( FD_LIKELY( !strcmp( link->name, "executed_txn" ) ) ) ctx->in_kind[ i ] = IN_KIND_EXECUTED_TXN;
+    else if( FD_LIKELY( !strcmp( link->name, "verify_packf" ) ) ) ctx->in_kind[ i ] = IN_KIND_BLOCK_FAIL;
+    else if( FD_LIKELY( !strcmp( link->name, "dedup_packf"  ) ) ) ctx->in_kind[ i ] = IN_KIND_BLOCK_FAIL;
     else FD_LOG_ERR(( "pack tile has unexpected input link %lu %s", i, link->name ));
   }
 
@@ -1368,6 +1569,7 @@ unprivileged_init( fd_topo_t const *      topo,
   FD_TEST( (tile->pack.schedule_strategy>=0) & (tile->pack.schedule_strategy<=FD_PACK_STRATEGY_BALANCED) );
 
   ctx->crank->enabled = tile->pack.bundle.enabled;
+  ctx->harmonic = tile->pack.bundle.harmonic_block_mode;
   if( FD_UNLIKELY( tile->pack.bundle.enabled ) ) {
     if( FD_UNLIKELY( !fd_bundle_crank_gen_init( ctx->crank->gen, (fd_acct_addr_t const *)tile->pack.bundle.tip_distribution_program_addr,
             (fd_acct_addr_t const *)tile->pack.bundle.tip_payment_program_addr,
@@ -1414,8 +1616,10 @@ unprivileged_init( fd_topo_t const *      topo,
                                                                                           extra_txn_deq_footprint() ) ) );
 #endif
 
+  ctx->harmonic_threshold_ns = 0L;
+
   ctx->cur_spot                      = NULL;
-  ctx->is_bundle                     = 0;
+  ctx->txn_type                      = TXN_TYPE_NORMAL;
   ctx->strategy                      = tile->pack.schedule_strategy;
   ctx->max_pending_transactions      = tile->pack.max_pending_transactions;
   ctx->leader_slot                   = ULONG_MAX;
@@ -1442,6 +1646,7 @@ unprivileged_init( fd_topo_t const *      topo,
 #endif
   ctx->use_consumed_cus              = tile->pack.use_consumed_cus;
   ctx->crank->enabled                = tile->pack.bundle.enabled;
+  ctx->harmonic    = tile->pack.bundle.harmonic_block_mode;
 
   ctx->limits.slot_max_cost                = limits_lower->max_cost_per_block;
   ctx->limits.slot_max_vote_cost           = limits_lower->max_vote_cost_per_block;
@@ -1462,6 +1667,7 @@ unprivileged_init( fd_topo_t const *      topo,
   }
 
   for( ulong i=0UL; i<tile->in_cnt; i++ ) {
+    if( FD_UNLIKELY( ctx->in_kind[ i ]==IN_KIND_BLOCK_FAIL ) ) continue; /* Zero-MTU signal link, no dcache */
     fd_topo_link_t const * link = &topo->links[ tile->in_link_id[ i ] ];
     fd_topo_wksp_t const * link_wksp = &topo->workspaces[ topo->objs[ link->dcache_obj_id ].wksp_id ];
 
@@ -1582,6 +1788,7 @@ populate_allowed_fds( fd_topo_t const *      topo,
 #define STEM_CALLBACK_DURING_HOUSEKEEPING during_housekeeping
 #define STEM_CALLBACK_BEFORE_CREDIT       before_credit
 #define STEM_CALLBACK_AFTER_CREDIT        after_credit
+#define STEM_CALLBACK_BEFORE_FRAG         before_frag
 #define STEM_CALLBACK_DURING_FRAG         during_frag
 #define STEM_CALLBACK_AFTER_FRAG          after_frag
 #define STEM_CALLBACK_METRICS_WRITE       metrics_write

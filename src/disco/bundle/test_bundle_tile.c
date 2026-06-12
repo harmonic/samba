@@ -87,6 +87,41 @@ test_replay_frag_ingest( void ) {
   free( wksp );
 }
 
+/* ---- test: before_frag sig filtering --------------------------------- */
+
+/* Covers the sig filter that gates every frag reaching during_frag.
+   Harmonic added before_frag, so no upstream test exercises it. */
+
+static void
+test_before_frag( void ) {
+  FD_LOG_NOTICE(( "TEST before_frag filters frags by sig" ));
+
+  fd_bundle_tile_t ctx[1];
+  memset( ctx, 0, sizeof(fd_bundle_tile_t) );
+
+  ulong const in_idx = 3UL;
+  ctx->leader_in.idx = in_idx;
+
+  /* Leader input is the replay link: became-leader and reset pass, every
+     other replay signal is filtered out. */
+  ctx->leader_in_is_replay = 1;
+  FD_TEST( before_frag( ctx, in_idx, 0UL, REPLAY_SIG_BECAME_LEADER  )==0 );
+  FD_TEST( before_frag( ctx, in_idx, 0UL, REPLAY_SIG_RESET          )==0 );
+  FD_TEST( before_frag( ctx, in_idx, 0UL, REPLAY_SIG_SLOT_COMPLETED )==1 );
+  FD_TEST( before_frag( ctx, in_idx, 0UL, REPLAY_SIG_ROOT_ADVANCED  )==1 );
+
+  /* Leader input is a poh link: only became-leader packets pass. */
+  ctx->leader_in_is_replay = 0;
+  FD_TEST( before_frag( ctx, in_idx, 0UL, fd_disco_poh_sig( 42UL, POH_PKT_TYPE_BECAME_LEADER, 0UL ) )==0 );
+  FD_TEST( before_frag( ctx, in_idx, 0UL, fd_disco_poh_sig( 42UL, POH_PKT_TYPE_MICROBLOCK,    0UL ) )==1 );
+  FD_TEST( before_frag( ctx, in_idx, 0UL, fd_disco_poh_sig( 42UL, POH_PKT_TYPE_LEADER_BANK,   0UL ) )==1 );
+
+  /* Frags from any other input are not the leader link's to filter, and
+     pass through rather than being discarded. */
+  FD_TEST( before_frag( ctx, in_idx+1UL, 0UL, REPLAY_SIG_RESET          )==0 );
+  FD_TEST( before_frag( ctx, in_idx+1UL, 0UL, REPLAY_SIG_SLOT_COMPLETED )==0 );
+}
+
 /* ---- test: maybe_sleep hysteresis ------------------------------------ */
 
 static void
@@ -396,6 +431,7 @@ main( int     argc,
   fd_boot( &argc, &argv );
 
   test_replay_frag_ingest();
+  test_before_frag();
   test_maybe_sleep_no_replay();
   test_maybe_sleep_unknown_schedule();
   test_maybe_sleep_far_leader();
