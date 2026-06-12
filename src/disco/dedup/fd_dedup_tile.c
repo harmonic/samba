@@ -17,6 +17,11 @@
 #define IN_KIND_EXECUTED_TXN (2UL)
 #define IN_KIND_REPLAY       (3UL)
 
+/* Block tcache depth - sized to fit a whole block while letting old
+   keys fall off quickly. Using slot in hash key means we don't need
+   to reset, just let old entries age out. */
+#define BLOCK_TCACHE_DEPTH   (65536UL)
+
 /* fd_dedup_in_ctx_t is a context object for each in (producer) mcache
    connected to the dedup tile. */
 
@@ -45,10 +50,25 @@ typedef struct {
   ulong bundle_idx;
   uchar bundle_signatures[ 4UL ][ 64UL ];
 
+  /*
+    Harmonic Block Dedup: We want to dedup transactions within a block,
+    but blocks are much larger than bundles so we cannot do the same linear
+    search. Instead, we use a dedicated tcache to dedup transactions.
+  */
+  int   block_failed;
+  ulong block_slot;
+  ulong block_tcache_depth;   /* == fd_tcache_depth( block_tcache ), depth of block tcache (const) */
+  ulong block_tcache_map_cnt; /* == fd_tcache_map_cnt( block_tcache ), number of slots for block tcache map (const) */
+  ulong * block_tcache_sync;  /* == fd_tcache_oldest_laddr( block_tcache ), local join to oldest key in block tcache */
+  ulong * block_tcache_ring;
+  ulong * block_tcache_map;
+
   fd_wksp_t * out_mem;
   ulong       out_chunk0;
   ulong       out_wmark;
   ulong       out_chunk;
+
+  ulong       packf_out_idx; /* Output link index for dedup_packf (block-fail signal) */
 
   ulong       hashmap_seed;
 
@@ -67,6 +87,7 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   ulong l = FD_LAYOUT_INIT;
   l = FD_LAYOUT_APPEND( l, alignof( fd_dedup_ctx_t ), sizeof( fd_dedup_ctx_t ) );
   l = FD_LAYOUT_APPEND( l, fd_tcache_align(), fd_tcache_footprint( tile->dedup.tcache_depth, 0UL ) );
+  l = FD_LAYOUT_APPEND( l, fd_tcache_align(), fd_tcache_footprint( BLOCK_TCACHE_DEPTH, 0UL ) ); /* harmonic dedicated block_tcache */
   return FD_LAYOUT_FINI( l, scratch_align() );
 }
 
@@ -164,13 +185,26 @@ after_frag( fd_dedup_ctx_t *    ctx,
   }
   fd_txn_t * txn = fd_txn_m_txn_t( txnm );
 
-  if( FD_UNLIKELY( txnm->block_engine.bundle_id && (txnm->block_engine.bundle_id!=ctx->bundle_id) ) ) {
+  int is_block  = (txnm->source_tpu == FD_TXN_M_TPU_SOURCE_HARMONIC) && !!txnm->block_engine.block_slot;
+  int is_bundle = (txnm->source_tpu == FD_TXN_M_TPU_SOURCE_BUNDLE) && !!txnm->block_engine.bundle_id;
+
+  if( FD_UNLIKELY( is_bundle && (txnm->block_engine.bundle_id!=ctx->bundle_id) ) ) {
     ctx->bundle_failed = 0;
     ctx->bundle_id     = txnm->block_engine.bundle_id;
     ctx->bundle_idx    = 0UL;
   }
 
-  if( FD_UNLIKELY( txnm->block_engine.bundle_id && ctx->bundle_failed ) ) {
+  if( FD_UNLIKELY( is_bundle && ctx->bundle_failed ) ) {
+    ctx->metrics.dedup_tile_result[ FD_METRICS_ENUM_DEDUP_TILE_RESULT_V_BUNDLE_PEER_FAILURE_IDX ]++;
+    return;
+  }
+
+  if( FD_UNLIKELY( is_block && (txnm->block_engine.block_slot!=ctx->block_slot) ) ) {
+    ctx->block_failed = 0;
+    ctx->block_slot   = txnm->block_engine.block_slot;
+  }
+
+  if( FD_UNLIKELY( is_block && ctx->block_failed ) ) {
     ctx->metrics.dedup_tile_result[ FD_METRICS_ENUM_DEDUP_TILE_RESULT_V_BUNDLE_PEER_FAILURE_IDX ]++;
     return;
   }
@@ -188,12 +222,12 @@ after_frag( fd_dedup_ctx_t *    ctx,
   }
 
   int is_dup = 0;
-  if( FD_LIKELY( !txnm->block_engine.bundle_id ) ) {
-    /* Compute fd_hash(signature) for dedup. */
+  if( FD_LIKELY( !is_bundle && !is_block ) ) {
+    /* For regular transactions (quic, udp, etc.), use normal signature-based dedup via tcache. */
     ulong ha_dedup_tag = fd_hash( ctx->hashmap_seed, fd_txn_m_payload( txnm )+txn->signature_off, 64UL );
 
     FD_TCACHE_INSERT( is_dup, *ctx->tcache_sync, ctx->tcache_ring, ctx->tcache_depth, ctx->tcache_map, ctx->tcache_map_cnt, ha_dedup_tag );
-  } else {
+  } else if( FD_UNLIKELY( is_bundle ) ) {
     /* Make sure bundles don't contain a duplicate transaction inside
        the bundle, which would not be valid. */
 
@@ -208,10 +242,26 @@ after_frag( fd_dedup_ctx_t *    ctx,
 
     if( FD_UNLIKELY( ctx->bundle_idx==4UL ) ) ctx->bundle_idx++;
     else fd_memcpy( ctx->bundle_signatures[ ctx->bundle_idx++ ], fd_txn_m_payload( txnm )+txn->signature_off, 64UL );
+  } else /* block */ {
+    /* Blocks: dedup within the block using hash(signature || slot).
+       Including slot in the hash means different blocks naturally have
+       different keys, so no tcache reset is needed on slot change. */
+    uchar sig_slot[ 72 ]; /* 64 byte signature + 8 byte slot */
+    fd_memcpy( sig_slot, fd_txn_m_payload( txnm )+txn->signature_off, 64UL );
+    FD_STORE( ulong, sig_slot+64, txnm->block_engine.block_slot );
+    ulong ha_dedup_tag = fd_hash( ctx->hashmap_seed, sig_slot, 72UL );
+    FD_TCACHE_INSERT( is_dup, *ctx->block_tcache_sync, ctx->block_tcache_ring, ctx->block_tcache_depth, ctx->block_tcache_map, ctx->block_tcache_map_cnt, ha_dedup_tag );
   }
 
   if( FD_LIKELY( is_dup ) ) {
-    if( FD_UNLIKELY( txnm->block_engine.bundle_id ) ) ctx->bundle_failed = 1;
+    ctx->bundle_failed = is_bundle;
+    if( FD_UNLIKELY( is_block && !ctx->block_failed ) ) {
+      ctx->block_failed = 1;
+      if( FD_LIKELY( ctx->packf_out_idx!=ULONG_MAX ) ) {
+        ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_tickcount() );
+        fd_stem_publish( stem, ctx->packf_out_idx, ctx->block_slot, 0UL, 0UL, 0UL, 0UL, tspub );
+      }
+    }
 
     ctx->metrics.dedup_tile_result[ FD_METRICS_ENUM_DEDUP_TILE_RESULT_V_DEDUP_FAILURE_IDX ]++;
   } else {
@@ -246,10 +296,15 @@ unprivileged_init( fd_topo_t const *      topo,
   fd_dedup_ctx_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof( fd_dedup_ctx_t ), sizeof( fd_dedup_ctx_t ) );
   fd_tcache_t * tcache = fd_tcache_join( fd_tcache_new( FD_SCRATCH_ALLOC_APPEND( l, fd_tcache_align(), fd_tcache_footprint( tile->dedup.tcache_depth, 0) ), tile->dedup.tcache_depth, 0 ) );
   if( FD_UNLIKELY( !tcache ) ) FD_LOG_ERR(( "fd_tcache_new failed" ));
+  fd_tcache_t * block_tcache = fd_tcache_join( fd_tcache_new( FD_SCRATCH_ALLOC_APPEND( l, fd_tcache_align(), fd_tcache_footprint( BLOCK_TCACHE_DEPTH, 0) ), BLOCK_TCACHE_DEPTH, 0 ) );
+  if( FD_UNLIKELY( !block_tcache ) ) FD_LOG_ERR(( "fd_tcache_new failed for block_tcache" ));
 
   ctx->bundle_failed = 0;
   ctx->bundle_id     = 0UL;
   ctx->bundle_idx    = 0UL;
+
+  ctx->block_failed  = 0;
+  ctx->block_slot    = 0UL;
 
   memset( &ctx->metrics, 0, sizeof( ctx->metrics ) );
 
@@ -258,6 +313,12 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->tcache_sync    = fd_tcache_oldest_laddr( tcache );
   ctx->tcache_ring    = fd_tcache_ring_laddr  ( tcache );
   ctx->tcache_map     = fd_tcache_map_laddr   ( tcache );
+
+  ctx->block_tcache_depth   = fd_tcache_depth       ( block_tcache );
+  ctx->block_tcache_map_cnt = fd_tcache_map_cnt     ( block_tcache );
+  ctx->block_tcache_sync    = fd_tcache_oldest_laddr( block_tcache );
+  ctx->block_tcache_ring    = fd_tcache_ring_laddr  ( block_tcache );
+  ctx->block_tcache_map     = fd_tcache_map_laddr   ( block_tcache );
 
   FD_TEST( tile->in_cnt<=sizeof( ctx->in )/sizeof( ctx->in[ 0 ] ) );
   for( ulong i=0UL; i<tile->in_cnt; i++ ) {
@@ -286,6 +347,16 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->out_chunk0 = fd_dcache_compact_chunk0( ctx->out_mem, topo->links[ tile->out_link_id[ 0 ] ].dcache );
   ctx->out_wmark  = fd_dcache_compact_wmark ( ctx->out_mem, topo->links[ tile->out_link_id[ 0 ] ].dcache, topo->links[ tile->out_link_id[ 0 ] ].mtu );
   ctx->out_chunk  = ctx->out_chunk0;
+
+  /* Find the dedup_packf output link index for block-fail signals */
+  ctx->packf_out_idx = ULONG_MAX;
+  for( ulong i=0UL; i<tile->out_cnt; i++ ) {
+    fd_topo_link_t const * link = &topo->links[ tile->out_link_id[ i ] ];
+    if( !strcmp( link->name, "dedup_packf" ) ) {
+      ctx->packf_out_idx = i;
+      break;
+    }
+  }
 
   ulong scratch_top = FD_SCRATCH_ALLOC_FINI( l, scratch_align() );
   if( FD_UNLIKELY( scratch_top > (ulong)scratch + scratch_footprint( tile ) ) )
