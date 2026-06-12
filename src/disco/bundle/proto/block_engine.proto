@@ -3,6 +3,7 @@ syntax = "proto3";
 import "packet.proto";
 import "shared.proto";
 import "bundle.proto";
+import "timestamp.proto";
 
 package block_engine;
 
@@ -25,6 +26,13 @@ message BlockBuilderFeeInfoResponse {
   uint64 commission = 2;
 }
 
+message SubmitLeaderWindowInfoRequest {
+  google.protobuf.Timestamp start_timestamp = 1;
+  uint64 slot = 2;
+}
+
+message SubmitLeaderWindowInfoResponse {}
+
 /// Validators can connect to Block Engines to receive packets and bundles.
 service BlockEngineValidator {
   /// Validators can subscribe to the block engine to receive a stream of packets
@@ -36,4 +44,7 @@ service BlockEngineValidator {
   // Block builders can optionally collect fees. This returns fee information if a block builder wants to
   // collect one.
   rpc GetBlockBuilderFeeInfo (BlockBuilderFeeInfoRequest) returns (BlockBuilderFeeInfoResponse) {}
+
+  /// Validators submit information about their upcoming active leader slot.
+  rpc SubmitLeaderWindowInfo (SubmitLeaderWindowInfoRequest) returns (SubmitLeaderWindowInfoResponse) {}
 }

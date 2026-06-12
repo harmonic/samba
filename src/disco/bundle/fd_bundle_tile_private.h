@@ -11,12 +11,36 @@
 #include "../../waltz/fd_rtt_est.h"
 #include "../../util/alloc/fd_alloc.h"
 #include "../../util/hist/fd_histf.h"
-
+#include "../tiles.h"
 #define FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE (5UL)
 
-/* Pending transaction buffer.  gRPC callbacks push decoded transactions
-   here.  after_credit drains one bundle per call by writing to dcache
-   and calling fd_stem_publish.
+/* Harmonic block transactions are copied into an in-tile staging buffer
+   and published only from after_credit (sharing per-iteration verify
+   budget with pending txns).  The staging buffer is sized to match the
+   verify_out link depth (tile->bundle.out_depth) so that one call to
+   fd_h2_rx (bounded by rbuf_rx capacity) cannot overflow it in
+   practice; this lets us accept multiple BundleUuids back-to-back
+   without dropping any.
+
+   Each staged txn carries its own block metadata (block_slot,
+   block_txn_cnt, commission, commission_pubkey) so that staged txns
+   from different blocks can coexist in the buffer without losing
+   per-block context. */
+
+typedef struct {
+  ushort payload_sz;
+  uint   source_ipv4;
+  ulong  block_slot;
+  ushort block_txn_cnt;
+  uchar  commission;
+  uchar  commission_pubkey[ 32 ];
+  uchar  payload[ FD_TXN_MTU ];
+} fd_bundle_harmonic_staged_txn_t;
+
+/* Pending transaction buffer.  gRPC callbacks push decoded bundle and
+   packet transactions here.  after_credit drains by writing to dcache
+   and calling fd_stem_publish.  Harmonic block txns use the parallel
+   harmonic_staging[] buffer with the same drain pattern.
 
    Sized to match the bundle_verif output link depth. */
 
@@ -24,6 +48,7 @@ struct fd_bundle_pending_txn {
   uchar  payload[ FD_TXN_MTU ];
   ushort payload_sz;
   uint   source_ipv4;
+  uchar  source_tpu;
   ulong  sig;
   ulong  bundle_seq;
   ulong  bundle_txn_cnt;
@@ -81,6 +106,10 @@ struct fd_bundle_metrics {
   ulong transport_fail_cnt;
   ulong missing_builder_info_fail_cnt;
   ulong backpressure_drop_cnt;
+
+  /* TPU endpoint metrics */
+  ulong tpu_packet_received_cnt;
+  ulong tpu_txn_received_cnt;
 
   fd_histf_t msg_rx_delay[1];
 };
@@ -146,11 +175,69 @@ struct fd_bundle_tile {
   uchar builder_info_wait  : 1;  /* Request already in-flight? */
   long  builder_info_valid_until;
 
+  /* Leader window info submission */
+  uchar submit_leader_window_info_wait : 1;  /* Request already in-flight? */
+
   /* Bundle subscriptions */
   uchar packet_subscription_live : 1;  /* Want to subscribe to a stream? */
   uchar packet_subscription_wait : 1;  /* Request already in-flight? */
   uchar bundle_subscription_live : 1;
   uchar bundle_subscription_wait : 1;
+
+  /* ========== TPU endpoint  ========== */
+
+  uint tpu_conn_enabled : 1;  /* Is the TPU connection configured? */
+  uint tpu_is_ssl : 1;
+
+# if FD_HAS_OPENSSL
+  SSL * tpu_ssl;
+# endif /* FD_HAS_OPENSSL */
+
+  /* Config for TPU endpoint */
+  char   tpu_server_fqdn[ 256 ]; /* cstr */
+  ulong  tpu_server_fqdn_len;
+  char   tpu_server_sni[ 256 ]; /* cstr */
+  ulong  tpu_server_sni_len;
+  ushort tpu_server_tcp_port;
+
+  /* Resolver for TPU endpoint */
+  uint tpu_server_ip4_addr; /* last DNS lookup result */
+
+  /* TCP socket for TPU endpoint */
+  int  tpu_tcp_sock;
+  uint tpu_tcp_sock_connected : 1;
+  uint tpu_defer_reset : 1;
+  long tpu_cached_ts;
+
+  /* Keepalive for TPU endpoint */
+  fd_keepalive_t    tpu_keepalive[1];
+  fd_rtt_estimate_t tpu_rtt[1];
+
+  /* gRPC client for TPU endpoint */
+  void *                   grpc_client_tpu_mem;
+  fd_grpc_client_t *       tpu_grpc_client;
+  fd_grpc_client_metrics_t tpu_grpc_metrics[1];
+
+  /* Bundle authenticator for TPU endpoint */
+  fd_bundle_auther_t tpu_auther;
+
+  /* Bundle subscriptions for TPU endpoint */
+  uchar tpu_packet_subscription_live : 1;  /* Want to subscribe to a stream? */
+  uchar tpu_packet_subscription_wait : 1;  /* Request already in-flight? */
+
+  /* Cached TPU configs from GetTpuConfigs RPC */
+  uchar  tpu_config_avail : 1;  /* TPU config available? (potentially stale) */
+  uchar  tpu_config_wait  : 1;  /* Request already in-flight? */
+  long   tpu_config_valid_until;
+  uint   tpu_config_tpu_ip4_addr;       /* network byte order */
+  ushort tpu_config_tpu_port;           /* host byte order */
+  uint   tpu_config_tpu_fwd_ip4_addr;   /* network byte order */
+  ushort tpu_config_tpu_fwd_port;       /* host byte order */
+
+  /* Error backoff for TPU endpoint */
+  uint  tpu_backoff_iter;
+  long  tpu_backoff_until;
+  long  tpu_backoff_reset;
 
   /* Bundle state */
   ulong bundle_seq;
@@ -166,6 +253,9 @@ struct fd_bundle_tile {
   fd_stem_context_t *       stem;
   fd_bundle_out_ctx_t       verify_out;
   fd_bundle_out_ctx_t       plugin_out;
+  fd_bundle_out_ctx_t       gossip_out;
+  fd_bundle_out_ctx_t       leader_in;
+  uchar                     leader_in_is_replay;
   fd_bundle_pending_txn_t * pending_txns;
 
   /* App metrics */
@@ -193,6 +283,50 @@ struct fd_bundle_tile {
     ulong       chunk0;
     ulong       wmark;
   } replay_in;
+
+  /* TPU status for gossip updates */
+  uchar tpu_status_recent;  /* most recently observed TPU status */
+  uchar tpu_status_gossip;  /* last TPU status sent to gossip link */
+
+  /* ========== Harmonic block mode  ========== */
+
+  int harmonic_block_mode;  /* If set, enables harmonic block subscription (third stream on same connection) */
+
+  /* Harmonic block subscription state (uses main grpc_client/auther) */
+  uchar harmonic_block_subscription_live : 1;
+  uchar harmonic_block_subscription_wait : 1;
+
+  /* Harmonic block state */
+  ulong harmonic_block_seq;
+  ulong harmonic_block_txn_cnt;
+  ulong harmonic_block_slot;  /* Current block's slot (parsed from uuid) */
+
+  /* Harmonic block metrics */
+  ulong harmonic_block_received_cnt;
+  ulong harmonic_block_txn_received_cnt;
+
+  /* Staging for harmonic batches.  Filled during gRPC decode; drained
+     in after_credit.  When harmonic_pending_len!=0, before_credit
+     defers fd_bundle_client_step so the stream cannot run ahead of
+     published order.  Sized to bundle.out_depth so a single fd_h2_rx
+     pass (bounded by rbuf_rx) cannot overflow it.
+
+     Per-entry block_slot/block_txn_cnt/commission/commission_pubkey
+     allow multiple distinct blocks to coexist in the staging buffer
+     when the server pipelines BundleUuids across one or more gRPC
+     messages decoded in the same I/O turn.
+
+     harmonic_staged_block_slot/_txn_cnt mirror the most recently
+     staged block's metadata for diagnostics/observability only;
+     after_credit reads per-entry metadata. */
+  fd_bundle_harmonic_staged_txn_t * harmonic_staging;
+  ulong                             harmonic_staging_max;
+  ulong                             harmonic_pending_len;
+  ulong                             harmonic_staged_block_slot;
+  ushort                            harmonic_staged_block_txn_cnt;
+
+  /* PoH became_leader message */
+  fd_became_leader_t _became_leader[1];
 };
 
 typedef struct fd_bundle_tile fd_bundle_tile_t;
@@ -202,6 +336,15 @@ typedef struct fd_bundle_tile fd_bundle_tile_t;
 #define FD_BUNDLE_CLIENT_REQ_Bundle_SubscribePackets            4
 #define FD_BUNDLE_CLIENT_REQ_Bundle_SubscribeBundles            5
 #define FD_BUNDLE_CLIENT_REQ_Bundle_GetBlockBuilderFeeInfo      6
+
+/* Harmonic block endpoint request context IDs */
+#define FD_BUNDLE_CLIENT_REQ_SubscribeBlocks                    7
+/* Leader window info submission */
+#define FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo             8
+
+/* TPU endpoint request context IDs */
+#define FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU                9
+#define FD_BUNDLE_CLIENT_REQ_GetTpuConfigs                      10
 
 FD_PROTOTYPES_BEGIN
 
@@ -309,10 +452,17 @@ fd_bundle_client_grpc_rx_timeout(
    - gRPC bundle and packet subscriptions are live
    - HTTP/2 PING exchange was done recently
 
-   Return codes are compatible with FD_PLUGIN_MSG_BLOCK_ENGINE_UPDATE_STATUS_{...}. */
+   Return codes are compatible with FD_BUNDLE_STATE_{...}. */
 
 int
 fd_bundle_client_status( fd_bundle_tile_t const * ctx );
+
+/* fd_bundle_tpu_client_status provides a "check engine light" for the
+   TPU connection.  Returns the same status codes as fd_bundle_client_status.
+   If TPU connection is not enabled, always returns DISCONNECTED. */
+
+int
+fd_bundle_tpu_client_status( fd_bundle_tile_t const * ctx );
 
 /* fd_bundle_request_ctx_cstr returns the gRPC method name for a
    FD_BUNDLE_CLIENT_REQ_* ID.  Returns "unknown" the ID is not
@@ -331,6 +481,37 @@ fd_bundle_client_reset( fd_bundle_tile_t * ctx );
 
 void
 fd_bundle_client_send_ping( fd_bundle_tile_t * ctx );
+
+/* fd_bundle_client_submit_leader_window_info notifies the auction house
+   that we are leader for a given slot. */
+
+void
+fd_bundle_client_submit_leader_window_info( fd_bundle_tile_t * ctx,
+                                            ulong              slot,
+                                            long               start_timestamp_ns );
+
+/* ========== TPU endpoint functions ========== */
+
+/* fd_bundle_tpu_client_grpc_callbacks provides callbacks for TPU grpc_client. */
+
+extern fd_grpc_client_callbacks_t fd_bundle_tpu_client_grpc_callbacks;
+
+/* fd_bundle_tpu_client_step drives the TPU endpoint client logic.
+   Similar to fd_bundle_client_step but for the TPU connection. */
+
+void
+fd_bundle_tpu_client_step( fd_bundle_tile_t * bundle,
+                           int *              charge_busy );
+
+/* fd_bundle_tpu_client_reset frees TPU connection resources. */
+
+void
+fd_bundle_tpu_client_reset( fd_bundle_tile_t * ctx );
+
+/* fd_bundle_tpu_client_send_ping enqueues a PING frame for the TPU connection. */
+
+void
+fd_bundle_tpu_client_send_ping( fd_bundle_tile_t * ctx );
 
 FD_PROTOTYPES_END
 
