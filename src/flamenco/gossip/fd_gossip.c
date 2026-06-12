@@ -407,6 +407,14 @@ fd_gossip_set_shred_version( fd_gossip_t * gossip,
 }
 
 void
+fd_gossip_set_contact_info( fd_gossip_t *                    gossip,
+                            fd_gossip_contact_info_t const * contact_info,
+                            long                             now ) {
+  *gossip->my_contact_info.ci->contact_info = *contact_info;
+  refresh_contact_info( gossip, now );
+}
+
+void
 fd_gossip_stakes_update( fd_gossip_t *             gossip,
                          fd_stake_weight_t const * stake_weights,
                          ulong                     stake_weights_cnt ) {

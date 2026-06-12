@@ -11,7 +11,7 @@
    or knowingly skipped) before the constant is bumped.  String keys of
    the user's own file are separately forced through the classification
    lists below. */
-FD_STATIC_ASSERT( sizeof(fd_config_t)==22964152UL, update_fd_config_to_json_for_the_layout_change );
+FD_STATIC_ASSERT( sizeof(fd_config_t)==22964680UL, update_fd_config_to_json_for_the_layout_change );
 
 #define REDACTED "[redacted]"
 
@@ -120,6 +120,7 @@ static char const * const jw_redacted_keys[] = {
   "net.bind_address",
   "tiles.quic.ssl_key_log_file",
   "tiles.bundle.url",
+  "tiles.bundle.tpu_url",
   "tiles.event.url",
   "tiles.shred.additional_shred_destinations_retransmit",
   "tiles.shred.additional_shred_destinations_leader",
@@ -161,6 +162,7 @@ static char const * const jw_reported_keys[] = {
   "net.xdp.listen_gre",
   "net.xdp.native_bond",
   "tiles.bundle.tls_domain_name",
+  "tiles.bundle.tpu_tls_domain_name",
   "tiles.bundle.tip_distribution_program_addr",
   "tiles.bundle.tip_payment_program_addr",
   "tiles.bundle.tip_distribution_authority",
@@ -565,6 +567,9 @@ fd_config_to_json( fd_config_t const * config,
       jw_ulong( &w, "commission_bps",                config->tiles.bundle.commission_bps );
       jw_ulong( &w, "keepalive_interval_millis",     config->tiles.bundle.keepalive_interval_millis );
       jw_bool ( &w, "tls_cert_verify",               config->tiles.bundle.tls_cert_verify );
+      jw_url  ( &w, "tpu_url",                       config->tiles.bundle.tpu_url );
+      jw_str  ( &w, "tpu_tls_domain_name",           config->tiles.bundle.tpu_tls_domain_name );
+      jw_bool ( &w, "harmonic_block_mode",           config->tiles.bundle.harmonic_block_mode );
     jw_obj_close( &w );
     jw_obj_open( &w, "pack" );
       jw_ulong( &w, "max_pending_transactions", config->tiles.pack.max_pending_transactions );

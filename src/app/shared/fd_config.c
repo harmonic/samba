@@ -644,6 +644,18 @@ fd_config_validate( fd_config_t const * config ) {
     FD_LOG_ERR(( "`tiles.bundle.keepalive_interval_millis` must be in range [3000, 3,600,000]" ));
   }
 
+  if( FD_UNLIKELY( config->tiles.bundle.harmonic_block_mode ) ) {
+    if( FD_UNLIKELY( !config->tiles.bundle.enabled ) ) {
+      FD_LOG_ERR(( "`tiles.bundle.enabled` must be true when `tiles.bundle.harmonic_block_mode` is enabled" ));
+    }
+    if( FD_UNLIKELY( !config->tiles.bundle.url[0] ) ) {
+      FD_LOG_ERR(( "`tiles.bundle.url` must be set when `tiles.bundle.harmonic_block_mode` is enabled" ));
+    }
+    if( FD_UNLIKELY( !config->tiles.bundle.tpu_url[0] ) ) {
+      FD_LOG_ERR(( "`tiles.bundle.tpu_url` must be set when `tiles.bundle.harmonic_block_mode` is enabled" ));
+    }
+  }
+
   CFG_HAS_NON_EMPTY( development.core_dump );
 
   CFG_HAS_NON_ZERO( development.genesis.target_tick_duration_micros );
