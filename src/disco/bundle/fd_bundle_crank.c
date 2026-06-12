@@ -7,8 +7,8 @@
 
 FD_STATIC_ASSERT( sizeof(fd_bundle_crank_tip_payment_config_t)==89UL, config_struct );
 
-#define MEMO_PROGRAM_ID 0x05U,0x4aU,0x53U,0x5aU,0x99U,0x29U,0x21U,0x06U,0x4dU,0x24U,0xe8U,0x71U,0x60U,0xdaU,0x38U,0x7cU, \
-                        0x7cU,0x35U,0xb5U,0xddU,0xbcU,0x92U,0xbbU,0x81U,0xe4U,0x1fU,0xa8U,0x40U,0x41U,0x05U,0x44U,0x8dU
+#define MEMO_PROGRAM_ID 0x05U,0x4aU,0x53U,0x52U,0x28U,0x54U,0xcdU,0xd1U,0x03U,0xccU,0x2eU,0x46U,0x31U,0xa3U,0xf5U,0x17U, \
+                        0x92U,0xacU,0x72U,0x7cU,0xf1U,0xe5U,0x0aU,0xbcU,0x97U,0x82U,0x8aU,0xc5U,0x99U,0x4fU,0x3cU,0xc2U
 
 static const fd_bundle_crank_3_t fd_bundle_crank_3_base[1] = {{
 
@@ -28,7 +28,7 @@ static const fd_bundle_crank_3_t fd_bundle_crank_3_base[1] = {{
         .acct_cnt = 0,
         .data_sz = 5,
         .set_cu_limit = 2,
-        .cus = 130000U
+        .cus = 127800U
     },
 
     .init_tip_distribution_acct = {
@@ -101,7 +101,7 @@ static const fd_bundle_crank_2_t fd_bundle_crank_2_base[1] = {{
         .acct_cnt = 0,
         .data_sz = 5,
         .set_cu_limit = 2,
-        .cus = 83000U
+        .cus = 80800U
     },
 
     .change_tip_receiver = {
@@ -364,14 +364,27 @@ fd_bundle_crank_generate( fd_bundle_crank_gen_t                       * gen,
   }
   new_tr_pidx->idx = 13UL;
 
-  fd_bundle_crank_gen_pidx_t * new_bb_pidx = pidx_map_insert( gen->map, *(fd_acct_addr_t *)new_block_builder );
-  if( FD_UNLIKELY( !new_bb_pidx ) ) {
-    pidx_map_remove( gen->map, new_tr_pidx   );
-    pidx_map_remove( gen->map, identity_pidx );
-    FD_LOG_WARNING(( "New block builder was already in map.  Refusing to crank bundles." ));
-    return ULONG_MAX;
+  int inserted_bb = 0;
+  fd_bundle_crank_gen_pidx_t dummy_bb[1] = {{ .idx = 14UL }};
+  fd_bundle_crank_gen_pidx_t * new_bb_pidx = pidx_map_query( gen->map, *(fd_acct_addr_t *)new_block_builder, NULL );
+  if( FD_LIKELY( NULL==new_bb_pidx ) ) {
+    new_bb_pidx = pidx_map_insert( gen->map, *(fd_acct_addr_t *)new_block_builder );
+    if( FD_UNLIKELY( !new_bb_pidx ) ) {
+      pidx_map_remove( gen->map, new_tr_pidx   );
+      pidx_map_remove( gen->map, identity_pidx );
+      FD_LOG_WARNING(( "Failed to insert new block builder.  Refusing to crank bundles." ));
+      return ULONG_MAX;
+    }
+    new_bb_pidx->idx = 14UL;
+    inserted_bb = 1;
+  } else if( FD_UNLIKELY( !swap3 && new_bb_pidx->idx>16UL ) ) {
+    new_bb_pidx = dummy_bb;
+  } else {
+    /* perturb byte 1 (not byte 0) so slot 14 stays unique even when
+       old_tip_receiver or old_block_builder alias the same address. */
+    gen->crank3->new_block_builder[1]++;
+    gen->crank2->new_block_builder[1]++;
   }
-  new_bb_pidx->idx = 14UL;
 
   int inserted1 = 0;
   int inserted2 = 0;
@@ -426,10 +439,12 @@ fd_bundle_crank_generate( fd_bundle_crank_gen_t                       * gen,
   gen->crank3->change_block_builder.acct_idx[2] = (uchar)(old_bb_pidx->idx);
   gen->crank2->change_tip_receiver.acct_idx [3] = (uchar)(old_bb_pidx->idx);
   gen->crank2->change_block_builder.acct_idx[2] = (uchar)(old_bb_pidx->idx);
+  gen->crank3->change_block_builder.acct_idx[3] = (uchar)(new_bb_pidx->idx);
+  gen->crank2->change_block_builder.acct_idx[3] = (uchar)(new_bb_pidx->idx);
 
-  if( FD_UNLIKELY( inserted2 ) ) pidx_map_remove( gen->map, old_bb_pidx );
-  if( FD_LIKELY  ( inserted1 ) ) pidx_map_remove( gen->map, old_tr_pidx );
-  pidx_map_remove( gen->map, new_bb_pidx   );
+  if( FD_UNLIKELY( inserted2   ) ) pidx_map_remove( gen->map, old_bb_pidx );
+  if( FD_LIKELY  ( inserted1   ) ) pidx_map_remove( gen->map, old_tr_pidx );
+  if( FD_LIKELY  ( inserted_bb ) ) pidx_map_remove( gen->map, new_bb_pidx );
   pidx_map_remove( gen->map, new_tr_pidx   );
   pidx_map_remove( gen->map, identity_pidx );
 

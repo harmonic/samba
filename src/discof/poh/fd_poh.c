@@ -1,4 +1,6 @@
 #include "fd_poh.h"
+#include "../../ballet/bmtree/fd_bmtree.h"
+#include "../../disco/pack/fd_pack.h"
 
 /* The PoH implementation is at its core a state machine ...
 
@@ -224,7 +226,7 @@ fd_poh_begin_leader( fd_poh_t * poh,
                      ulong      slot,
                      ulong      hashcnt_per_tick,
                      ulong      ticks_per_slot,
-                     ulong      tick_duration_ns,
+                     ulong      tick_duration_ns FD_PARAM_UNUSED,
                      ulong      max_microblocks_in_slot,
                      long       slot_start_ns ) {
   FD_TEST( poh->state==STATE_FOLLOWER || poh->state==STATE_WAITING_FOR_BANK );
@@ -759,3 +761,4 @@ fd_poh1_mixin( fd_poh_t *          poh,
 
   publish_microblock( poh, stem, slot, hashcnt_delta, txn_cnt, txns );
 }
+
