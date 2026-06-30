@@ -319,6 +319,7 @@ struct fd_topo_tile {
         char  identity_key_path[ PATH_MAX ];
         char  vote_account_path[ PATH_MAX ]; /* or pubkey is okay */
         int   harmonic_block_mode; /* If set, processes harmonic blocks */
+        int   strategy; /* block_engine_SchedulingStrategy for crank memo */
       } bundle;
     } pack;
 
