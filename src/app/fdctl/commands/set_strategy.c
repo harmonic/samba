@@ -2,6 +2,7 @@
 #include "../../shared/fd_config.h"
 #include "../../shared/fd_action.h"
 #include "../../../disco/bundle/fd_bundle_tile_private.h"
+#include "../../../disco/pack/fd_pack_tile_private.h"
 #include "../../../disco/bundle/proto/block_engine.pb.h"
 #include "../../../util/fd_util.h"
 
@@ -67,13 +68,13 @@ set_strategy_cmd_fn( args_t *   args,
   fd_topo_obj_t const * bundle_obj = &config->topo.objs[ bundle_tile->tile_obj_id ];
   fd_topo_join_workspace( &config->topo, &config->topo.workspaces[ bundle_obj->wksp_id ], FD_SHMEM_JOIN_MODE_READ_WRITE, 0 );
 
-  fd_bundle_tile_t * ctx = fd_topo_obj_laddr( &config->topo, bundle_tile->tile_obj_id );
-  if( FD_UNLIKELY( !ctx ) ) {
+  fd_bundle_tile_t * bundle_ctx = fd_topo_obj_laddr( &config->topo, bundle_tile->tile_obj_id );
+  if( FD_UNLIKELY( !bundle_ctx ) ) {
     fd_topo_leave_workspaces( &config->topo );
     FD_LOG_ERR(( "Failed to access bundle tile object" ));
   }
 
-  int const old_strategy = ctx->strategy;
+  int const old_strategy = bundle_ctx->strategy;
   int const new_strategy = args->set_strategy.strategy_enum;
 
   if( FD_UNLIKELY( !strategy_is_known( old_strategy ) ) ) {
@@ -91,9 +92,24 @@ set_strategy_cmd_fn( args_t *   args,
   }
 
   FD_COMPILER_MFENCE();
-  ctx->strategy    = new_strategy;
-  ctx->defer_reset = 1;
+  bundle_ctx->strategy    = new_strategy;
+  bundle_ctx->defer_reset = 1;
   FD_COMPILER_MFENCE();
+
+  ulong pack_tile_idx = fd_topo_find_tile( &config->topo, "pack", 0UL );
+  if( FD_LIKELY( pack_tile_idx!=ULONG_MAX ) ) {
+    fd_topo_tile_t const * pack_tile = &config->topo.tiles[ pack_tile_idx ];
+    if( FD_LIKELY( pack_tile->tile_obj_id!=ULONG_MAX ) ) {
+      fd_topo_obj_t const * pack_obj = &config->topo.objs[ pack_tile->tile_obj_id ];
+      fd_topo_join_workspace( &config->topo, &config->topo.workspaces[ pack_obj->wksp_id ], FD_SHMEM_JOIN_MODE_READ_WRITE, 0 );
+      fd_pack_runtime_cfg_t * pack_rt = fd_topo_obj_laddr( &config->topo, pack_tile->tile_obj_id );
+      if( FD_LIKELY( pack_rt ) ) {
+        FD_COMPILER_MFENCE();
+        pack_rt->harmonic_strategy = new_strategy;
+        FD_COMPILER_MFENCE();
+      }
+    }
+  }
 
   FD_LOG_NOTICE(( "harmonic scheduling strategy: %s -> %s (connection reset requested)",
                   old_cstr, new_cstr ));
@@ -107,6 +123,6 @@ action_t fd_action_set_strategy = {
   .fn             = set_strategy_cmd_fn,
   .require_config = 1,
   .perm           = NULL,
-  .description    = "Change harmonic scheduling strategy in the running bundle tile",
+  .description    = "Change harmonic scheduling strategy in the running bundle and pack tiles",
   .is_diagnostic  = 1,
 };
