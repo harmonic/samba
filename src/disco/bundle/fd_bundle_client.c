@@ -1868,7 +1868,7 @@ fd_bundle_tpu_client_step1( fd_bundle_tile_t * ctx,
   }
 
   /* Drive I/O, SSL handshake, and any inflight requests */
-  if( FD_UNLIKELY( !fd_bundle_tpu_client_drive_io( ctx, charge_busy ) ||
+  if( FD_UNLIKELY( -1==fd_bundle_tpu_client_drive_io( ctx, charge_busy ) ||
                    ctx->tpu_defer_reset ) ) {
     fd_bundle_tpu_client_reset( ctx );
     ctx->metrics.transport_fail_cnt++;
