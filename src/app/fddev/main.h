@@ -123,6 +123,7 @@ extern action_t fd_action_dump;
 extern action_t fd_action_flame;
 extern action_t fd_action_help;
 extern action_t fd_action_metrics;
+extern action_t fd_action_set_strategy;
 extern action_t fd_action_load;
 extern action_t fd_action_pktgen;
 extern action_t fd_action_quic_trace;
@@ -144,6 +145,7 @@ action_t * ACTIONS[] = {
   &fd_action_get_identityh,
   &fd_action_help,
   &fd_action_metrics,
+  &fd_action_set_strategy,
   &fd_action_version,
   &fd_action_bench,
   &fd_action_bundle_client,
