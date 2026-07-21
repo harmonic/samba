@@ -1,5 +1,6 @@
 #include "fd_gossip_tile.h"
 #include "../../disco/metrics/fd_metrics.h"
+#include "../../disco/bundle/fd_bundle_tpu.h"
 #include "generated/fd_gossip_tile_seccomp.h"
 
 #include "../../choreo/eqvoc/fd_eqvoc.h"
@@ -19,6 +20,7 @@
 #define IN_KIND_EPOCH         (4)
 #define IN_KIND_TOWER         (5)
 #define IN_KIND_SNAPIN_MANIF  (6)
+#define IN_KIND_BUNDLE_GOSSIP (7)
 
 FD_FN_CONST static inline ulong
 scratch_align( void ) {
@@ -321,6 +323,44 @@ handle_epoch( fd_gossip_tile_ctx_t *      ctx,
 }
 
 static void
+handle_tpu_update( fd_gossip_tile_ctx_t *         ctx,
+                   fd_bundle_tpu_update_t const * msg ) {
+  /* Update our contact info based on TPU connection status from bundle tile.
+     When connected to a remote relayer, we advertise the remote TPU address
+     so other validators send transactions there. When disconnected, we
+     revert to our local TPU address. */
+  if( msg->status == FD_BUNDLE_TPU_UPDATE_CONNECTED ) {
+    /* Update TPU addresses to remote endpoint.
+       Port values in contact_info are stored in network byte order. */
+    ushort tpu_port_nbo     = fd_ushort_bswap( msg->tpu_port );
+    ushort tpu_fwd_port_nbo = fd_ushort_bswap( msg->tpu_fwd_port );
+
+    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU ]               = (fd_gossip_socket_t){ .is_ipv6 = 0, .ip4 = msg->tpu_ip4_addr,     .port = tpu_port_nbo     };
+    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_QUIC ]          = (fd_gossip_socket_t){ .is_ipv6 = 0, .ip4 = msg->tpu_ip4_addr,     .port = tpu_port_nbo     };
+    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_VOTE ]          = (fd_gossip_socket_t){ .is_ipv6 = 0, .ip4 = msg->tpu_ip4_addr,     .port = tpu_port_nbo     };
+    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_VOTE_QUIC ]     = (fd_gossip_socket_t){ .is_ipv6 = 0, .ip4 = msg->tpu_ip4_addr,     .port = tpu_port_nbo     };
+    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_FORWARDS ]      = (fd_gossip_socket_t){ .is_ipv6 = 0, .ip4 = msg->tpu_fwd_ip4_addr, .port = tpu_fwd_port_nbo };
+    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_FORWARDS_QUIC ] = (fd_gossip_socket_t){ .is_ipv6 = 0, .ip4 = msg->tpu_fwd_ip4_addr, .port = tpu_fwd_port_nbo };
+
+    FD_LOG_INFO(( "TPU connected: advertising remote TPU " FD_IP4_ADDR_FMT ":%u, forwards " FD_IP4_ADDR_FMT ":%u",
+                  FD_IP4_ADDR_FMT_ARGS( msg->tpu_ip4_addr ), msg->tpu_port,
+                  FD_IP4_ADDR_FMT_ARGS( msg->tpu_fwd_ip4_addr ), msg->tpu_fwd_port ));
+  } else {
+    /* Revert to local TPU addresses saved at startup */
+    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU ]               = ctx->local_tpu_addr;
+    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_QUIC ]          = ctx->local_tpu_quic_addr;
+    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_VOTE ]          = ctx->local_tpu_addr;
+    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_VOTE_QUIC ]     = ctx->local_tpu_quic_addr;
+    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_FORWARDS ]      = ctx->local_tpu_fwd_addr;
+    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_FORWARDS_QUIC ] = ctx->local_tpu_fwd_quic_addr;
+
+    FD_LOG_INFO(( "TPU disconnected: reverted to local TPU " FD_IP4_ADDR_FMT ":%u",
+                  FD_IP4_ADDR_FMT_ARGS( ctx->local_tpu_addr.ip4 ),
+                  fd_ushort_bswap( ctx->local_tpu_addr.port ) ));
+  }
+}
+
+static void
 handle_packet( fd_gossip_tile_ctx_t * ctx,
                ulong                  sig,
                uchar const *          payload,
@@ -431,6 +471,7 @@ returnable_frag( fd_gossip_tile_ctx_t * ctx,
     case IN_KIND_TXSEND:        handle_local_vote( ctx, fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk ), stem ); break;
     case IN_KIND_EPOCH:         handle_epoch( ctx, fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk ) ); break;
     case IN_KIND_TOWER:         handle_local_duplicate_shred( ctx, sig, fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk ), stem ); break;
+    case IN_KIND_BUNDLE_GOSSIP: handle_tpu_update( ctx, fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk ) ); break;
     case IN_KIND_SNAPIN_MANIF: {
       if( FD_LIKELY( ctx->wfs_state==FD_GOSSIP_WFS_STATE_DONE ) ) break;
 
@@ -452,13 +493,13 @@ returnable_frag( fd_gossip_tile_ctx_t * ctx,
 
       FD_TEST( manifest->vote_accounts_len<=FD_VOTE_ACCOUNTS_MAX );
       for( ulong i=0UL; i<manifest->vote_accounts_len; i++ ) {
-          if( FD_UNLIKELY( manifest->vote_accounts[ i ].stake==0UL ) ) continue;
-          ctx->wfs_stake.total += manifest->vote_accounts[ i ].stake;
+        if( FD_UNLIKELY( manifest->vote_accounts[ i ].stake==0UL ) ) continue;
+        ctx->wfs_stake.total += manifest->vote_accounts[ i ].stake;
 
-          fd_memcpy( ctx->wfs_stakes_scratch[ wfs_stakes_unconverted_cnt ].id_key.uc, manifest->vote_accounts[ i ].node_account_pubkey, sizeof(fd_pubkey_t) );
-          fd_memcpy( ctx->wfs_stakes_scratch[ wfs_stakes_unconverted_cnt ].vote_key.uc, manifest->vote_accounts[ i ].vote_account_pubkey, sizeof(fd_pubkey_t) );
-          ctx->wfs_stakes_scratch[ wfs_stakes_unconverted_cnt ].stake = manifest->vote_accounts[ i ].stake;
-          wfs_stakes_unconverted_cnt++;
+        fd_memcpy( ctx->wfs_stakes_scratch[ wfs_stakes_unconverted_cnt ].id_key.uc,   manifest->vote_accounts[ i ].node_account_pubkey, sizeof(fd_pubkey_t) );
+        fd_memcpy( ctx->wfs_stakes_scratch[ wfs_stakes_unconverted_cnt ].vote_key.uc, manifest->vote_accounts[ i ].vote_account_pubkey, sizeof(fd_pubkey_t) );
+        ctx->wfs_stakes_scratch[ wfs_stakes_unconverted_cnt ].stake = manifest->vote_accounts[ i ].stake;
+        wfs_stakes_unconverted_cnt++;
       }
       ctx->wfs_stakes_cnt = compute_id_weights_from_vote_weights( ctx->wfs_stakes, ctx->wfs_stakes_scratch, wfs_stakes_unconverted_cnt );
 
@@ -562,6 +603,8 @@ unprivileged_init( fd_topo_t const *      topo,
       ctx->in[ i ].kind = IN_KIND_TOWER;
     } else if( FD_UNLIKELY( !strcmp( link->name, "snapin_manif" ) ) ) {
       ctx->in[ i ].kind = IN_KIND_SNAPIN_MANIF;
+    } else if( FD_UNLIKELY( !strcmp( link->name, "bundle_gossi" ) ) ) {
+      ctx->in[ i ].kind = IN_KIND_BUNDLE_GOSSIP;
     } else {
       FD_LOG_ERR(( "unexpected input link name %s", link->name ));
     }
@@ -598,7 +641,7 @@ unprivileged_init( fd_topo_t const *      topo,
 
   ctx->my_contact_info->outset = (ulong)FD_NANOSEC_TO_MICRO( tile->gossip.boot_timestamp_nanos );
 
-  ctx->my_contact_info->version.client      = FD_GOSSIP_CONTACT_INFO_CLIENT_FIREDANCER;
+  ctx->my_contact_info->version.client      = FD_GOSSIP_CONTACT_INFO_CLIENT_HARMONIC_FD;
   ctx->my_contact_info->version.major       = (ushort)fd_major_version;
   ctx->my_contact_info->version.minor       = (ushort)fd_minor_version;
   ctx->my_contact_info->version.patch       = (ushort)fd_patch_version;
@@ -619,6 +662,12 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TVU_QUIC ]          = (fd_gossip_socket_t){ .is_ipv6 = 0, .ip4 = 0, .port = 0 };
   ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_RPC ]               = (fd_gossip_socket_t){ .is_ipv6 = 0, .ip4 = 0, .port = 0 };
   ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_RPC_PUBSUB ]        = (fd_gossip_socket_t){ .is_ipv6 = 0, .ip4 = 0, .port = 0 };
+
+  /* Save local TPU addresses for reverting when bundle disconnects */
+  ctx->local_tpu_addr          = ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU ];
+  ctx->local_tpu_quic_addr     = ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_QUIC ];
+  ctx->local_tpu_fwd_addr      = ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_FORWARDS ];
+  ctx->local_tpu_fwd_quic_addr = ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_FORWARDS_QUIC ];
 
   ctx->gossip = fd_gossip_join( fd_gossip_new( _gossip,
                                                ctx->rng,

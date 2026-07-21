@@ -78,6 +78,11 @@ struct fd_became_leader {
     uchar                                tip_receiver_owner[32];
     uchar                                last_blockhash[32];
   } bundle[1];
+
+  /* cavey: 1 if this validator is also the leader for slot+1, 0 otherwise.
+     Used by pack to decide whether to sprint (schedule bundles/nonvote)
+     after the harmonic block completes. */
+  int leader_next_slot;
 };
 typedef struct fd_became_leader fd_became_leader_t;
 
@@ -91,6 +96,7 @@ typedef struct fd_rooted_bank fd_rooted_bank_t;
 struct fd_completed_bank {
    ulong slot;
    uchar hash[32];
+   ulong block_height;
 };
 
 typedef struct fd_completed_bank fd_completed_bank_t;
