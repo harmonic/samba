@@ -1,0 +1,238 @@
+name: Harmonic Draft Release
+
+# Creates a draft GitHub release for the harmonic firedancer fork.
+#
+# Run from a harmonic release branch (vX.Y-harmonic); the branch major picks the
+# client: v0.Y -> Frankendancer (fdctl), v1+.Y -> full Firedancer (firedancer).
+# Builds that binary, checks the tree is clean, then tags v<version>-harmonic at
+# the branch HEAD using the exact version the binary reports (e.g. Frankendancer's
+# packed "0.1006.40100"); the binary's major must match the branch major. The tag
+# is created only when the draft is published.
+#
+# release_type sets the network (Frankendancer's version has no reliable
+# pre-release suffix): 'prerelease' -> Testnet pre-release, 'latest' -> Mainnet.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: "Release type: 'prerelease' (Testnet, marked pre-release) or 'latest' (Mainnet, marked latest)"
+        required: true
+        type: choice
+        options:
+          - prerelease
+          - latest
+        default: prerelease
+      changelog:
+        description: "Changelog for the release (markdown, e.g. '- Minor bugfixes')"
+        required: false
+        type: string
+        default: ""
+      harmonic_patch:
+        description: "Harmonic patch number for a release between upstream versions (e.g. '1' -> ...-harmonic.1). Leave blank for a normal release."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      branch: ${{ steps.plan.outputs.branch }}
+      client: ${{ steps.plan.outputs.client }}
+      binary: ${{ steps.plan.outputs.binary }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Select client from branch and validate
+        id: plan
+        run: |
+          set -euo pipefail
+
+          branch="${GITHUB_REF_NAME}"
+          if ! echo "${branch}" | grep -qE '^v[0-9]+\.[0-9]+-harmonic$'; then
+            echo "::error::Run this workflow from a release branch named 'vX.Y-harmonic' (got '${branch}')"
+            exit 1
+          fi
+          major="$(echo "${branch}" | sed -E 's/^v([0-9]+)\.[0-9]+-harmonic$/\1/')"
+          minor="$(echo "${branch}" | sed -E 's/^v[0-9]+\.([0-9]+)-harmonic$/\1/')"
+
+          # Branch major picks the client: 0 -> Frankendancer, >=1 -> Firedancer.
+          if [ "${major}" -eq 0 ]; then
+            client="frankendancer"
+            binary="fdctl"
+          else
+            client="firedancer"
+            binary="firedancer"
+          fi
+
+          echo "branch=${branch}" >> "${GITHUB_OUTPUT}"
+          echo "major=${major}" >> "${GITHUB_OUTPUT}"
+          echo "minor=${minor}" >> "${GITHUB_OUTPUT}"
+          echo "client=${client}" >> "${GITHUB_OUTPUT}"
+          echo "binary=${binary}" >> "${GITHUB_OUTPUT}"
+          echo "Releasing ${client} (${binary}) from ${branch}"
+
+      - uses: ./.github/actions/submodule-init
+
+      - uses: dtolnay/rust-toolchain@1.94.0
+
+      - name: Install dependencies
+        run: |
+          set -e
+          sudo apt-get update
+          FD_AUTO_INSTALL_PACKAGES=1 ./deps.sh check
+          CC=gcc CXX=g++ FD_AUTO_INSTALL_PACKAGES=1 ./deps.sh +dev fetch install
+
+      - name: Build release binary
+        env:
+          BINARY: ${{ steps.plan.outputs.binary }}
+        run: |
+          set -e
+          make -j "${BINARY}"
+
+      - name: Ensure the working tree is clean
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::Build left the working tree dirty:"
+            git status --porcelain
+            exit 1
+          fi
+
+      - name: Compute expected version, tag, and verify the binary
+        id: version
+        env:
+          CLIENT: ${{ steps.plan.outputs.client }}
+          BINARY: ${{ steps.plan.outputs.binary }}
+          BRANCH_MAJOR: ${{ steps.plan.outputs.major }}
+          BRANCH_MINOR: ${{ steps.plan.outputs.minor }}
+          HARMONIC_PATCH: ${{ inputs.harmonic_patch }}
+        run: |
+          set -euo pipefail
+
+          read_mk() { sed -nE "s/^$1[[:space:]]*:=[[:space:]]*([0-9]+).*/\1/p" "$2"; }
+
+          # Compute the expected version from source, matching how upstream tags
+          # releases. The Frankendancer packing mirrors contrib/tag-release.py.
+          if [ "${CLIENT}" = "frankendancer" ]; then
+            vmk="src/app/fdctl/version.mk"
+          else
+            vmk="src/app/firedancer/version.mk"
+          fi
+          vmaj="$(read_mk VERSION_MAJOR "${vmk}")"
+          vmin="$(read_mk VERSION_MINOR "${vmk}")"
+          vpat="$(read_mk VERSION_PATCH "${vmk}")"
+
+          # The source version.mk must match the branch it is released from.
+          if [ "${vmaj}" != "${BRANCH_MAJOR}" ] || [ "${vmin}" != "${BRANCH_MINOR}" ]; then
+            echo "::error::${vmk} is ${vmaj}.${vmin} but branch is v${BRANCH_MAJOR}.${BRANCH_MINOR}"
+            exit 1
+          fi
+
+          if [ "${CLIENT}" = "frankendancer" ]; then
+            # Pack the linked Agave version into the patch, using the prerelease
+            # number as the patch when Agave is a prerelease (see with-agave.mk).
+            agave_ver="$(sed -nE 's/^version = "([^"]+)".*/\1/p' agave/Cargo.toml | head -n1)"
+            agave_core="${agave_ver%%-*}"
+            a_major="$(echo "${agave_core}" | cut -d. -f1)"
+            a_minor="$(echo "${agave_core}" | cut -d. -f2)"
+            if [ "${agave_ver}" != "${agave_core}" ]; then
+              a_patch="$(echo "${agave_ver#*-}" | cut -d. -f2)"
+            else
+              a_patch="$(echo "${agave_core}" | cut -d. -f3)"
+            fi
+            agave_packed="$(printf '%d%02d%02d' "${a_major}" "${a_minor}" "${a_patch}")"
+            expected="${vmaj}.$(printf '%d%02d' "${vmin}" "${vpat}").${agave_packed}"
+          else
+            expected="${vmaj}.${vmin}.${vpat}"
+          fi
+
+          # Sanity-check the built binary against the expected version.
+          # `<binary> version` prints "<version> (<commit>)". When Agave is a
+          # prerelease, Frankendancer reports "MAJOR.MINOR.0-<pre>.PATCH"; flatten
+          # that to "MAJOR.MINOR.PATCH" before comparing.
+          raw_version="$(build/native/gcc/bin/${BINARY} version | awk '{print $1}')"
+          binver="$(echo "${raw_version}" | sed -E 's/\.0-[a-z]+\./\./')"
+          if [ "${binver}" != "${expected}" ]; then
+            echo "::error::${BINARY} reports ${raw_version} (flattened ${binver}) but source expects ${expected}"
+            exit 1
+          fi
+
+          # Optionally append a harmonic patch number for a release between
+          # upstream versions, e.g. v0.1006.40100-harmonic.1.
+          tag="v${expected}-harmonic"
+          if [ -n "${HARMONIC_PATCH}" ]; then
+            if ! echo "${HARMONIC_PATCH}" | grep -qE '^[1-9][0-9]*$'; then
+              echo "::error::harmonic_patch must be a positive integer (got '${HARMONIC_PATCH}')"
+              exit 1
+            fi
+            tag="${tag}.${HARMONIC_PATCH}"
+          fi
+
+          echo "Expected ${expected} (binary reported ${raw_version}) -> tag ${tag}"
+          echo "version=${expected}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+  draft-release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.build.outputs.tag }}
+          BRANCH: ${{ needs.build.outputs.branch }}
+          CLIENT: ${{ needs.build.outputs.client }}
+          BINARY: ${{ needs.build.outputs.binary }}
+          VERSION: ${{ needs.build.outputs.version }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          CHANGELOG: ${{ inputs.changelog }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "::error::Release ${TAG} already exists"
+            exit 1
+          fi
+
+          if [ "${RELEASE_TYPE}" = "prerelease" ]; then
+            net="Testnet"
+            header="This is a Testnet only release."
+          else
+            net="Mainnet"
+            header="This is a stable release suitable for Testnet and Mainnet Beta."
+          fi
+
+          case "${CLIENT}" in
+            frankendancer) client_title="Frankendancer" ;;
+            firedancer)    client_title="Firedancer" ;;
+            *)             client_title="${CLIENT}" ;;
+          esac
+
+          cat > notes.md <<EOF
+          ${header}
+
+          ## What's Changed
+
+          ### ${client_title} (\`${BINARY}\`)
+
+          - Upstream Changes: https://github.com/firedancer-io/firedancer/releases/tag/v${VERSION}
+
+          ${CHANGELOG}
+          EOF
+
+          args=(--draft --target "${BRANCH}" --title "${client_title} ${net} ${TAG}" --notes-file notes.md)
+          if [ "${RELEASE_TYPE}" = "prerelease" ]; then
+            args+=(--prerelease)
+          else
+            args+=(--latest)
+          fi
+
+          gh release create "${TAG}" "${args[@]}"
