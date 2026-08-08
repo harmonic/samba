@@ -42,15 +42,13 @@ user = "firedancer"
         "eoKpUABi59aT4rR9HGS3LcMecfut9x7zJyodWWP43YQ",
         "9QxCLckBiJc783jnMvXZubK4wH86Eqqvashtrwvcsgkv",
     ]
+    identity_path = "/home/firedancer/validator-keypair.json"
+    vote_account_path = "/home/firedancer/vote-keypair.json"
 
 [rpc]
     port = 9099
     full_api = true
     private = true
-
-[consensus]
-    identity_path = "/home/firedancer/validator-keypair.json"
-    vote_account_path = "/home/firedancer/vote-keypair.json"
 ```
 
 :::
