@@ -128,7 +128,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          read_mk() { sed -nE "s/^$1[[:space:]]*:=[[:space:]]*([0-9]+).*/\1/p" "$2"; }
+          # version.mk names the fields VERSION_* on v0.x and FD_VERSION_* on v1+.
+          read_mk() { sed -nE "s/^(FD_)?$1[[:space:]]*:=[[:space:]]*([0-9]+).*/\2/p" "$2" | head -n1; }
 
           # Compute the expected version from source, matching how upstream tags
           # releases. The Frankendancer packing mirrors contrib/tag-release.py.
