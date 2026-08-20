@@ -24,6 +24,7 @@ $(call add-objs,commands/remove_all_authorized_voters,fd_firedancer)
 $(call add-objs,commands/shred_version,fd_firedancer)
 $(call add-objs,commands/set_identity,fd_firedancer)
 $(call add-objs,commands/get_identity,fd_firedancer)
+$(call add-objs,commands/set_strategy,fd_firedancer)
 $(call add-objs,commands/adminctl_client,fd_firedancer)
 $(call add-objs,commands/monitor_gossip/monitor_gossip commands/monitor_gossip/gossip_diag,fd_firedancer)
 

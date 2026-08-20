@@ -13,6 +13,8 @@
 #include "../pack/fd_pack.h"
 #include "../pack/fd_pack_cost.h"
 #include "../pack/fd_pack_pacing.h"
+#include "../pack/fd_pack_tile_private.h"
+#include "../bundle/proto/block_engine.pb.h"
 
 #include <string.h>
 
@@ -115,8 +117,6 @@ FD_IMPORT( wait_duration, "src/disco/pack/pack_delay.bin", ulong, 6, "" );
 #define FD_PACK_STRATEGY_PERF     0
 #define FD_PACK_STRATEGY_BALANCED 1
 
-static char const * const schedule_strategy_strings[2] = { "PRF", "BAL" };
-
 
 typedef struct {
   fd_acct_addr_t commission_pubkey[1];
@@ -135,6 +135,8 @@ typedef struct {
 } fd_pack_in_ctx_t;
 
 typedef struct {
+  fd_pack_runtime_cfg_t runtime_cfg[1];
+
   fd_pack_t *  pack;
   fd_txn_e_t * cur_spot;
 
@@ -351,6 +353,8 @@ typedef struct {
   union{ fd_pack_rebate_t rebate[1]; uchar footprint[USHORT_MAX]; } rebate[1];
 } fd_pack_ctx_t;
 
+FD_STATIC_ASSERT( offsetof( fd_pack_ctx_t, runtime_cfg )==0UL, runtime_cfg_at_start );
+
 #define BUNDLE_META_SZ 40UL
 FD_STATIC_ASSERT( sizeof(block_builder_info_t)==BUNDLE_META_SZ, blk_engine_cfg );
 
@@ -358,6 +362,38 @@ FD_STATIC_ASSERT( sizeof(block_builder_info_t)==BUNDLE_META_SZ, blk_engine_cfg )
 #define FD_PACK_METRIC_STATE_EXECLES      1
 #define FD_PACK_METRIC_STATE_LEADER       2
 #define FD_PACK_METRIC_STATE_MICROBLOCKS  3
+
+static char const *
+pack_schedule_strategy_memo( int pack_schedule_strategy ) {
+  switch( pack_schedule_strategy ) {
+  case FD_PACK_STRATEGY_PERF:     return "PRF";
+  case FD_PACK_STRATEGY_BALANCED: return "BAL";
+  default:                        return "???";
+  }
+}
+
+static char const *
+pack_crank_strategy_memo( int bundle_strategy ) {
+  switch( bundle_strategy ) {
+  case block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_FBA:  return "FBA";
+  case block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_MREV: return "MRV";
+  case block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_FIFO: return "FIF";
+  default:                                                       return "???";
+  }
+}
+
+static void
+pack_crank_refresh_memo( fd_pack_ctx_t * ctx,
+                         int             harmonic_state ) {
+  char const * memo;
+  if( ctx->harmonic &&
+      (harmonic_state==HARMONIC_MODE_SPRINT || harmonic_state==HARMONIC_MODE_FAILED) ) {
+    memo = pack_schedule_strategy_memo( ctx->strategy );
+  } else {
+    memo = pack_crank_strategy_memo( ctx->runtime_cfg->harmonic_strategy );
+  }
+  fd_bundle_crank_gen_set_memo( ctx->crank->gen, memo );
+}
 
 /* Updates one component of the metric state.  If the state has changed,
    records the change. */
@@ -813,6 +849,8 @@ after_credit( fd_pack_ctx_t *     ctx,
     }
     if( FD_UNLIKELY( top_meta ) ) {
       /* Have bundles, in a reasonable state to crank. */
+
+      pack_crank_refresh_memo( ctx, harmonic_state );
 
       fd_txn_e_t * _bundle[ 1UL ];
       fd_txn_e_t * const * bundle = fd_pack_insert_bundle_init( ctx->pack, _bundle, 1UL );
@@ -1587,11 +1625,12 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->crank->enabled = tile->pack.bundle.enabled;
   ctx->harmonic = tile->pack.bundle.harmonic_block_mode;
   if( FD_UNLIKELY( tile->pack.bundle.enabled ) ) {
+    ctx->runtime_cfg->harmonic_strategy = tile->pack.bundle.strategy;
+
     if( FD_UNLIKELY( !fd_bundle_crank_gen_init( ctx->crank->gen, (fd_acct_addr_t const *)tile->pack.bundle.tip_distribution_program_addr,
             (fd_acct_addr_t const *)tile->pack.bundle.tip_payment_program_addr,
             (fd_acct_addr_t const *)ctx->crank->vote_pubkey->b,
             (fd_acct_addr_t const *)tile->pack.bundle.tip_distribution_authority,
-            schedule_strategy_strings[ tile->pack.schedule_strategy ],
             tile->pack.bundle.commission_bps ) ) ) {
       FD_LOG_ERR(( "constructing bundle generator failed" ));
     }

@@ -306,6 +306,9 @@ struct fd_topo_tile {
       ulong keepalive_interval_nanos;
       uchar tls_cert_verify : 1;
       int   harmonic_block_mode;
+
+      /* Block engine scheduling strategy for Harmonic block mode */
+      int   strategy;
     } bundle;
 
     struct {
@@ -332,6 +335,7 @@ struct fd_topo_tile {
         char  identity_key_path[ PATH_MAX ];
         char  vote_account_path[ PATH_MAX ]; /* or pubkey is okay */
         int   harmonic_block_mode; /* If set, processes harmonic blocks */
+        int   strategy; /* block_engine_SchedulingStrategy for crank memo */
       } bundle;
       ulong acct_blocklist_cnt;
       fd_pubkey_t acct_blocklist[ FD_PACK_ACCT_BLOCKLIST_MAX ];

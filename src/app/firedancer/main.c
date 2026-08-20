@@ -164,6 +164,7 @@ extern action_t fd_action_add_authorized_voter;
 extern action_t fd_action_remove_all_authorized_voters;
 extern action_t fd_action_set_identity;
 extern action_t fd_action_get_identity;
+extern action_t fd_action_set_strategy;
 extern action_t fd_action_ps;
 extern action_t fd_action_monitor_gossip;
 
@@ -186,6 +187,7 @@ action_t * ACTIONS[] = {
   &fd_action_monitor_gossip,
   &fd_action_set_identity,
   &fd_action_get_identity,
+  &fd_action_set_strategy,
   &fd_action_ps,
   NULL,
 };
