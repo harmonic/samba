@@ -177,7 +177,6 @@ fd_bundle_crank_gen_init( void                 * mem,
                           fd_acct_addr_t const * tip_payment_program_addr,
                           fd_acct_addr_t const * validator_vote_acct_addr,
                           fd_acct_addr_t const * merkle_root_authority_addr,
-                          char const *           scheduler_mode,
                           ulong                  commission_bps ) {
   fd_bundle_crank_gen_t * g = (fd_bundle_crank_gen_t *)mem;
   memcpy( g->crank3, fd_bundle_crank_3_base, sizeof(fd_bundle_crank_3_base) );
@@ -189,14 +188,8 @@ fd_bundle_crank_gen_init( void                 * mem,
   memcpy( g->crank3->validator_vote_account,                                  validator_vote_acct_addr,      32UL );
   memcpy( g->crank3->init_tip_distribution_acct.merkle_root_upload_authority, merkle_root_authority_addr,    32UL );
 
-  /* What we want here is just an strncpy, but the compiler makes it
-     really hard to use strncpy to make a deliberately potentially
-     unterminated string.  Rather than fight the compiler, we basically
-     hand-do it. */
-  int is_nul;
-  is_nul = 0      || (!scheduler_mode[0]);    g->crank3->memo.memo[0] = is_nul ? '\0' : scheduler_mode[0];
-  is_nul = is_nul || (!scheduler_mode[1]);    g->crank3->memo.memo[1] = is_nul ? '\0' : scheduler_mode[1];
-  is_nul = is_nul || (!scheduler_mode[2]);    g->crank3->memo.memo[2] = is_nul ? '\0' : scheduler_mode[2];
+  memset( g->crank3->memo.memo, 0, 3UL );
+  memset( g->crank2->memo.memo, 0, 3UL );
 
   uint  cerr[1];
   do {
@@ -258,6 +251,18 @@ fd_bundle_crank_gen_init( void                 * mem,
 
   g->configured_epoch = ULONG_MAX;
   return g;
+}
+
+
+void
+fd_bundle_crank_gen_set_memo( fd_bundle_crank_gen_t * gen,
+                              char const            * memo ) {
+  gen->crank3->memo.memo[0] = memo[0];
+  gen->crank3->memo.memo[1] = memo[1];
+  gen->crank3->memo.memo[2] = memo[2];
+  gen->crank2->memo.memo[0] = memo[0];
+  gen->crank2->memo.memo[1] = memo[1];
+  gen->crank2->memo.memo[2] = memo[2];
 }
 
 
