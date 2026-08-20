@@ -4594,7 +4594,7 @@ unprivileged_init( fd_topo_t const *      topo,
              (fd_acct_addr_t const *)tile->replay.bundle.tip_distribution_program_addr,
              (fd_acct_addr_t const *)tile->replay.bundle.tip_payment_program_addr,
              (fd_acct_addr_t const *)ctx->bundle.vote_account.uc,
-             (fd_acct_addr_t const *)ctx->bundle.vote_account.uc, "NAN", 0UL ) ) ) {
+             (fd_acct_addr_t const *)ctx->bundle.vote_account.uc, 0UL ) ) ) {
       FD_LOG_ERR(( "failed to initialize bundle crank gen" ));
     }
   }
