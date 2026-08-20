@@ -208,6 +208,11 @@ union fdctl_args {
   struct {
     ulong slot;
   } snapshot_create;
+
+  struct {
+    char strategy[ 8 ];
+    int  strategy_enum;
+  } set_strategy;
 };
 
 typedef union fdctl_args args_t;
