@@ -121,6 +121,44 @@ test_before_frag( void ) {
   FD_TEST( before_frag( ctx, in_idx+1UL, 0UL, REPLAY_SIG_SLOT_COMPLETED )==0 );
 }
 
+/* ---- test: harmonic never sleeps ------------------------------------- */
+
+/* Covers the guard keeping the block engine connection up outside leader
+   windows.  Without it a rebase could silently restore sleeping. */
+
+static void
+test_maybe_sleep_harmonic( void ) {
+  FD_LOG_NOTICE(( "TEST maybe_sleep never sleeps in harmonic mode" ));
+
+  void * wksp = mock_replay_wksp_new();
+
+  fd_bundle_tile_t ctx[1];
+  memset( ctx, 0, sizeof(fd_bundle_tile_t) );
+  ctx->harmonic_block_mode = 1;
+  ctx->replay_in.mem       = wksp;
+  ctx->sleep_mode          = 0;
+
+  /* Leader schedule unknown: would sleep without harmonic. */
+  ctx->sleep_check_ns   = 0;
+  ctx->next_leader_slot = ULONG_MAX;
+  ctx->reset_slot       = ULONG_MAX;
+  fd_bundle_tile_maybe_sleep( ctx, 1 );
+  FD_TEST( ctx->sleep_mode==0 );
+
+  /* Leader far past the sleep threshold: would sleep without harmonic. */
+  ctx->sleep_check_ns   = 0;
+  ctx->reset_slot       = 0UL;
+  ctx->next_leader_slot = FD_BUNDLE_SLEEP_THRESHOLD_SLOTS + 1UL;
+  fd_bundle_tile_maybe_sleep( ctx, 2 );
+  FD_TEST( ctx->sleep_mode==0 );
+
+  /* The guard returns before touching sleep_check_ns, so the tile never
+     starts accounting for a wake-up it does not need. */
+  FD_TEST( ctx->sleep_check_ns==0 );
+
+  free( wksp );
+}
+
 /* ---- test: maybe_sleep hysteresis ------------------------------------ */
 
 static void
@@ -431,6 +469,7 @@ main( int     argc,
 
   test_replay_frag_ingest();
   test_before_frag();
+  test_maybe_sleep_harmonic();
   test_maybe_sleep_no_replay();
   test_maybe_sleep_unknown_schedule();
   test_maybe_sleep_far_leader();
