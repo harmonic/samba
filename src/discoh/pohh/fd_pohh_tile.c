@@ -2467,7 +2467,7 @@ unprivileged_init( fd_topo_t const *      topo,
     NONNULL( fd_bundle_crank_gen_init( ctx->bundle.gen, (fd_acct_addr_t const *)tile->pohh.bundle.tip_distribution_program_addr,
              (fd_acct_addr_t const *)tile->pohh.bundle.tip_payment_program_addr,
              (fd_acct_addr_t const *)ctx->bundle.vote_account.uc,
-             (fd_acct_addr_t const *)ctx->bundle.vote_account.uc, "NAN", 0UL ) ); /* last three arguments are properly bogus */
+             (fd_acct_addr_t const *)ctx->bundle.vote_account.uc, 0UL ) ); /* last two arguments are properly bogus */
   }
 
   ulong pohh_shred_obj_id = fd_pod_query_ulong( topo->props, "pohh_shred", ULONG_MAX );

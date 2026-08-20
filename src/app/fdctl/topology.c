@@ -486,6 +486,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->bundle.ssl_heap_sz = config->development.bundle.ssl_heap_size_mib<<20;
     tile->bundle.keepalive_interval_nanos = config->tiles.bundle.keepalive_interval_millis * (ulong)1e6;
     tile->bundle.tls_cert_verify = !!config->tiles.bundle.tls_cert_verify;
+    tile->bundle.strategy = config->tiles.bundle.strategy_enum;
   } else if( FD_UNLIKELY( !strcmp( tile->name, "verify" ) ) ) {
     tile->verify.tcache_depth = config->tiles.verify.signature_cache_size;
 
@@ -519,6 +520,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
       PARSE_PUBKEY( pack, tip_distribution_authority    );
       tile->pack.bundle.commission_bps = config->tiles.bundle.commission_bps;
       tile->pack.bundle.harmonic_block_mode = config->tiles.bundle.harmonic_block_mode;
+      tile->pack.bundle.strategy = config->tiles.bundle.strategy_enum;
       fd_cstr_ncpy( tile->pack.bundle.identity_key_path, config->paths.identity_key, sizeof(tile->pack.bundle.identity_key_path) );
       fd_cstr_ncpy( tile->pack.bundle.vote_account_path, config->paths.vote_account, sizeof(tile->pack.bundle.vote_account_path) );
     } else {
