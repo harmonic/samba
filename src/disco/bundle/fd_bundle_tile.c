@@ -96,6 +96,9 @@ loose_footprint( fd_topo_tile_t const * tile ) {
 
 static void
 fd_bundle_tile_maybe_sleep( fd_bundle_tile_t * ctx, long now_ns ) {
+  /* Harmonic treats block engine connection liveness as a validator
+     health signal, so never drop it between leader windows. */
+  if( FD_UNLIKELY( ctx->harmonic_block_mode ) ) return;
   if( FD_UNLIKELY( !ctx->replay_in.mem ) ) return;
   if( FD_LIKELY( now_ns < ctx->sleep_check_ns ) ) return;
   ctx->sleep_check_ns = now_ns + FD_BUNDLE_SLEEP_CHECK_INTERVAL_NS;
@@ -914,7 +917,9 @@ unprivileged_init( fd_topo_t const *      topo,
 
   ctx->next_leader_slot = ULONG_MAX;
   ctx->reset_slot       = ULONG_MAX;
-  ctx->sleep_mode       = has_replay_in; /* start asleep until we learn leader schedule */
+  /* Harmonic must not start asleep: fd_bundle_tile_maybe_sleep returns
+     early in harmonic mode and so can never clear this. */
+  ctx->sleep_mode       = has_replay_in && !ctx->harmonic_block_mode; /* start asleep until we learn leader schedule */
   ctx->sleep_check_ns   = 0;
   ctx->halt_signing     = 0;
   if( !has_replay_in ) memset( &ctx->replay_in, 0, sizeof(ctx->replay_in) );
