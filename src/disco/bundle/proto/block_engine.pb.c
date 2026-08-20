@@ -30,4 +30,12 @@ PB_BIND(block_engine_SubmitLeaderWindowInfoRequest, block_engine_SubmitLeaderWin
 PB_BIND(block_engine_SubmitLeaderWindowInfoResponse, block_engine_SubmitLeaderWindowInfoResponse, AUTO)
 
 
+PB_BIND(block_engine_SetStrategyRequest, block_engine_SetStrategyRequest, AUTO)
+
+
+PB_BIND(block_engine_SetStrategyResponse, block_engine_SetStrategyResponse, AUTO)
+
+
+
+
 
