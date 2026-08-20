@@ -118,6 +118,7 @@ test_bundle_env_mock_conn_empty( test_bundle_env_t * env ) {
   fd_rng_new( ctx->rng, 42U, 42UL );
   ctx->tcp_sock_connected    = 1;
   ctx->auther.state          = FD_BUNDLE_AUTH_STATE_DONE_WAIT;
+  ctx->set_strategy_done     = 1; /* skip SetStrategy in tests */
   ctx->keepalive->ts_last_tx = ts_start;
   ctx->keepalive->ts_last_rx = ts_start;
   fd_rng_new( ctx->rng, 42U, 42UL );

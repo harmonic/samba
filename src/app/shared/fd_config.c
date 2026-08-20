@@ -10,6 +10,7 @@
 #include "../../discof/genesis/fd_genesi_tile.h"
 #include "../../disco/net/fd_net_tile.h"
 #include "../../discof/restore/utils/fd_ssarchive.h"
+#include "../../disco/bundle/proto/block_engine.pb.h"
 
 #include <unistd.h>
 #include <errno.h>
@@ -383,6 +384,11 @@ fd_config_fill( fd_config_t * config,
     FD_LOG_ERR(( "the revenue scheduler has been removed.  Please update [tiles.pack.schedule_strategy]" ));
   }
   else FD_LOG_ERR(( "[tiles.pack.schedule_strategy] %s not recognized", config->tiles.pack.schedule_strategy ));
+
+  if(      FD_LIKELY( !strcmp( config->tiles.bundle.strategy, "fba"  ) ) ) config->tiles.bundle.strategy_enum = block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_FBA;
+  else if( FD_LIKELY( !strcmp( config->tiles.bundle.strategy, "mrev" ) ) ) config->tiles.bundle.strategy_enum = block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_MREV;
+  else if( FD_LIKELY( !strcmp( config->tiles.bundle.strategy, "fifo" ) ) ) config->tiles.bundle.strategy_enum = block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_FIFO;
+  else FD_LOG_ERR(( "[tiles.bundle.strategy] %s not recognized", config->tiles.bundle.strategy ));
 
   fd_config_fill_net( config );
 
