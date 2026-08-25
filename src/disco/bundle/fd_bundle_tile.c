@@ -13,9 +13,7 @@
 #include "../../waltz/http/fd_url.h"
 #include "../../waltz/openssl/fd_openssl_tile.h"
 
-#if FD_HAS_OPENSSL
 #include <errno.h>
-#endif
 
 #include <dirent.h> /* opendir */
 #include <stdio.h> /* snprintf */
