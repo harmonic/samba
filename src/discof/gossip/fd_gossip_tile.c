@@ -245,6 +245,10 @@ after_credit( fd_gossip_tile_ctx_t * ctx,
     /* the identity key is swapped after the sign tile has been swapped
        because the below function directly sends a sign request. */
     FD_BASE58_ENCODE_32_BYTES( ctx->keyswitch->bytes, _new_id_b58 );
+    /* Keep the tile's contact info copy in sync with the engine's
+       outset, so later fd_gossip_set_contact_info calls (e.g. TPU
+       updates from the bundle tile) cannot rewind it to boot time. */
+    ctx->my_contact_info->outset = (ulong)FD_NANOSEC_TO_MICRO( ctx->keyswitch->param );
     fd_gossip_set_identity( ctx->gossip,
                             ctx->keyswitch->bytes,
                             ctx->last_wallclock,

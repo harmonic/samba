@@ -410,7 +410,14 @@ void
 fd_gossip_set_contact_info( fd_gossip_t *                    gossip,
                             fd_gossip_contact_info_t const * contact_info,
                             long                             now ) {
+  /* outset is owned by the gossip engine and advanced on identity
+     swaps by fd_gossip_set_identity.  The caller's copy may still
+     carry the boot timestamp, and rewinding outset here would cause
+     our own CRDS (and every peer) to reject all our subsequent
+     contact info as stale. */
+  ulong outset = gossip->my_contact_info.ci->contact_info->outset;
   *gossip->my_contact_info.ci->contact_info = *contact_info;
+  gossip->my_contact_info.ci->contact_info->outset = outset;
   refresh_contact_info( gossip, now );
 }
 
