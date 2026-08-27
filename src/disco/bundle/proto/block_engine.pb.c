@@ -18,6 +18,9 @@ PB_BIND(block_engine_SubscribeBundlesRequest, block_engine_SubscribeBundlesReque
 PB_BIND(block_engine_SubscribeBundlesResponse, block_engine_SubscribeBundlesResponse, AUTO)
 
 
+PB_BIND(block_engine_SubscribeBlocksRequest, block_engine_SubscribeBlocksRequest, AUTO)
+
+
 PB_BIND(block_engine_BlockBuilderFeeInfoRequest, block_engine_BlockBuilderFeeInfoRequest, AUTO)
 
 
@@ -34,7 +37,6 @@ PB_BIND(block_engine_SetStrategyRequest, block_engine_SetStrategyRequest, AUTO)
 
 
 PB_BIND(block_engine_SetStrategyResponse, block_engine_SetStrategyResponse, AUTO)
-
 
 
 

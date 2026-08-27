@@ -279,7 +279,7 @@ fd_bundle_client_subscribe_bundles( fd_bundle_tile_t * ctx ) {
   block_engine_SubscribeBundlesRequest req = block_engine_SubscribeBundlesRequest_init_default;
 
   /*
-     When harmonic_block_mode is enabled, use SubscribeBundles2. 
+     When harmonic_block_mode is enabled, use SubscribeBundles2.
      TODO: revert once all clients migrate */
   static char const path[]  = "/block_engine.BlockEngineValidator/SubscribeBundles";
   static char const path2[] = "/block_engine.BlockEngineValidator/SubscribeBundles2";
@@ -311,13 +311,17 @@ static void
 fd_bundle_client_subscribe_blocks( fd_bundle_tile_t * ctx ) {
   if( FD_UNLIKELY( fd_grpc_client_request_is_blocked( ctx->grpc_client ) ) ) return;
 
-  block_engine_SubscribeBundlesRequest req = block_engine_SubscribeBundlesRequest_init_default;
+  /* Include the version/commit_hash on the SubscribeBlocksRequest. */
+  block_engine_SubscribeBlocksRequest req = block_engine_SubscribeBlocksRequest_init_default;
+  fd_cstr_printf( req.version,     sizeof(req.version),     NULL, "%s", fd_version_cstr    );
+  fd_cstr_printf( req.commit_hash, sizeof(req.commit_hash), NULL, "%s", fd_commit_ref_cstr );
+
   static char const path[] = "/block_engine.BlockEngineValidator/SubscribeBlocks";
   fd_grpc_h2_stream_t * request = fd_grpc_client_request_start(
       ctx->grpc_client,
       path, sizeof(path)-1,
       FD_BUNDLE_CLIENT_REQ_SubscribeBlocks,
-      &block_engine_SubscribeBundlesRequest_msg, &req,
+      &block_engine_SubscribeBlocksRequest_msg, &req,
       ctx->auther.access_token, ctx->auther.access_token_sz,
       0 /* is_streaming */
   );
@@ -920,7 +924,7 @@ fd_bundle_client_handle_packet_batch(
 /* Handle a SubscribePacketsResponse from the TPU endpoint.
    Note: The relayer uses tpu.SubscribePacketsResponse which has a oneof msg
    containing either a heartbeat or a packet batch.
-   
+
    Nanopb oneof workaround: When decoding a oneof field, nanopb memsets the union
    to zero if which_msg differs from the incoming field tag, clearing any callbacks.
    Additionally, pb_decode() calls pb_message_set_to_defaults() which resets which_msg
@@ -943,13 +947,13 @@ fd_bundle_tpu_client_handle_packet_batch(
     .funcs.decode = fd_bundle_tpu_client_visit_pb_packet,
     .arg          = ctx
   };
-  
+
   if( FD_UNLIKELY( !pb_decode_ex( istream, &tpu_SubscribePacketsResponse_msg, &res, PB_DECODE_NOINIT ) ) ) {
     ctx->metrics.decode_fail_cnt++;
     FD_LOG_WARNING(( "Protobuf decode of TPU (tpu.SubscribePacketsResponse) failed" ));
     return;
   }
-  
+
   /* Sample RX delay for batch messages */
   if( res.which_msg == tpu_SubscribePacketsResponse_batch_tag ) {
     if( res.has_header ) {
