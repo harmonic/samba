@@ -45,6 +45,14 @@ typedef struct _block_engine_SubscribeBundlesResponse {
     pb_callback_t bundles;
 } block_engine_SubscribeBundlesResponse;
 
+/* Request to subscribe to the block engine's block stream.  The block
+ engine records version/commit_hash against the connected validator,
+ so both are populated from the running binary. */
+typedef struct _block_engine_SubscribeBlocksRequest {
+    char version[33];
+    char commit_hash[41];
+} block_engine_SubscribeBlocksRequest;
+
 typedef struct _block_engine_BlockBuilderFeeInfoRequest {
     char dummy_field;
 } block_engine_BlockBuilderFeeInfoRequest;
@@ -92,6 +100,7 @@ extern "C" {
 
 
 
+
 #define block_engine_SetStrategyRequest_strategy_ENUMTYPE block_engine_SchedulingStrategy
 
 
@@ -101,6 +110,7 @@ extern "C" {
 #define block_engine_SubscribePacketsResponse_init_default {false, shared_Header_init_default, false, packet_PacketBatch_init_default}
 #define block_engine_SubscribeBundlesRequest_init_default {0}
 #define block_engine_SubscribeBundlesResponse_init_default {{{NULL}, NULL}}
+#define block_engine_SubscribeBlocksRequest_init_default {"", ""}
 #define block_engine_BlockBuilderFeeInfoRequest_init_default {0}
 #define block_engine_BlockBuilderFeeInfoResponse_init_default {"", 0}
 #define block_engine_SubmitLeaderWindowInfoRequest_init_default {false, google_protobuf_Timestamp_init_default, 0}
@@ -111,6 +121,7 @@ extern "C" {
 #define block_engine_SubscribePacketsResponse_init_zero {false, shared_Header_init_zero, false, packet_PacketBatch_init_zero}
 #define block_engine_SubscribeBundlesRequest_init_zero {0}
 #define block_engine_SubscribeBundlesResponse_init_zero {{{NULL}, NULL}}
+#define block_engine_SubscribeBlocksRequest_init_zero {"", ""}
 #define block_engine_BlockBuilderFeeInfoRequest_init_zero {0}
 #define block_engine_BlockBuilderFeeInfoResponse_init_zero {"", 0}
 #define block_engine_SubmitLeaderWindowInfoRequest_init_zero {false, google_protobuf_Timestamp_init_zero, 0}
@@ -122,6 +133,8 @@ extern "C" {
 #define block_engine_SubscribePacketsResponse_header_tag 1
 #define block_engine_SubscribePacketsResponse_batch_tag 2
 #define block_engine_SubscribeBundlesResponse_bundles_tag 1
+#define block_engine_SubscribeBlocksRequest_version_tag 1
+#define block_engine_SubscribeBlocksRequest_commit_hash_tag 2
 #define block_engine_BlockBuilderFeeInfoResponse_pubkey_tag 1
 #define block_engine_BlockBuilderFeeInfoResponse_commission_tag 2
 #define block_engine_SubmitLeaderWindowInfoRequest_start_timestamp_tag 1
@@ -152,6 +165,12 @@ X(a, CALLBACK, REPEATED, MESSAGE,  bundles,           1)
 #define block_engine_SubscribeBundlesResponse_CALLBACK pb_default_field_callback
 #define block_engine_SubscribeBundlesResponse_DEFAULT NULL
 #define block_engine_SubscribeBundlesResponse_bundles_MSGTYPE bundle_BundleUuid
+
+#define block_engine_SubscribeBlocksRequest_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, STRING,   version,           1) \
+X(a, STATIC,   SINGULAR, STRING,   commit_hash,       2)
+#define block_engine_SubscribeBlocksRequest_CALLBACK NULL
+#define block_engine_SubscribeBlocksRequest_DEFAULT NULL
 
 #define block_engine_BlockBuilderFeeInfoRequest_FIELDLIST(X, a) \
 
@@ -190,6 +209,7 @@ extern const pb_msgdesc_t block_engine_SubscribePacketsRequest_msg;
 extern const pb_msgdesc_t block_engine_SubscribePacketsResponse_msg;
 extern const pb_msgdesc_t block_engine_SubscribeBundlesRequest_msg;
 extern const pb_msgdesc_t block_engine_SubscribeBundlesResponse_msg;
+extern const pb_msgdesc_t block_engine_SubscribeBlocksRequest_msg;
 extern const pb_msgdesc_t block_engine_BlockBuilderFeeInfoRequest_msg;
 extern const pb_msgdesc_t block_engine_BlockBuilderFeeInfoResponse_msg;
 extern const pb_msgdesc_t block_engine_SubmitLeaderWindowInfoRequest_msg;
@@ -202,6 +222,7 @@ extern const pb_msgdesc_t block_engine_SetStrategyResponse_msg;
 #define block_engine_SubscribePacketsResponse_fields &block_engine_SubscribePacketsResponse_msg
 #define block_engine_SubscribeBundlesRequest_fields &block_engine_SubscribeBundlesRequest_msg
 #define block_engine_SubscribeBundlesResponse_fields &block_engine_SubscribeBundlesResponse_msg
+#define block_engine_SubscribeBlocksRequest_fields &block_engine_SubscribeBlocksRequest_msg
 #define block_engine_BlockBuilderFeeInfoRequest_fields &block_engine_BlockBuilderFeeInfoRequest_msg
 #define block_engine_BlockBuilderFeeInfoResponse_fields &block_engine_BlockBuilderFeeInfoResponse_msg
 #define block_engine_SubmitLeaderWindowInfoRequest_fields &block_engine_SubmitLeaderWindowInfoRequest_msg
@@ -211,13 +232,14 @@ extern const pb_msgdesc_t block_engine_SetStrategyResponse_msg;
 
 /* Maximum encoded size of messages (where known) */
 /* block_engine_SubscribeBundlesResponse_size depends on runtime parameters */
-#define BLOCK_ENGINE_BLOCK_ENGINE_PB_H_MAX_SIZE  block_engine_BlockBuilderFeeInfoResponse_size
+#define BLOCK_ENGINE_BLOCK_ENGINE_PB_H_MAX_SIZE  block_engine_SubscribeBlocksRequest_size
 #define block_engine_BlockBuilderFeeInfoRequest_size 0
 #define block_engine_BlockBuilderFeeInfoResponse_size 57
 #define block_engine_SetStrategyRequest_size     2
 #define block_engine_SetStrategyResponse_size    0
 #define block_engine_SubmitLeaderWindowInfoRequest_size 35
 #define block_engine_SubmitLeaderWindowInfoResponse_size 0
+#define block_engine_SubscribeBlocksRequest_size 76
 #define block_engine_SubscribeBundlesRequest_size 0
 #define block_engine_SubscribePacketsRequest_size 0
 #if defined(packet_PacketBatch_size)
