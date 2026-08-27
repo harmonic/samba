@@ -311,13 +311,17 @@ static void
 fd_bundle_client_subscribe_blocks( fd_bundle_tile_t * ctx ) {
   if( FD_UNLIKELY( fd_grpc_client_request_is_blocked( ctx->grpc_client ) ) ) return;
 
-  block_engine_SubscribeBundlesRequest req = block_engine_SubscribeBundlesRequest_init_default;
+  /* Include the version/commit_hash on the SubscribeBlocksRequest. */
+  block_engine_SubscribeBlocksRequest req = block_engine_SubscribeBlocksRequest_init_default;
+  fd_cstr_printf( req.version,     sizeof(req.version),     NULL, "%s", fd_version_cstr    );
+  fd_cstr_printf( req.commit_hash, sizeof(req.commit_hash), NULL, "%s", fd_commit_ref_cstr );
+
   static char const path[] = "/block_engine.BlockEngineValidator/SubscribeBlocks";
   fd_grpc_h2_stream_t * request = fd_grpc_client_request_start(
       ctx->grpc_client,
       path, sizeof(path)-1,
       FD_BUNDLE_CLIENT_REQ_SubscribeBlocks,
-      &block_engine_SubscribeBundlesRequest_msg, &req,
+      &block_engine_SubscribeBlocksRequest_msg, &req,
       ctx->auther.access_token, ctx->auther.access_token_sz,
       0 /* is_streaming */
   );
