@@ -350,12 +350,6 @@ handle_tpu_update( fd_gossip_tile_ctx_t *             ctx,
     ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_QUIC ].is_ipv6          = 0U;
     ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_QUIC ].ip4          = msg->tpu_ip4_addr;
     ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_QUIC ].port          = tpu_quic_port_nbo;
-    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_VOTE ].is_ipv6          = 0U;
-    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_VOTE ].ip4          = msg->tpu_ip4_addr;
-    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_VOTE ].port          = tpu_port_nbo;
-    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_VOTE_QUIC ].is_ipv6     = 0U;
-    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_VOTE_QUIC ].ip4     = msg->tpu_ip4_addr;
-    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_VOTE_QUIC ].port     = tpu_quic_port_nbo;
     ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_FORWARDS ].is_ipv6      = 0U;
     ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_FORWARDS ].ip4      = msg->tpu_fwd_ip4_addr;
     ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_FORWARDS ].port      = tpu_fwd_port_nbo;
@@ -370,8 +364,6 @@ handle_tpu_update( fd_gossip_tile_ctx_t *             ctx,
     /* Revert to local TPU addresses saved at startup */
     ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU ]               = ctx->local_tpu_addr;
     ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_QUIC ]          = ctx->local_tpu_quic_addr;
-    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_VOTE ]          = ctx->local_tpu_addr;
-    ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_VOTE_QUIC ]     = ctx->local_tpu_quic_addr;
     ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_FORWARDS ]      = ctx->local_tpu_fwd_addr;
     ctx->my_contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_FORWARDS_QUIC ] = ctx->local_tpu_fwd_quic_addr;
 
