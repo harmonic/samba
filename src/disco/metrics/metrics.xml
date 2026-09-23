@@ -753,7 +753,6 @@ EXAMPLES
     <int value="2" name="ParseFailure" label="Transaction failed to parse" />
     <int value="3" name="DedupFailure" label="Transaction failed deduplication" />
     <int value="4" name="VerifyFailure" label="Transaction failed signature verification" />
-    <int value="5" name="BlockPeerFailure" label="Peer transaction in the harmonic block failed" />
 </enum>
 
 <tile name="verify">

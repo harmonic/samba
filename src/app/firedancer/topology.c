@@ -356,8 +356,6 @@ fd_topo_initialize( config_t * config ) {
     fd_topob_wksp( topo, "verify_dedup"  );
     fd_topob_wksp( topo, "dedup_resolv"  );
     fd_topob_wksp( topo, "resolv_pack"   );
-    fd_topob_wksp( topo, "verify_packf"  );
-    fd_topob_wksp( topo, "dedup_packf"   );
     fd_topob_wksp( topo, "pack_poh"      );
     fd_topob_wksp( topo, "pack_execle"   );
     fd_topob_wksp( topo, "resolv_replay" );
@@ -501,9 +499,6 @@ fd_topo_initialize( config_t * config ) {
     }
     /**/                   fd_topob_link( topo, "poh_shred",     "poh_shred",     16384UL,                                  FD_POH_SHRED_MTU,              1UL );
     /**/                   fd_topob_link( topo, "poh_replay",    "poh_replay",    4096UL,                                   sizeof(fd_poh_leader_slot_ended_t), 1UL );
-    /* Harmonic block failure signal links (zero-MTU, signal-only). Only verify:0 receives block txns. */
-    /**/                   fd_topob_link( topo, "verify_packf", "verify_packf", 128UL,                                    0UL,                           1UL );
-    /**/                   fd_topob_link( topo, "dedup_packf",  "dedup_packf",  128UL,                                    0UL,                           1UL );
   }
 
   FOR(resolv_tile_cnt) fd_topob_link( topo, "resolv_replay", "resolv_replay", 4096UL,                                   sizeof(fd_resolv_slot_exchanged_t), 1UL );
@@ -780,18 +775,14 @@ fd_topo_initialize( config_t * config ) {
     FOR(verify_tile_cnt) fd_topob_tile_in(  topo, "verify",  i,            "metric_in", "gossip_out",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     /**/                 fd_topob_tile_in(  topo, "verify",  0UL,          "metric_in", "txsend_out",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     FOR(verify_tile_cnt) fd_topob_tile_out( topo, "verify",  i,                         "verify_dedup",  i                                                  );
-    /**/                 fd_topob_tile_out( topo, "verify",  0UL,                       "verify_packf",  0UL                                                );
     FOR(verify_tile_cnt) fd_topob_tile_in(  topo, "dedup",   0UL,          "metric_in", "verify_dedup",  i,            FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     /**/                 fd_topob_tile_in(  topo, "dedup",   0UL,          "metric_in", "replay_out",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     /**/                 fd_topob_tile_out( topo, "dedup",   0UL,                       "dedup_resolv",  0UL                                                );
-    /**/                 fd_topob_tile_out( topo, "dedup",   0UL,                       "dedup_packf",   0UL                                                );
     FOR(resolv_tile_cnt) fd_topob_tile_in(  topo, "resolv",  i,            "metric_in", "dedup_resolv",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     FOR(resolv_tile_cnt) fd_topob_tile_in(  topo, "resolv",  i,            "metric_in", "replay_out",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     FOR(resolv_tile_cnt) fd_topob_tile_out( topo, "resolv",  i,                         "resolv_pack",   i                                                  );
     FOR(resolv_tile_cnt) fd_topob_tile_out( topo, "resolv",  i,                         "resolv_replay", i                                                  );
     FOR(resolv_tile_cnt) fd_topob_tile_in(  topo, "pack",    0UL,          "metric_in", "resolv_pack",   i,            FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
-    /**/                 fd_topob_tile_in(  topo, "pack",    0UL,          "metric_in", "verify_packf",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
-    /**/                 fd_topob_tile_in(  topo, "pack",    0UL,          "metric_in", "dedup_packf",   0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     /**/                 fd_topob_tile_in(  topo, "pack",    0UL,          "metric_in", "replay_out",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     FOR(execle_tile_cnt) fd_topob_tile_out(  topo, "pack",   0UL,                       "pack_execle",   i                                                  );
     /**/                 fd_topob_tile_out(  topo, "pack",   0UL,                       "pack_poh" ,     0UL                                                );
@@ -878,7 +869,6 @@ fd_topo_initialize( config_t * config ) {
 
     /**/                 fd_topob_tile_in(  topo, "sign",   0UL,           "metric_in", "bundle_sign",    0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
     /**/                 fd_topob_tile_out( topo, "bundle", 0UL,                        "bundle_sign",    0UL                                                );
-    /* sign_bundle must be the last in_link for bundle tile (unpolled links go last) */
     /**/                 fd_topob_tile_in(  topo, "bundle", 0UL,           "metric_in", "sign_bundle",    0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_UNPOLLED );
     /**/                 fd_topob_tile_out( topo, "sign",   0UL,                        "sign_bundle",    0UL                                                );
 

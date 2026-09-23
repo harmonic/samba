@@ -33,8 +33,8 @@ typedef struct {
   ushort payload_sz;
   uint   source_ipv4;
   long   first_seen_nanos;
-  ulong  block_slot;
-  ushort block_txn_cnt;
+  ulong  bundle_id;      /* FD_TXN_M_HARMONIC_BUNDLE_ID( slot, seq ) */
+  ulong  bundle_txn_cnt; /* txns in this bundle, in [1, FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE] */
   uchar  commission;
   uchar  commission_pubkey[ 32 ];
   uchar  payload[ FD_TXN_MTU ];
@@ -307,10 +307,20 @@ struct fd_bundle_tile {
   uchar harmonic_block_subscription_live : 1;
   uchar harmonic_block_subscription_wait : 1;
 
-  /* Harmonic block state */
+  /* Harmonic block state.  A block is streamed as a sequence of bundles
+     (BundleUuid messages whose uuid is the slot).  harmonic_block_seq
+     numbers the bundles within the current block starting at 1 and is
+     reset whenever the slot changes; pack uses it to detect a dropped
+     bundle. */
   ulong harmonic_block_seq;
   ulong harmonic_block_txn_cnt;
   ulong harmonic_block_slot;  /* Current block's slot (parsed from uuid) */
+  /* Set when the connection is reset, cleared when we become leader.  A
+     reset between became_leader and the end of that slot may have lost
+     bundles we cannot account for, so the next block's numbering starts
+     at 2: pack sees the gap and stops that block instead of executing a
+     suffix of it. */
+  int   harmonic_seq_tainted;
 
   /* Harmonic block metrics */
   ulong harmonic_block_received_cnt;
@@ -322,19 +332,20 @@ struct fd_bundle_tile {
      published order.  Sized to bundle.out_depth so a single fd_h2_rx
      pass (bounded by rbuf_rx) cannot overflow it.
 
-     Per-entry block_slot/block_txn_cnt/commission/commission_pubkey
-     allow multiple distinct blocks to coexist in the staging buffer
-     when the server pipelines BundleUuids across one or more gRPC
-     messages decoded in the same I/O turn.
+     Per-entry bundle_id/bundle_txn_cnt/commission/commission_pubkey
+     allow multiple bundles to coexist in the staging buffer when the
+     server pipelines BundleUuids across one or more gRPC messages
+     decoded in the same I/O turn.  after_credit publishes whole
+     bundles only, never a prefix of one.
 
-     harmonic_staged_block_slot/_txn_cnt mirror the most recently
-     staged block's metadata for diagnostics/observability only;
-     after_credit reads per-entry metadata. */
+     harmonic_staged_bundle_id/_txn_cnt are the metadata of the bundle
+     currently being decoded, snapshotted for the per-txn stage
+     callback. */
   fd_bundle_harmonic_staged_txn_t * harmonic_staging;
   ulong                             harmonic_staging_max;
   ulong                             harmonic_pending_len;
-  ulong                             harmonic_staged_block_slot;
-  ushort                            harmonic_staged_block_txn_cnt;
+  ulong                             harmonic_staged_bundle_id;
+  ulong                             harmonic_staged_bundle_txn_cnt;
 
   /* PoH became_leader message */
   fd_became_leader_t _became_leader[1];

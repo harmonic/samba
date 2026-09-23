@@ -670,8 +670,19 @@ void fd_pack_set_initializer_bundles_ready( fd_pack_t * pack );
 #define HARMONIC_MODE_VOTE_ONLY  (-4)
 #define HARMONIC_MODE_DONE       (-3)
 
-#define FD_PACK_END_FLAG_HARMONIC_TIMEOUT (1<<0)
-#define FD_PACK_END_FLAG_VOTE_DRAIN       (1<<1)
+#define FD_PACK_END_FLAG_HARMONIC_TIMEOUT  (1<<0) /* block never arrived, arrived late, or was cut off */
+#define FD_PACK_END_FLAG_VOTE_DRAIN        (1<<1) /* votes remained at slot end */
+#define FD_PACK_END_FLAG_HARMONIC_FAILED   (1<<2) /* a block bundle was dropped, rejected, or could not fit */
+#define FD_PACK_END_FLAG_HARMONIC_REVERTED (1<<3) /* a block bundle reverted at execution */
+
+/* FD_PACK_EXECLE_BUSY_FAIL_FLAG is OR'd into the execle busy fseq value
+   by the execle tile when the microblock it just finished came from the
+   harmonic block stream and produced no entries (a bundle reverted, or
+   a single transaction was excluded).  Pack masks it off when comparing
+   against the expected sequence number and, if set, calls
+   fd_pack_harmonic_bank_failed instead of fd_pack_microblock_complete.
+   Frag sequence numbers never reach bit 63. */
+#define FD_PACK_EXECLE_BUSY_FAIL_FLAG (1UL<<63)
 
 /* fd_pack_schedule_next_microblock schedules pending transactions.
    These transaction either form a microblock, which is a set of
@@ -740,28 +751,51 @@ fd_pack_schedule_next_microblock( fd_pack_t  * pack,
                                   int          harmonic,
                                   fd_txn_e_t * out );
 
+/* Harmonic block mode.  Block bundles are inserted with the regular
+   fd_pack_insert_bundle_init and fd_pack_harmonic_insert_bundle_fini,
+   which applies the block admission rules once per bundle (see the
+   comment above the implementation) and otherwise behaves like
+   fd_pack_insert_bundle_fini.  bundle_id is the FD_TXN_M_HARMONIC_BUNDLE_ID
+   of the bundle (ignored for the crank), now_ns is the pack tile's
+   wallclock, and the threshold/cutoff are the slot's admission bounds.
+   Returns an FD_PACK_INSERT_* code; a negative code means the bundle was
+   cancelled.  FD_PACK_INSERT_REJECT_BLOCK_FAILED means the bundle was
+   not admitted (wrong slot or mode, gap in the sequence, too late). */
+
 void fd_pack_harmonic_reset( fd_pack_t * pack, ulong leader_slot, int leader_next_slot );
 
-int fd_pack_harmonic_insert_fini( fd_pack_t    * pack,
-                                  fd_txn_e_t   * txne,
-                                  ulong          block_slot,
-                                  ulong          block_txn_expected,
-                                  void   const * block_meta,
-                                  int            is_ib,
-                                  long           txn_arrival_ns,
-                                  long           harmonic_threshold_ns,
-                                  long           harmonic_cutoff_ns,
-                                  ulong        * opt_delete_cnt );
+int fd_pack_harmonic_insert_bundle_fini( fd_pack_t          * pack,
+                                         fd_txn_e_t * const * bundle,
+                                         ulong                txn_cnt,
+                                         ulong                bundle_id,
+                                         ulong                expires_at,
+                                         int                  initializer_bundle,
+                                         void         const * bundle_meta,
+                                         long                 now_ns,
+                                         long                 harmonic_threshold_ns,
+                                         long                 harmonic_cutoff_ns,
+                                         ulong              * delete_cnt );
+
+/* fd_pack_harmonic_stop stops admitting block bundles for the rest of
+   the slot; bundles already accepted still execute.  fd_pack_harmonic_abort
+   additionally drops every block bundle still pending.  flag is OR'd
+   into the end-of-slot flags.  fd_pack_harmonic_bank_failed handles a
+   block bundle microblock on bank_tile that produced no entries: it
+   completes the microblock, aborts, and moves to SPRINT so the slot
+   continues with our own transactions.  Call it in place of
+   fd_pack_microblock_complete for that bank. */
+
+void fd_pack_harmonic_stop       ( fd_pack_t * pack, int flag );
+void fd_pack_harmonic_abort      ( fd_pack_t * pack, int flag );
+void fd_pack_harmonic_bank_failed( fd_pack_t * pack, ulong bank_tile );
 
 FD_FN_PURE int   fd_pack_harmonic_state          ( fd_pack_t const * pack );
 FD_FN_PURE int   fd_pack_harmonic_done           ( fd_pack_t const * pack );
+FD_FN_PURE int   fd_pack_harmonic_stopped        ( fd_pack_t const * pack );
 FD_FN_PURE ulong fd_pack_harmonic_pending_cnt    ( fd_pack_t const * pack );
 FD_FN_PURE ulong fd_pack_harmonic_inflight_cnt   ( fd_pack_t const * pack );
 FD_FN_PURE int   fd_pack_harmonic_pool_full      ( fd_pack_t const * pack );
 FD_FN_PURE int   fd_pack_harmonic_end_flags      ( fd_pack_t const * pack );
-
-
-void fd_pack_harmonic_signal_fail( fd_pack_t * pack, ulong failed_slot );
 
 void fd_pack_harmonic_state_crank( fd_pack_t * pack,
                                    long        approx_wallclock_ns,

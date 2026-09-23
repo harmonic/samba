@@ -14,9 +14,19 @@
 #define FD_TXN_M_TPU_SOURCE_HARMONIC (6UL)
 #define FD_TXN_M_TPU_SOURCE_HTPU    (7UL)
 
-/* High bits of stem `sig` on resolv→pack: harmonic block marker and failure signal */
-#define FD_TXN_M_SIG_BLOCK_FLAG      (1UL<<62)
-#define FD_TXN_M_SIG_BLOCK_FAIL_FLAG (1UL<<63)
+/* Harmonic block streams arrive as a sequence of bundles, each at most
+   FD_PACK_MAX_TXN_PER_BUNDLE transactions.  They flow through the same
+   bundle path as regular bundles, keyed by bundle_id, so the id must
+   identify both the slot the block is for and the bundle's position in
+   the block.  The slot occupies the high 32 bits (about 24 years of
+   200ms slots from today's slot numbers) and a per-block sequence
+   number starting at 1 occupies the low 32 bits, so the id is never
+   zero and never collides with regular bundle ids in practice. */
+#define FD_TXN_M_HARMONIC_SEQ_BITS      (32)
+#define FD_TXN_M_HARMONIC_SEQ_MASK      ((1UL<<FD_TXN_M_HARMONIC_SEQ_BITS)-1UL)
+#define FD_TXN_M_HARMONIC_BUNDLE_ID( slot, seq ) (((ulong)(slot)<<FD_TXN_M_HARMONIC_SEQ_BITS) | ((ulong)(seq) & FD_TXN_M_HARMONIC_SEQ_MASK))
+#define FD_TXN_M_HARMONIC_BUNDLE_SLOT( id )      ((ulong)(id)>>FD_TXN_M_HARMONIC_SEQ_BITS)
+#define FD_TXN_M_HARMONIC_BUNDLE_SEQ( id )       ((ulong)(id) & FD_TXN_M_HARMONIC_SEQ_MASK)
 
 struct fd_txn_m {
   /* The computed slot that this transaction is referencing, aka. the
@@ -60,21 +70,13 @@ struct fd_txn_m {
        the block engine, and the validator will crank the tip payment
        program with these values, if it is not using them already.
        These fields are only provided on the first transaction in a
-       bundle.
-
-       For harmonic transactions (source_tpu==FD_TXN_M_TPU_SOURCE_HARMONIC),
-       block_slot contains the intended slot from the block server.
-       Use source_tpu to determine which union member applies. */
-    union {
-      ulong bundle_id;   /* For bundles: sequential bundle ID */
-      ulong block_slot;  /* For blocks: intended slot from server */
-    };
-
-    ushort bundle_txn_cnt; /* Harmonic: shrunk from ulong - never exceeds 65535 */
+       bundle. */
+    ulong bundle_id;
+    ulong bundle_txn_cnt;
     uchar commission;
     uchar commission_pubkey[ 32 ];
 
-    /* alignof is 8, so 5 bytes of padding here */
+    /* alignof is 8, so 7 bytes of padding here */
 
   } block_engine;
 
