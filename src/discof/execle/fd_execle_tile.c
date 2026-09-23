@@ -2,6 +2,7 @@
 
 #include "../../disco/tiles.h"
 #include "../../disco/pack/fd_pack.h"
+#include "../../disco/fd_txn_m.h"
 #include "../../disco/pack/fd_pack_cost.h"
 #include "../../ballet/blake3/fd_blake3.h"
 #include "../../ballet/bmtree/fd_bmtree.h"
@@ -17,6 +18,21 @@
 #include "../../flamenco/log_collector/fd_log_collector_base.h"
 #include <time.h>
 #include "generated/fd_execle_tile_seccomp.h"
+
+/* Harmonic: pack needs to know, at the moment it observes a microblock
+   from the block stream completing, whether it landed anything.  The
+   busy fseq is that observation point, so the fail flag rides on it.
+   Only microblocks whose transactions came from the block stream are
+   ever flagged; everything else keeps the plain sequence number. */
+static inline ulong
+execle_busy_val( ulong              seq,
+                 fd_txn_p_t const * txns,
+                 ulong              txn_cnt ) {
+  if( FD_LIKELY( txn_cnt==0UL || txns[ 0 ].source_tpu!=FD_TXN_M_TPU_SOURCE_HARMONIC ) ) return seq;
+  int any_in_block = 0;
+  for( ulong i=0UL; i<txn_cnt; i++ ) any_in_block |= !!(txns[ i ].flags & FD_TXN_P_FLAGS_EXECUTE_SUCCESS);
+  return seq | fd_ulong_if( !any_in_block, FD_PACK_EXECLE_BUSY_FAIL_FLAG, 0UL );
+}
 
 #define REBATE_BATCH_IDLE_LOOPS      (128UL)
 #define REBATE_BATCH_MAX_MICROBLOCKS (4UL)
@@ -463,7 +479,7 @@ handle_microblock( fd_execle_tile_t *  ctx,
 
   /* Indicate to pack tile we are done processing the transactions so
      it can pack new microblocks using these accounts. */
-  fd_fseq_update( ctx->busy_fseq, seq );
+  fd_fseq_update( ctx->busy_fseq, execle_busy_val( seq, (fd_txn_p_t const *)dst, txn_cnt ) );
 
   /* Now produce the merkle hash of the transactions for inclusion
      (mixin) to the PoH hash.  This is done on the execle tile because
@@ -666,7 +682,7 @@ handle_bundle( fd_execle_tile_t *  ctx,
 
   /* Indicate to pack tile we are done processing the transactions so
      it can pack new microblocks using these accounts. */
-  fd_fseq_update( ctx->busy_fseq, seq );
+  fd_fseq_update( ctx->busy_fseq, execle_busy_val( seq, txns, txn_cnt ) );
 
   /* We need to publish each transaction separately into its own
      microblock, so make a temporary copy on the stack so we can move

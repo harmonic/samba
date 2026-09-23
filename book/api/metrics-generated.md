@@ -401,7 +401,6 @@
 | <span class="metrics-name">verify_&#8203;txn_&#8203;result</span><br/>{verify_&#8203;tile_&#8203;result="<span class="metrics-enum">parse_&#8203;failure</span>"} | counter | Transaction results through verify tile (Transaction failed to parse) |
 | <span class="metrics-name">verify_&#8203;txn_&#8203;result</span><br/>{verify_&#8203;tile_&#8203;result="<span class="metrics-enum">dedup_&#8203;failure</span>"} | counter | Transaction results through verify tile (Transaction failed deduplication) |
 | <span class="metrics-name">verify_&#8203;txn_&#8203;result</span><br/>{verify_&#8203;tile_&#8203;result="<span class="metrics-enum">verify_&#8203;failure</span>"} | counter | Transaction results through verify tile (Transaction failed signature verification) |
-| <span class="metrics-name">verify_&#8203;txn_&#8203;result</span><br/>{verify_&#8203;tile_&#8203;result="<span class="metrics-enum">block_&#8203;peer_&#8203;failure</span>"} | counter | Transaction results through verify tile (Peer transaction in the harmonic block failed) |
 | <span class="metrics-name">verify_&#8203;vote_&#8203;gossip_&#8203;rx</span> | counter | Simple vote transactions received over gossip instead of via the normal TPU path |
 
 </div>

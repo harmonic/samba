@@ -4,9 +4,6 @@
 #include "fd_bundle_tpu.h"
 #include "../fd_disco_base.h"
 #include "../fd_txn_m.h"
-
-/* Must match replay sig on replay_out (see discof/replay/fd_replay_tile.h). */
-#define REPLAY_SIG_BECAME_LEADER (4)
 #include "../metrics/fd_metrics.h"
 #include "../topo/fd_topo.h"
 #include "../keyguard/fd_keyload.h"
@@ -30,40 +27,13 @@
 
 #define IN_KIND_REPLAY_OUT (1)
 
-/* STEM_BURST bounds the number of fragments after_credit may publish
-   to verify_out in a single stem iteration.  before_credit never
-   publishes (all decode paths buffer into pending_txns or
-   harmonic_staging), so K1=0 and the burst check before after_credit
-   is the only barrier we need.  Sized to comfortably drain bundles
-   (up to FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE per iter atomically) and
-   keep harmonic block throughput high without wasting verify_out
-   credits. */
-#define STEM_BURST (32UL)
+#define STEM_BURST (5UL)
 FD_STATIC_ASSERT( FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE<=STEM_BURST, stem_burst );
 
 /* hysteresis thresholds to avoid bouncing (e.g. during forks) */
 #define FD_BUNDLE_SLEEP_THRESHOLD_SLOTS   (450UL)
 #define FD_BUNDLE_WAKE_THRESHOLD_SLOTS    (400UL)
 #define FD_BUNDLE_SLEEP_CHECK_INTERVAL_NS ((long)5e9)
-
-/* Count pending entries at deque head belonging to one bundle (sig==1,
-   matching bundle_seq).  Returns 0 if head is not a bundle txn. */
-
-static ulong
-pending_bundle_txn_cnt_at_head( fd_bundle_pending_txn_t * txns ) {
-  if( pending_txn_empty( txns ) ) return 0UL;
-  fd_bundle_pending_txn_t const * h0 = pending_txn_peek_head( txns );
-  if( FD_UNLIKELY( h0->sig!=1UL ) ) return 0UL;
-  ulong const seq   = h0->bundle_seq;
-  ulong const total = pending_txn_cnt( txns );
-  ulong n = 0UL;
-  for( ulong i=0UL; i<total; i++ ) {
-    fd_bundle_pending_txn_t const * e = pending_txn_peek_index( txns, i );
-    if( FD_LIKELY( e->sig==1UL && e->bundle_seq==seq ) ) n++;
-    else break;
-  }
-  return n;
-}
 
 FD_FN_CONST static ulong
 scratch_align( void ) {
@@ -218,7 +188,7 @@ fd_bundle_tile_housekeeping( fd_bundle_tile_t * ctx ) {
     ctx->halt_signing = 1;
     fd_memcpy( ctx->auther.pubkey, ctx->keyswitch->bytes, 32UL );
 
-    /* cavey: also update TPU auther pubkey and reset TPU connection */
+    /* Harmonic: also update TPU auther pubkey and reset TPU connection */
     if( ctx->tpu_conn_enabled ) {
       fd_memcpy( ctx->tpu_auther.pubkey, ctx->keyswitch->bytes, 32UL );
       ctx->tpu_defer_reset = 1;
@@ -339,6 +309,9 @@ after_frag( fd_bundle_tile_t *  ctx,
   }
 
   if( FD_UNLIKELY( in_idx!=ctx->leader_in.idx ) ) return;
+  /* Bundles for this slot are requested from here on, so nothing has
+     been lost yet: numbering for the next block starts at 1. */
+  ctx->harmonic_seq_tainted = 0;
   fd_bundle_client_submit_leader_window_info( ctx, ctx->_became_leader->slot, ctx->_became_leader->slot_start_ns );
 }
 
@@ -427,127 +400,100 @@ after_credit( fd_bundle_tile_t *  ctx,
               int *               charge_busy ) {
   if( FD_UNLIKELY( fd_clock_tile_recal_due( ctx->clock ) ) ) fd_clock_tile_recal( ctx->clock );
 
-  /* Share one STEM_BURST budget across harmonic staging and pending
-     deque so we never publish more than STEM_BURST frags to verify_out
-     in a single after_credit. */
-
-  ulong verify_budget = STEM_BURST;
-
+  /* Harmonic: block bundles are published whole or not at all, like
+     regular bundles below: entries of one bundle are contiguous and
+     share a bundle_id, and a bundle only goes out if all of it fits in
+     this iteration's burst.  Downstream tiles treat them as ordinary
+     bundles (sig==1), so pack never sees a prefix of a block bundle.
+     The fallback deque is drained only in iterations where nothing was
+     staged. */
+  int published_block = 0;
   if( FD_UNLIKELY( ctx->harmonic_pending_len ) ) {
-    ulong const n = fd_ulong_min( ctx->harmonic_pending_len, verify_budget );
-    for( ulong i=0UL; i<n; i++ ) {
-      fd_bundle_harmonic_staged_txn_t const * s = &ctx->harmonic_staging[i];
+    ulong n = 0UL;
+    while( n<ctx->harmonic_pending_len ) {
+      ulong const id  = ctx->harmonic_staging[ n ].bundle_id;
+      ulong       bsz = 0UL;
+      while( n+bsz<ctx->harmonic_pending_len && ctx->harmonic_staging[ n+bsz ].bundle_id==id ) bsz++;
+      if( FD_UNLIKELY( n+bsz>STEM_BURST ) ) break;
 
-      fd_txn_m_t * txnm = fd_chunk_to_laddr( ctx->verify_out.mem, ctx->verify_out.chunk );
-      *txnm = (fd_txn_m_t) {
-        .reference_slot = 0UL,
-        .payload_sz     = s->payload_sz,
-        .txn_t_sz       = 0U,
-        .source_ipv4    = s->source_ipv4,
-        .source_tpu     = FD_TXN_M_TPU_SOURCE_HARMONIC,
-        .first_seen_nanos = s->first_seen_nanos,
-        .block_engine   = {
-          .block_slot     = s->block_slot,
-          .bundle_txn_cnt = s->block_txn_cnt,
-          .commission     = s->commission,
-        },
-      };
-      fd_memcpy( txnm->block_engine.commission_pubkey, s->commission_pubkey, 32UL );
-      fd_memcpy( fd_txn_m_payload( txnm ), s->payload, s->payload_sz );
+      for( ulong i=0UL; i<bsz; i++ ) {
+        fd_bundle_harmonic_staged_txn_t const * s = &ctx->harmonic_staging[ n+i ];
 
-      ulong sz    = fd_txn_m_realized_footprint( txnm, 0, 0 );
-      ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now( ctx ) );
-      fd_stem_publish( stem, ctx->verify_out.idx, 2UL, ctx->verify_out.chunk, sz, 0UL, 0UL, tspub );
-      ctx->verify_out.chunk = fd_dcache_compact_next( ctx->verify_out.chunk, sz, ctx->verify_out.chunk0, ctx->verify_out.wmark );
+        fd_txn_m_t * txnm = fd_chunk_to_laddr( ctx->verify_out.mem, ctx->verify_out.chunk );
+        *txnm = (fd_txn_m_t) {
+          .reference_slot = 0UL,
+          .payload_sz     = s->payload_sz,
+          .txn_t_sz       = 0U,
+          .source_ipv4    = s->source_ipv4,
+          .source_tpu     = FD_TXN_M_TPU_SOURCE_HARMONIC,
+          .first_seen_nanos = s->first_seen_nanos,
+          .block_engine   = {
+            .bundle_id      = s->bundle_id,
+            .bundle_txn_cnt = s->bundle_txn_cnt,
+            .commission     = s->commission,
+          },
+        };
+        fd_memcpy( txnm->block_engine.commission_pubkey, s->commission_pubkey, 32UL );
+        fd_memcpy( fd_txn_m_payload( txnm ), s->payload, s->payload_sz );
 
-      ctx->harmonic_block_txn_received_cnt++;
+        ulong sz    = fd_txn_m_realized_footprint( txnm, 0, 0 );
+        ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now( ctx ) );
+        fd_stem_publish( stem, ctx->verify_out.idx, 1UL, ctx->verify_out.chunk, sz, 0UL, 0UL, tspub );
+        ctx->verify_out.chunk = fd_dcache_compact_next( ctx->verify_out.chunk, sz, ctx->verify_out.chunk0, ctx->verify_out.wmark );
+
+        ctx->harmonic_block_txn_received_cnt++;
+      }
+      n += bsz;
     }
-    verify_budget -= n;
     ctx->harmonic_pending_len -= n;
     if( FD_UNLIKELY( ctx->harmonic_pending_len ) ) {
       memmove( ctx->harmonic_staging, ctx->harmonic_staging + n,
                ctx->harmonic_pending_len * sizeof(fd_bundle_harmonic_staged_txn_t) );
     }
-    *charge_busy = 1;
-    *opt_poll_in = 0;
-  }
-
-  if( FD_LIKELY( verify_budget && !pending_txn_empty( ctx->pending_txns ) ) ) {
-    fd_bundle_pending_txn_t * head = pending_txn_peek_head( ctx->pending_txns );
-
-    if( FD_UNLIKELY( head->sig==1UL ) ) {
-      ulong const bsz = pending_bundle_txn_cnt_at_head( ctx->pending_txns );
-      if( FD_LIKELY( bsz && bsz<=verify_budget ) ) {
-        for( ulong i=0UL; i<bsz; i++ ) {
-          fd_bundle_pending_txn_t const * txn = pending_txn_peek_head( ctx->pending_txns );
-
-          fd_txn_m_t * txnm = fd_chunk_to_laddr( ctx->verify_out.mem, ctx->verify_out.chunk );
-          *txnm = (fd_txn_m_t) {
-            .reference_slot = 0UL,
-            .payload_sz     = txn->payload_sz,
-            .txn_t_sz       = 0U,
-            .source_ipv4    = txn->source_ipv4,
-            .source_tpu     = txn->source_tpu,
-            .first_seen_nanos = txn->first_seen_nanos,
-            .block_engine   = {
-              .bundle_id      = txn->bundle_seq,
-              .bundle_txn_cnt = (ushort)txn->bundle_txn_cnt,
-              .commission     = txn->commission,
-            },
-          };
-          fd_memcpy( txnm->block_engine.commission_pubkey, txn->commission_pubkey, 32UL );
-          fd_memcpy( fd_txn_m_payload( txnm ), txn->payload, txn->payload_sz );
-
-          ulong sz    = fd_txn_m_realized_footprint( txnm, 0, 0 );
-          ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now( ctx ) );
-          fd_stem_publish( stem, ctx->verify_out.idx, txn->sig, ctx->verify_out.chunk, sz, 0UL, 0UL, tspub );
-          ctx->verify_out.chunk = fd_dcache_compact_next( ctx->verify_out.chunk, sz, ctx->verify_out.chunk0, ctx->verify_out.wmark );
-
-          pending_txn_remove_head( ctx->pending_txns );
-        }
-        verify_budget -= bsz;
-        *charge_busy = 1;
-        *opt_poll_in = 0;
-      }
-    } else {
-      ulong drain_seq    = head->bundle_seq;
-      ulong drain_sig    = head->sig;
-      ulong drain_cnt    = 0UL;
-      ulong drain_budget = verify_budget;
-
-      do {
-        fd_bundle_pending_txn_t const * txn = pending_txn_peek_head( ctx->pending_txns );
-
-        fd_txn_m_t * txnm = fd_chunk_to_laddr( ctx->verify_out.mem, ctx->verify_out.chunk );
-        *txnm = (fd_txn_m_t) {
-          .reference_slot = 0UL,
-          .payload_sz     = txn->payload_sz,
-          .txn_t_sz       = 0U,
-          .source_ipv4    = txn->source_ipv4,
-          .source_tpu     = txn->source_tpu,
-          .first_seen_nanos = txn->first_seen_nanos,
-          .block_engine   = {
-            .bundle_id      = txn->bundle_seq,
-            .bundle_txn_cnt = (ushort)txn->bundle_txn_cnt,
-            .commission     = txn->commission,
-          },
-        };
-        fd_memcpy( txnm->block_engine.commission_pubkey, txn->commission_pubkey, 32UL );
-        fd_memcpy( fd_txn_m_payload( txnm ), txn->payload, txn->payload_sz );
-
-        ulong sz    = fd_txn_m_realized_footprint( txnm, 0, 0 );
-        ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now( ctx ) );
-        fd_stem_publish( stem, ctx->verify_out.idx, txn->sig, ctx->verify_out.chunk, sz, 0UL, 0UL, tspub );
-        ctx->verify_out.chunk = fd_dcache_compact_next( ctx->verify_out.chunk, sz, ctx->verify_out.chunk0, ctx->verify_out.wmark );
-
-        pending_txn_remove_head( ctx->pending_txns );
-        drain_cnt++;
-        verify_budget--;
-      } while( verify_budget && fd_bundle_drain_continue( ctx->pending_txns, drain_sig, drain_seq, drain_cnt, drain_budget ) );
-
+    published_block = n>0UL;
+    if( FD_LIKELY( published_block ) ) {
       *charge_busy = 1;
       *opt_poll_in = 0;
     }
+  }
+
+  if( !published_block && !pending_txn_empty( ctx->pending_txns ) ) {
+    fd_bundle_pending_txn_t * head = pending_txn_peek_head( ctx->pending_txns );
+    ulong drain_seq = head->bundle_seq;
+    ulong drain_sig = head->sig;
+    ulong drain_cnt = 0UL;
+
+    do {
+      fd_bundle_pending_txn_t const * txn = pending_txn_peek_head( ctx->pending_txns );
+
+      fd_txn_m_t * txnm = fd_chunk_to_laddr( ctx->verify_out.mem, ctx->verify_out.chunk );
+      *txnm = (fd_txn_m_t) {
+        .reference_slot = 0UL,
+        .payload_sz     = txn->payload_sz,
+        .txn_t_sz       = 0U,
+        .source_ipv4    = txn->source_ipv4,
+        .source_tpu     = txn->source_tpu,
+        .first_seen_nanos = txn->first_seen_nanos,
+        .block_engine   = {
+          .bundle_id      = txn->bundle_seq,
+          .bundle_txn_cnt = txn->bundle_txn_cnt,
+          .commission     = txn->commission,
+        },
+      };
+      fd_memcpy( txnm->block_engine.commission_pubkey, txn->commission_pubkey, 32UL );
+      fd_memcpy( fd_txn_m_payload( txnm ), txn->payload, txn->payload_sz );
+
+      ulong sz    = fd_txn_m_realized_footprint( txnm, 0, 0 );
+      ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now( ctx ) );
+      fd_stem_publish( stem, ctx->verify_out.idx, txn->sig, ctx->verify_out.chunk, sz, 0UL, 0UL, tspub );
+      ctx->verify_out.chunk = fd_dcache_compact_next( ctx->verify_out.chunk, sz, ctx->verify_out.chunk0, ctx->verify_out.wmark );
+
+      pending_txn_remove_head( ctx->pending_txns );
+      drain_cnt++;
+    } while( fd_bundle_drain_continue( ctx->pending_txns, drain_sig, drain_seq, drain_cnt, STEM_BURST ) );
+
+    *charge_busy = 1;
+    *opt_poll_in = 0;
   }
 
   /* Drive the TPU endpoint if enabled */
@@ -774,27 +720,9 @@ privileged_init( fd_topo_t const *      topo,
 
 # endif /* FD_HAS_OPENSSL */
 
-  /* Init resolver.  fd_netdb_open_fds may return low fd numbers (0, 1)
-     if stdin/stdout were already closed before privileged_init.  The
-     sandbox later invalidates low fds, so dup them above stderr. */
+  /* Init resolver */
   if( FD_UNLIKELY( !fd_netdb_open_fds( ctx->netdb_fds ) ) ) {
     FD_LOG_ERR(( "fd_netdb_open_fds failed" ));
-  }
-  extern FD_TL int fd_etc_resolv_conf_fd;
-  extern FD_TL int fd_etc_hosts_fd;
-  if( FD_UNLIKELY( ctx->netdb_fds->etc_resolv_conf>=0 && ctx->netdb_fds->etc_resolv_conf<=2 ) ) {
-    int new_fd = fcntl( ctx->netdb_fds->etc_resolv_conf, F_DUPFD, 3 );
-    if( FD_UNLIKELY( new_fd<0 ) ) FD_LOG_ERR(( "fcntl(F_DUPFD) resolv_conf failed (%i-%s)", errno, fd_io_strerror( errno ) ));
-    close( ctx->netdb_fds->etc_resolv_conf );
-    ctx->netdb_fds->etc_resolv_conf = new_fd;
-    fd_etc_resolv_conf_fd = new_fd;
-  }
-  if( FD_UNLIKELY( ctx->netdb_fds->etc_hosts>=0 && ctx->netdb_fds->etc_hosts<=2 ) ) {
-    int new_fd = fcntl( ctx->netdb_fds->etc_hosts, F_DUPFD, 3 );
-    if( FD_UNLIKELY( new_fd<0 ) ) FD_LOG_ERR(( "fcntl(F_DUPFD) hosts failed (%i-%s)", errno, fd_io_strerror( errno ) ));
-    close( ctx->netdb_fds->etc_hosts );
-    ctx->netdb_fds->etc_hosts = new_fd;
-    fd_etc_hosts_fd = new_fd;
   }
 
   /* Random seed for header hashmap */
@@ -834,14 +762,6 @@ unprivileged_init( fd_topo_t const *      topo,
   }
 
   fd_clock_tile_init( ctx->clock );
-
-  /* Set thread-local netdb fds for DNS resolution on the tile thread.
-     fd_netdb_open_fds was called in privileged_init on the main thread,
-     but fd_get_resolv_conf reads thread-local globals. */
-  extern FD_TL int fd_etc_resolv_conf_fd;
-  extern FD_TL int fd_etc_hosts_fd;
-  fd_etc_resolv_conf_fd = ctx->netdb_fds->etc_resolv_conf;
-  fd_etc_hosts_fd       = ctx->netdb_fds->etc_hosts;
 
   ulong sign_in_idx = fd_topo_find_tile_in_link( topo, tile, "sign_bundle", tile->kind_id );
   if( FD_UNLIKELY( sign_in_idx==ULONG_MAX ) ) FD_LOG_ERR(( "Missing sign_bundle link" ));
@@ -962,12 +882,14 @@ unprivileged_init( fd_topo_t const *      topo,
 
   /* Get poh_pack or replay_out link (franken: poh_pack, firedancer: replay_out) */
   ulong leader_in_idx;
-  if( ULONG_MAX!=(leader_in_idx=fd_topo_find_tile_in_link( topo, tile, "poh_pack", tile->kind_id )) ) {
+  if( ULONG_MAX!=(leader_in_idx=fd_topo_find_tile_in_link( topo, tile, "pohh_pack", tile->kind_id )) ) {
+    ctx->leader_in_is_replay = 0;
+  } else if( ULONG_MAX!=(leader_in_idx=fd_topo_find_tile_in_link( topo, tile, "poh_pack", tile->kind_id )) ) {
     ctx->leader_in_is_replay = 0;
   } else if( ULONG_MAX!=(leader_in_idx=fd_topo_find_tile_in_link( topo, tile, "replay_out", tile->kind_id )) ) {
     ctx->leader_in_is_replay = 1;
   } else {
-    FD_LOG_ERR(( "bundle tile requires either poh_pack or replay_out link" ));
+    FD_LOG_ERR(( "bundle tile requires a pohh_pack, poh_pack, or replay_out link" ));
   }
   fd_topo_link_t const * leader_link = &topo->links[ tile->in_link_id[ leader_in_idx ] ];
   ctx->leader_in.idx    = leader_in_idx;

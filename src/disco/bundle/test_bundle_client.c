@@ -888,43 +888,63 @@ encode_block_msg( uchar * buf, ulong buf_sz, ulong slot, ulong txn_cnt, ulong tx
   return (ulong)(ptr - buf);
 }
 
-/* Static buffer for block message with slot 12345678 */
+/* A block is streamed as a sequence of BundleUuid messages that all
+   carry the slot as uuid.  encode_block_msg emits exactly one of them,
+   so concatenating its output gives a response with several bundles. */
+static ulong
+encode_block_stream_msg( uchar * buf, ulong buf_sz, ulong slot, ulong bundle_cnt, ulong txns_per_bundle, ulong txn_sz ) {
+  ulong off = 0UL;
+  for( ulong i=0UL; i<bundle_cnt; i++ ) {
+    ulong sz = encode_block_msg( buf+off, buf_sz-off, slot, txns_per_bundle, txn_sz );
+    if( !sz ) return 0UL;
+    off += sz;
+  }
+  return off;
+}
+
+/* Static buffer for block message with slot 12345678: 1 bundle of 2 txns */
 static uchar subscribe_blocks_msg_slot_12345678[256];
 static ulong subscribe_blocks_msg_slot_12345678_sz = 0;
 
-/* Static buffer for block message with slot 99999999 */
+/* Static buffer for block message with slot 99999999: 3 bundles of 2 txns */
 static uchar subscribe_blocks_msg_slot_99999999[512];
 static ulong subscribe_blocks_msg_slot_99999999_sz = 0;
 
-/* Static buffer for block message with 8 txns, slot 55555555 */
+/* Static buffer for block message with slot 55555555: 4 bundles of 2 txns */
 static uchar subscribe_blocks_msg_8txns[512];
 static ulong subscribe_blocks_msg_8txns_sz = 0;
+
+/* Static buffer for an oversize block bundle (6 txns), slot 77777777 */
+static uchar subscribe_blocks_msg_oversize[512];
+static ulong subscribe_blocks_msg_oversize_sz = 0;
 
 /* Initialize the block test messages (call once at start of tests) */
 static void
 init_block_test_messages( void ) {
-  /* 2 txns, 1 byte each, slot=12345678 */
-  subscribe_blocks_msg_slot_12345678_sz = encode_block_msg(
+  subscribe_blocks_msg_slot_12345678_sz = encode_block_stream_msg(
       subscribe_blocks_msg_slot_12345678, sizeof(subscribe_blocks_msg_slot_12345678),
-      12345678UL, 2UL, 1UL );
+      12345678UL, 1UL, 2UL, 1UL );
   FD_TEST( subscribe_blocks_msg_slot_12345678_sz > 0 );
 
-  /* 6 txns, 1 byte each, slot=99999999 */
-  subscribe_blocks_msg_slot_99999999_sz = encode_block_msg(
+  subscribe_blocks_msg_slot_99999999_sz = encode_block_stream_msg(
       subscribe_blocks_msg_slot_99999999, sizeof(subscribe_blocks_msg_slot_99999999),
-      99999999UL, 6UL, 1UL );
+      99999999UL, 3UL, 2UL, 1UL );
   FD_TEST( subscribe_blocks_msg_slot_99999999_sz > 0 );
 
-  /* 8 txns, 1 byte each, slot=55555555 */
-  subscribe_blocks_msg_8txns_sz = encode_block_msg(
+  subscribe_blocks_msg_8txns_sz = encode_block_stream_msg(
       subscribe_blocks_msg_8txns, sizeof(subscribe_blocks_msg_8txns),
-      55555555UL, 8UL, 1UL );
+      55555555UL, 4UL, 2UL, 1UL );
   FD_TEST( subscribe_blocks_msg_8txns_sz > 0 );
+
+  subscribe_blocks_msg_oversize_sz = encode_block_stream_msg(
+      subscribe_blocks_msg_oversize, sizeof(subscribe_blocks_msg_oversize),
+      77777777UL, 1UL, FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE+1UL, 1UL );
+  FD_TEST( subscribe_blocks_msg_oversize_sz > 0 );
 }
 
 static ulong published_txn_cnt( test_bundle_env_t const * env );
 static fd_txn_m_t const * published_txn( test_bundle_env_t const * env, ulong seq, fd_frag_meta_t const ** opt_meta );
-static void expect_published_harmonic_txn( test_bundle_env_t const * env, ulong seq, uchar const * payload, ulong payload_sz, ulong block_slot, ushort block_txn_cnt, uchar commission, uchar const * commission_pubkey );
+static void expect_published_harmonic_txn( test_bundle_env_t const * env, ulong seq, uchar const * payload, ulong payload_sz, ulong bundle_id, ulong bundle_txn_cnt, uchar commission, uchar const * commission_pubkey );
 static ulong flush_harmonic_staging( fd_bundle_tile_t * state );
 static ulong flush_harmonic_staging_budgeted( fd_bundle_tile_t * state, ulong budget );
 static ulong publish_after_credit( fd_bundle_tile_t * state );
@@ -943,7 +963,7 @@ FD_UNIT_TEST( harmonic_block_slot_parsing ) {
   for( ulong i=0UL; i<32UL; i++ ) builder_pubkey[ i ] = (uchar)( i + 0xA0U );
   fd_memcpy( state->builder_pubkey, builder_pubkey, 32UL );
 
-  /* Receive block with slot=12345678 (2 txns <= 32 → staging path) */
+  /* Receive one block bundle with slot=12345678 (2 txns → staging path) */
   fd_bundle_client_grpc_callbacks.rx_msg(
       state,
       subscribe_blocks_msg_slot_12345678, subscribe_blocks_msg_slot_12345678_sz,
@@ -962,16 +982,18 @@ FD_UNIT_TEST( harmonic_block_slot_parsing ) {
   FD_TEST( published_txn_cnt( env )==2UL );
 
   uchar const expected_payload[] = { 0x42 };
-  expect_published_harmonic_txn( env, 0UL, expected_payload, 1UL, 12345678UL, 2, 10U, builder_pubkey );
-  expect_published_harmonic_txn( env, 1UL, expected_payload, 1UL, 12345678UL, 2, 10U, builder_pubkey );
+  ulong const expected_id = FD_TXN_M_HARMONIC_BUNDLE_ID( 12345678UL, 1UL );
+  expect_published_harmonic_txn( env, 0UL, expected_payload, 1UL, expected_id, 2UL, 10U, builder_pubkey );
+  expect_published_harmonic_txn( env, 1UL, expected_payload, 1UL, expected_id, 2UL, 10U, builder_pubkey );
 
   FD_LOG_NOTICE(( "Harmonic block slot parsing test passed (slot=12345678)" ));
   test_bundle_env_destroy( env );
 }
 
-/* Test that harmonic blocks can have > 5 transactions (unlike regular bundles) */
-FD_UNIT_TEST( harmonic_block_rx_many_txns ) {
-  FD_LOG_NOTICE(( "Testing harmonic block rx with many txns (no len=5 limit)" ));
+/* A block arrives as several bundles; each is tagged with the slot and
+   its 1-based position in the block. */
+FD_UNIT_TEST( harmonic_block_multi_bundle ) {
+  FD_LOG_NOTICE(( "Testing harmonic block rx with several bundles" ));
   test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
   test_bundle_env_enable_harmonic_block_mode( env, wksp );
   test_bundle_env_mock_harmonic_block_conn( env );
@@ -979,7 +1001,7 @@ FD_UNIT_TEST( harmonic_block_rx_many_txns ) {
 
   state->builder_info_avail = 1;
 
-  /* Test 6 transactions (6 <= 32 → staging path) */
+  /* 3 bundles of 2 txns */
   fd_bundle_client_grpc_callbacks.rx_msg(
       state,
       subscribe_blocks_msg_slot_99999999, subscribe_blocks_msg_slot_99999999_sz,
@@ -987,7 +1009,8 @@ FD_UNIT_TEST( harmonic_block_rx_many_txns ) {
   );
 
   FD_TEST( state->harmonic_block_slot==99999999UL );
-  FD_TEST( state->harmonic_block_received_cnt==1UL );
+  FD_TEST( state->harmonic_block_seq==3UL );
+  FD_TEST( state->harmonic_block_received_cnt==3UL );
   FD_TEST( state->harmonic_pending_len==6UL );
   FD_TEST( state->harmonic_block_txn_received_cnt==0UL );
 
@@ -995,13 +1018,104 @@ FD_UNIT_TEST( harmonic_block_rx_many_txns ) {
   FD_TEST( state->harmonic_block_txn_received_cnt==6UL );
   FD_TEST( published_txn_cnt( env )==6UL );
 
-  fd_frag_meta_t const * meta = NULL;
-  fd_txn_m_t const * txnm0 = published_txn( env, 0UL, &meta );
-  FD_TEST( meta->sig==2UL );
-  FD_TEST( txnm0->source_tpu==FD_TXN_M_TPU_SOURCE_HARMONIC );
-  FD_TEST( txnm0->block_engine.block_slot==99999999UL );
+  for( ulong i=0UL; i<6UL; i++ ) {
+    fd_frag_meta_t const * meta = NULL;
+    fd_txn_m_t const * txnm = published_txn( env, i, &meta );
+    FD_TEST( meta->sig==1UL );
+    FD_TEST( txnm->source_tpu==FD_TXN_M_TPU_SOURCE_HARMONIC );
+    FD_TEST( txnm->block_engine.bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 99999999UL, 1UL+i/2UL ) );
+    FD_TEST( txnm->block_engine.bundle_txn_cnt==2UL );
+  }
 
-  FD_LOG_NOTICE(( "Harmonic block rx many txns test passed (6 txns ok, slot=99999999)" ));
+  FD_LOG_NOTICE(( "Harmonic block multi bundle test passed" ));
+  test_bundle_env_destroy( env );
+}
+
+/* A block bundle larger than a regular bundle cannot execute atomically
+   and is dropped whole.  It still consumes a sequence number so pack
+   sees the gap and stops the block. */
+FD_UNIT_TEST( harmonic_block_oversize_bundle_rejected ) {
+  FD_LOG_NOTICE(( "Testing oversize harmonic block bundle rejection" ));
+  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
+  test_bundle_env_enable_harmonic_block_mode( env, wksp );
+  test_bundle_env_mock_harmonic_block_conn( env );
+  fd_bundle_tile_t * state = env->state;
+
+  state->builder_info_avail = 1;
+
+  fd_bundle_client_grpc_callbacks.rx_msg(
+      state,
+      subscribe_blocks_msg_oversize, subscribe_blocks_msg_oversize_sz,
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+  );
+  FD_TEST( state->harmonic_block_slot==77777777UL );
+  FD_TEST( state->harmonic_block_seq==1UL );
+  FD_TEST( state->harmonic_block_received_cnt==0UL );
+  FD_TEST( state->harmonic_pending_len==0UL );
+
+  /* A following valid bundle for the same block gets seq 2 */
+  uchar  msg[ 256 ];
+  ulong  msg_sz = encode_block_stream_msg( msg, sizeof(msg), 77777777UL, 1UL, 2UL, 1UL );
+  FD_TEST( msg_sz>0UL );
+  fd_bundle_client_grpc_callbacks.rx_msg( state, msg, msg_sz, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks );
+  FD_TEST( state->harmonic_block_seq==2UL );
+  FD_TEST( state->harmonic_block_received_cnt==1UL );
+  FD_TEST( state->harmonic_pending_len==2UL );
+  FD_TEST( state->harmonic_staging[0].bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 77777777UL, 2UL ) );
+  FD_TEST( state->harmonic_staging[0].bundle_txn_cnt==2UL );
+
+  FD_LOG_NOTICE(( "Oversize harmonic block bundle rejection test passed" ));
+  test_bundle_env_destroy( env );
+}
+
+/* A connection reset between becoming leader and the end of the slot
+   may have lost bundles.  Numbering after a reset starts at 2 so pack
+   stops that block; becoming leader clears the taint. */
+FD_UNIT_TEST( harmonic_reset_taints_sequence ) {
+  FD_LOG_NOTICE(( "Testing harmonic sequence taint after reset" ));
+  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
+  test_bundle_env_enable_harmonic_block_mode( env, wksp );
+  test_bundle_env_mock_harmonic_block_conn( env );
+  fd_bundle_tile_t * state = env->state;
+
+  state->builder_info_avail = 1;
+  state->harmonic_seq_tainted = 0; /* as after became_leader */
+
+  fd_bundle_client_grpc_callbacks.rx_msg(
+      state,
+      subscribe_blocks_msg_slot_12345678, subscribe_blocks_msg_slot_12345678_sz,
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+  );
+  FD_TEST( state->harmonic_block_seq==1UL );
+  FD_TEST( state->harmonic_staging[0].bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 12345678UL, 1UL ) );
+
+  fd_bundle_client_reset( state );
+  FD_TEST( state->harmonic_seq_tainted==1 );
+  FD_TEST( state->harmonic_pending_len==0UL );
+  test_bundle_env_mock_harmonic_block_conn( env );
+  state->builder_info_avail = 1;
+
+  /* Same block again after the reset: numbering skips 1 */
+  fd_bundle_client_grpc_callbacks.rx_msg(
+      state,
+      subscribe_blocks_msg_slot_12345678, subscribe_blocks_msg_slot_12345678_sz,
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+  );
+  FD_TEST( state->harmonic_block_seq==2UL );
+  FD_TEST( state->harmonic_staging[0].bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 12345678UL, 2UL ) );
+  FD_TEST( flush_harmonic_staging( state )==2UL );
+
+  /* Became leader for a new slot: taint cleared, next block starts at 1 */
+  state->harmonic_seq_tainted = 0;
+  fd_bundle_client_grpc_callbacks.rx_msg(
+      state,
+      subscribe_blocks_msg_slot_99999999, subscribe_blocks_msg_slot_99999999_sz,
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+  );
+  FD_TEST( state->harmonic_block_seq==3UL );
+  FD_TEST( state->harmonic_staging[0].bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 99999999UL, 1UL ) );
+
+  FD_LOG_NOTICE(( "Harmonic sequence taint test passed" ));
   test_bundle_env_destroy( env );
 }
 
@@ -1038,13 +1152,13 @@ FD_UNIT_TEST( all_three_sources ) {
   FD_TEST( state->metrics.bundle_received_cnt==1UL );
   FD_TEST( pending_txn_cnt( state->pending_txns )==7UL );
 
-  /* 3. Receive harmonic blocks (6 txns → staging) */
+  /* 3. Receive harmonic block bundles (3 bundles, 6 txns → staging) */
   fd_bundle_client_grpc_callbacks.rx_msg(
       state,
       subscribe_blocks_msg_slot_99999999, subscribe_blocks_msg_slot_99999999_sz,
       FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
   );
-  FD_TEST( state->harmonic_block_received_cnt==1UL );
+  FD_TEST( state->harmonic_block_received_cnt==3UL );
   FD_TEST( state->harmonic_pending_len==6UL );
   FD_TEST( state->harmonic_block_slot==99999999UL );
 
@@ -1087,13 +1201,13 @@ FD_UNIT_TEST( interleaved_sources ) {
   FD_TEST( state->metrics.bundle_received_cnt==1UL );
   FD_TEST( pending_txn_cnt( state->pending_txns )==5UL );
 
-  /* Harmonic block 1 (6 txns, slot=99999999 → staging) */
+  /* Harmonic block 1 (3 bundles, 6 txns, slot=99999999 → staging) */
   fd_bundle_client_grpc_callbacks.rx_msg(
       state,
       subscribe_blocks_msg_slot_99999999, subscribe_blocks_msg_slot_99999999_sz,
       FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
   );
-  FD_TEST( state->harmonic_block_received_cnt==1UL );
+  FD_TEST( state->harmonic_block_received_cnt==3UL );
   FD_TEST( state->harmonic_block_slot==99999999UL );
   FD_TEST( state->harmonic_pending_len==6UL );
 
@@ -1109,14 +1223,16 @@ FD_UNIT_TEST( interleaved_sources ) {
   FD_TEST( state->metrics.bundle_received_cnt==2UL );
   FD_TEST( pending_txn_cnt( state->pending_txns )==10UL );
 
-  /* Harmonic block 2 (2 txns, slot=12345678 → staging) */
+  /* Harmonic block 2 (1 bundle, 2 txns, slot=12345678 → staging).  A
+     new slot restarts the per-block sequence. */
   fd_bundle_client_grpc_callbacks.rx_msg(
       state,
       subscribe_blocks_msg_slot_12345678, subscribe_blocks_msg_slot_12345678_sz,
       FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
   );
-  FD_TEST( state->harmonic_block_received_cnt==2UL );
+  FD_TEST( state->harmonic_block_received_cnt==4UL );
   FD_TEST( state->harmonic_block_slot==12345678UL );
+  FD_TEST( state->harmonic_block_seq==1UL );
   FD_TEST( state->harmonic_pending_len==2UL );
 
   FD_TEST( flush_harmonic_staging( state )==2UL );
@@ -1132,9 +1248,10 @@ FD_UNIT_TEST( interleaved_sources ) {
   test_bundle_env_destroy( env );
 }
 
-/* Test budget-limited harmonic staging drain with memmove.
-   Stages 8 txns, drains TEST_STEM_BURST (5), verifies memmove shifts
-   remaining 3 correctly, then drains those. */
+/* Test budget-limited harmonic staging drain with memmove.  Stages 4
+   bundles of 2 txns, drains with budget TEST_STEM_BURST (5): only two
+   whole bundles (4 txns) fit, the third must not be split.  Verifies
+   memmove shifts the remaining 4 correctly, then drains those. */
 FD_UNIT_TEST( harmonic_staging_partial_drain ) {
   FD_LOG_NOTICE(( "Testing harmonic staging partial drain with memmove" ));
   test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
@@ -1159,19 +1276,25 @@ FD_UNIT_TEST( harmonic_staging_partial_drain ) {
     state->harmonic_staging[i].payload[0] = (uchar)i;
   }
 
-  /* Drain with budget=TEST_STEM_BURST (5).  Should publish 5,
-     memmove the remaining 3. */
-  FD_TEST( flush_harmonic_staging_budgeted( state, TEST_STEM_BURST )==5UL );
-  FD_TEST( state->harmonic_pending_len==3UL );
-  FD_TEST( published_txn_cnt( env )==5UL );
+  /* Drain with budget=TEST_STEM_BURST (5).  Two whole bundles (4 txns)
+     fit; the third bundle would need 6 so it waits.  memmove the
+     remaining 4. */
+  FD_TEST( flush_harmonic_staging_budgeted( state, TEST_STEM_BURST )==4UL );
+  FD_TEST( state->harmonic_pending_len==4UL );
+  FD_TEST( published_txn_cnt( env )==4UL );
 
-  /* Verify memmove shifted txns [5,6,7] to positions [0,1,2]. */
-  FD_TEST( state->harmonic_staging[0].payload[0]==5 );
-  FD_TEST( state->harmonic_staging[1].payload[0]==6 );
-  FD_TEST( state->harmonic_staging[2].payload[0]==7 );
+  /* Verify memmove shifted txns [4,5,6,7] to positions [0,1,2,3]. */
+  FD_TEST( state->harmonic_staging[0].payload[0]==4 );
+  FD_TEST( state->harmonic_staging[1].payload[0]==5 );
+  FD_TEST( state->harmonic_staging[2].payload[0]==6 );
+  FD_TEST( state->harmonic_staging[3].payload[0]==7 );
 
-  /* Drain remaining 3. */
-  FD_TEST( flush_harmonic_staging_budgeted( state, TEST_STEM_BURST )==3UL );
+  /* A budget of 1 cannot fit any bundle: nothing is published. */
+  FD_TEST( flush_harmonic_staging_budgeted( state, 1UL )==0UL );
+  FD_TEST( state->harmonic_pending_len==4UL );
+
+  /* Drain remaining 4. */
+  FD_TEST( flush_harmonic_staging_budgeted( state, TEST_STEM_BURST )==4UL );
   FD_TEST( state->harmonic_pending_len==0UL );
   FD_TEST( published_txn_cnt( env )==8UL );
 
@@ -1239,7 +1362,7 @@ FD_UNIT_TEST( harmonic_before_credit_gate ) {
   );
   FD_TEST( state->harmonic_pending_len==6UL );
   FD_TEST( state->harmonic_block_slot==99999999UL );
-  FD_TEST( state->harmonic_block_received_cnt==2UL );
+  FD_TEST( state->harmonic_block_received_cnt==4UL );
 
   FD_TEST( flush_harmonic_staging( state )==6UL );
   FD_TEST( published_txn_cnt( env )==9UL );
@@ -1266,8 +1389,8 @@ FD_UNIT_TEST( reset_clears_harmonic_state ) {
       FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
   );
   FD_TEST( state->harmonic_pending_len==2UL );
-  FD_TEST( state->harmonic_staged_block_slot==12345678UL );
-  FD_TEST( state->harmonic_staged_block_txn_cnt==2 );
+  FD_TEST( state->harmonic_staged_bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 12345678UL, 1UL ) );
+  FD_TEST( state->harmonic_staged_bundle_txn_cnt==2UL );
   FD_TEST( state->harmonic_block_received_cnt==1UL );
 
   /* Reset must clear harmonic staging so stale data does not leak
@@ -1275,8 +1398,9 @@ FD_UNIT_TEST( reset_clears_harmonic_state ) {
   fd_bundle_client_reset( state );
 
   FD_TEST( state->harmonic_pending_len==0UL );
-  FD_TEST( state->harmonic_staged_block_slot==0UL );
-  FD_TEST( state->harmonic_staged_block_txn_cnt==0 );
+  FD_TEST( state->harmonic_staged_bundle_id==0UL );
+  FD_TEST( state->harmonic_staged_bundle_txn_cnt==0UL );
+  FD_TEST( state->harmonic_block_seq==0UL );
   FD_TEST( state->harmonic_block_subscription_live==0 );
   FD_TEST( state->harmonic_block_subscription_wait==0 );
 
@@ -1509,19 +1633,19 @@ expect_published_harmonic_txn( test_bundle_env_t const * env,
                                ulong                     seq,
                                uchar const *             payload,
                                ulong                     payload_sz,
-                               ulong                     block_slot,
-                               ushort                    block_txn_cnt,
+                               ulong                     bundle_id,
+                               ulong                     bundle_txn_cnt,
                                uchar                     commission,
                                uchar const *             commission_pubkey ) {
   fd_frag_meta_t const * meta = NULL;
   fd_txn_m_t const * txnm = published_txn( env, seq, &meta );
 
-  FD_TEST( meta->sig==2UL );
+  FD_TEST( meta->sig==1UL );
   FD_TEST( txnm->payload_sz==payload_sz );
   FD_TEST( txnm->txn_t_sz==0U );
   FD_TEST( txnm->source_tpu==FD_TXN_M_TPU_SOURCE_HARMONIC );
-  FD_TEST( txnm->block_engine.block_slot==block_slot );
-  FD_TEST( txnm->block_engine.bundle_txn_cnt==block_txn_cnt );
+  FD_TEST( txnm->block_engine.bundle_id==bundle_id );
+  FD_TEST( txnm->block_engine.bundle_txn_cnt==bundle_txn_cnt );
   FD_TEST( txnm->block_engine.commission==commission );
   FD_TEST( 0==memcmp( txnm->block_engine.commission_pubkey, commission_pubkey, 32UL ) );
   FD_TEST( 0==memcmp( fd_txn_m_payload_const( txnm ), payload, payload_sz ) );
@@ -1571,80 +1695,48 @@ publish_after_credit( fd_bundle_tile_t * state ) {
   return drain_cnt;
 }
 
-/* Flush harmonic staging buffer by publishing to verify_out, mirroring
-   the harmonic drain loop in after_credit. */
-
-static ulong
-flush_harmonic_staging( fd_bundle_tile_t * state ) {
-  ulong n = state->harmonic_pending_len;
-  if( !n ) return 0UL;
-
-  fd_stem_context_t * stem = state->stem;
-  for( ulong i=0UL; i<n; i++ ) {
-    fd_bundle_harmonic_staged_txn_t const * s = &state->harmonic_staging[i];
-
-    fd_txn_m_t * txnm = fd_chunk_to_laddr( state->verify_out.mem, state->verify_out.chunk );
-    *txnm = (fd_txn_m_t) {
-      .reference_slot = 0UL,
-      .payload_sz     = s->payload_sz,
-      .txn_t_sz       = 0U,
-      .source_ipv4    = s->source_ipv4,
-      .source_tpu     = FD_TXN_M_TPU_SOURCE_HARMONIC,
-      .block_engine   = {
-        .block_slot     = s->block_slot,
-        .bundle_txn_cnt = s->block_txn_cnt,
-        .commission     = s->commission,
-      },
-    };
-    fd_memcpy( txnm->block_engine.commission_pubkey, s->commission_pubkey, 32UL );
-    fd_memcpy( fd_txn_m_payload( txnm ), s->payload, s->payload_sz );
-
-    ulong sz    = fd_txn_m_realized_footprint( txnm, 0, 0 );
-    ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now( state ) );
-    fd_stem_publish( stem, state->verify_out.idx, 2UL, state->verify_out.chunk, sz, 0UL, 0UL, tspub );
-    state->verify_out.chunk = fd_dcache_compact_next( state->verify_out.chunk, sz, state->verify_out.chunk0, state->verify_out.wmark );
-
-    state->harmonic_block_txn_received_cnt++;
-  }
-  state->harmonic_pending_len = 0UL;
-  return n;
-}
-
-/* Budget-limited version of flush_harmonic_staging.  Mirrors the
-   production after_credit loop: drain at most `budget` txns, then
+/* Mirror the production after_credit harmonic drain: publish whole
+   bundles from the staging buffer while they fit in the budget, then
    memmove the remainder to the front of the staging array. */
 
 static ulong
 flush_harmonic_staging_budgeted( fd_bundle_tile_t * state, ulong budget ) {
-  ulong n = fd_ulong_min( state->harmonic_pending_len, budget );
-  if( !n ) return 0UL;
-
   fd_stem_context_t * stem = state->stem;
-  for( ulong i=0UL; i<n; i++ ) {
-    fd_bundle_harmonic_staged_txn_t const * s = &state->harmonic_staging[i];
+  ulong n = 0UL;
+  while( n<state->harmonic_pending_len ) {
+    ulong const id  = state->harmonic_staging[ n ].bundle_id;
+    ulong       bsz = 0UL;
+    while( n+bsz<state->harmonic_pending_len && state->harmonic_staging[ n+bsz ].bundle_id==id ) bsz++;
+    if( bsz>budget ) break;
 
-    fd_txn_m_t * txnm = fd_chunk_to_laddr( state->verify_out.mem, state->verify_out.chunk );
-    *txnm = (fd_txn_m_t) {
-      .reference_slot = 0UL,
-      .payload_sz     = s->payload_sz,
-      .txn_t_sz       = 0U,
-      .source_ipv4    = s->source_ipv4,
-      .source_tpu     = FD_TXN_M_TPU_SOURCE_HARMONIC,
-      .block_engine   = {
-        .block_slot     = s->block_slot,
-        .bundle_txn_cnt = s->block_txn_cnt,
-        .commission     = s->commission,
-      },
-    };
-    fd_memcpy( txnm->block_engine.commission_pubkey, s->commission_pubkey, 32UL );
-    fd_memcpy( fd_txn_m_payload( txnm ), s->payload, s->payload_sz );
+    for( ulong i=0UL; i<bsz; i++ ) {
+      fd_bundle_harmonic_staged_txn_t const * s = &state->harmonic_staging[ n+i ];
 
-    ulong sz    = fd_txn_m_realized_footprint( txnm, 0, 0 );
-    ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now( state ) );
-    fd_stem_publish( stem, state->verify_out.idx, 2UL, state->verify_out.chunk, sz, 0UL, 0UL, tspub );
-    state->verify_out.chunk = fd_dcache_compact_next( state->verify_out.chunk, sz, state->verify_out.chunk0, state->verify_out.wmark );
+      fd_txn_m_t * txnm = fd_chunk_to_laddr( state->verify_out.mem, state->verify_out.chunk );
+      *txnm = (fd_txn_m_t) {
+        .reference_slot = 0UL,
+        .payload_sz     = s->payload_sz,
+        .txn_t_sz       = 0U,
+        .source_ipv4    = s->source_ipv4,
+        .source_tpu     = FD_TXN_M_TPU_SOURCE_HARMONIC,
+        .block_engine   = {
+          .bundle_id      = s->bundle_id,
+          .bundle_txn_cnt = s->bundle_txn_cnt,
+          .commission     = s->commission,
+        },
+      };
+      fd_memcpy( txnm->block_engine.commission_pubkey, s->commission_pubkey, 32UL );
+      fd_memcpy( fd_txn_m_payload( txnm ), s->payload, s->payload_sz );
 
-    state->harmonic_block_txn_received_cnt++;
+      ulong sz    = fd_txn_m_realized_footprint( txnm, 0, 0 );
+      ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_bundle_now( state ) );
+      fd_stem_publish( stem, state->verify_out.idx, 1UL, state->verify_out.chunk, sz, 0UL, 0UL, tspub );
+      state->verify_out.chunk = fd_dcache_compact_next( state->verify_out.chunk, sz, state->verify_out.chunk0, state->verify_out.wmark );
+
+      state->harmonic_block_txn_received_cnt++;
+    }
+    n      += bsz;
+    budget -= bsz;
   }
   state->harmonic_pending_len -= n;
   if( state->harmonic_pending_len ) {
@@ -1652,6 +1744,11 @@ flush_harmonic_staging_budgeted( fd_bundle_tile_t * state, ulong budget ) {
              state->harmonic_pending_len * sizeof(fd_bundle_harmonic_staged_txn_t) );
   }
   return n;
+}
+
+static ulong
+flush_harmonic_staging( fd_bundle_tile_t * state ) {
+  return flush_harmonic_staging_budgeted( state, ULONG_MAX );
 }
 
 /* Simulate after_credit drain using the same continuation logic as
