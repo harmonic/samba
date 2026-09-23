@@ -84,7 +84,7 @@ struct fd_became_leader {
     uchar                                last_blockhash[32];
   } bundle[1];
 
-  /* cavey: 1 if this validator is also the leader for slot+1, 0 otherwise.
+  /* Harmonic: 1 if this validator is also the leader for slot+1, 0 otherwise.
      Used by pack to decide whether to sprint (schedule bundles/nonvote)
      after the harmonic block completes. */
   int leader_next_slot;

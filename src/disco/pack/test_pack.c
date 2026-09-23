@@ -1,5 +1,6 @@
 #include "../../ballet/fd_ballet.h"
 #include "fd_pack.h"
+#include "../fd_txn_m.h"
 #include "fd_pack_cost.h"
 #include "fd_compute_budget_program.h"
 #include "../../ballet/txn/fd_txn.h"
@@ -1706,6 +1707,360 @@ test_bundle_nonce( void ) {
   fd_pack_delete( fd_pack_leave( pack ) );
 }
 
+
+/* Harmonic block mode.  Block bundles are admitted whole and in order,
+   scheduled one bundle per microblock in FIFO order, and the executed
+   set is always an ordered prefix of the block: a gap, a late bundle, a
+   bundle that cannot fit, or a bundle that reverts stops the block, and
+   a reverted bundle's accounts are poisoned until the block ends. */
+
+#define H_THRESHOLD (1000L)
+#define H_CUTOFF    (2000L)
+#define H_EARLY     ( 500L)
+#define H_LATE      (3000L)
+
+static ulong h_signer = 5000UL;
+
+static fd_txn_e_t * const *
+h_bundle( fd_pack_t *          pack,
+          fd_txn_e_t **        _bundle,
+          ulong                txn_cnt,
+          char const * const * writes,
+          uint                 compute ) {
+  fd_txn_e_t * const * bundle = fd_pack_insert_bundle_init( pack, _bundle, txn_cnt );
+  for( ulong k=0UL; k<txn_cnt; k++ ) make_transaction1( bundle[k]->txnp, h_signer++, compute, 500U, 11.0, writes[k], "", NULL, NULL );
+  return bundle;
+}
+
+static int
+h_fini( fd_pack_t *          pack,
+        fd_txn_e_t * const * bundle,
+        ulong                txn_cnt,
+        ulong                slot,
+        ulong                seq,
+        long                 now ) {
+  ulong deleted;
+  return fd_pack_harmonic_insert_bundle_fini( pack, bundle, txn_cnt, FD_TXN_M_HARMONIC_BUNDLE_ID( slot, seq ), 1000UL, 0, NULL,
+                                              now, H_THRESHOLD, H_CUTOFF, &deleted );
+}
+
+static ulong
+h_sched( fd_pack_t * pack, ulong bank, int harmonic ) {
+  return fd_pack_schedule_next_microblock( pack, FD_PACK_TEST_MAX_COST_PER_BLOCK, 0.0f, bank, ALL, harmonic, outcome.results );
+}
+
+static void
+h_crank( fd_pack_t * pack, long now ) {
+  fd_pack_harmonic_state_crank( pack, now, H_THRESHOLD, H_CUTOFF, 0, 0UL, 0UL, 0 );
+}
+
+static void
+test_harmonic( void ) {
+  FD_LOG_NOTICE(( "TEST HARMONIC" ));
+  fd_pack_t * pack = init_all( 128UL, 4UL, 32UL, &outcome );
+  fd_txn_e_t * _bundle[ FD_PACK_MAX_TXN_PER_BUNDLE ];
+  fd_txn_e_t * const * bundle;
+  ulong slot = 1000UL;
+
+  /* Admission: in-order bundles are accepted whole; a bundle of one is
+     not revert protected but a bundle of two is. */
+  fd_pack_harmonic_reset( pack, slot, 0 ); fd_pack_set_initializer_bundles_ready( pack );
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_UNDECIDED );
+  FD_TEST( h_sched( pack, 0UL, 1 )==0UL ); /* nothing is scheduled while undecided */
+
+  { char const * w[2] = { "A", "B" };
+    bundle = h_bundle( pack, _bundle, 2UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 2UL, slot, 1UL, H_EARLY )>=0 ); }
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_HARMONIC );
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==2UL );
+  FD_TEST( fd_pack_avail_txn_cnt( pack )==2UL );
+  { char const * w[1] = { "C" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 2UL, H_EARLY )>=0 ); }
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==3UL );
+  FD_TEST( !fd_pack_verify( pack, pack_verify_scratch ) );
+
+  /* Gap: seq 4 arrives before seq 3.  Nothing later is admitted, but
+     what was already accepted still executes. */
+  { char const * w[1] = { "D" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 4UL, H_EARLY )==FD_PACK_INSERT_REJECT_BLOCK_FAILED ); }
+  FD_TEST( fd_pack_harmonic_stopped( pack ) );
+  FD_TEST( fd_pack_harmonic_end_flags( pack ) & FD_PACK_END_FLAG_HARMONIC_FAILED );
+  { char const * w[1] = { "D" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 3UL, H_EARLY )==FD_PACK_INSERT_REJECT_BLOCK_FAILED ); }
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==3UL );
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_HARMONIC );
+
+  /* Scheduling: FIFO, one bundle per microblock, flags as decided */
+  FD_TEST( h_sched( pack, 0UL, 1 )==2UL );
+  FD_TEST(   outcome.results[0].txnp->flags & FD_TXN_P_FLAGS_BUNDLE  );
+  FD_TEST(   outcome.results[1].txnp->flags & FD_TXN_P_FLAGS_BUNDLE  );
+  FD_TEST( fd_pack_harmonic_inflight_cnt( pack )==1UL );
+  FD_TEST( h_sched( pack, 1UL, 1 )==1UL );
+  FD_TEST( !(outcome.results[0].txnp->flags & FD_TXN_P_FLAGS_BUNDLE) );
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==0UL );
+  FD_TEST( fd_pack_avail_txn_cnt( pack )==0UL );
+  FD_TEST( h_sched( pack, 2UL, 1 )==0UL );
+  h_crank( pack, H_EARLY ); /* pending drained and stopped: leave HARMONIC without waiting for the cutoff */
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_SPRINT );
+  FD_TEST( fd_pack_microblock_complete( pack, 0UL ) );
+  FD_TEST( fd_pack_microblock_complete( pack, 1UL ) );
+  FD_TEST( fd_pack_harmonic_inflight_cnt( pack )==0UL );
+  FD_TEST( !fd_pack_verify( pack, pack_verify_scratch ) );
+  fd_pack_end_block( pack );
+
+  /* Wrong slot: dropped whole, does not consume the sequence */
+  slot++;
+  fd_pack_harmonic_reset( pack, slot, 0 ); fd_pack_set_initializer_bundles_ready( pack );
+  { char const * w[1] = { "A" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot-1UL, 1UL, H_EARLY )==FD_PACK_INSERT_REJECT_BLOCK_FAILED ); }
+  FD_TEST( !fd_pack_harmonic_stopped( pack ) );
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_UNDECIDED );
+  { char const * w[1] = { "A" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 1UL, H_EARLY )>=0 ); }
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_HARMONIC );
+  FD_TEST( h_sched( pack, 0UL, 1 )==1UL );
+  h_crank( pack, H_EARLY );
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_HARMONIC ); /* not stopped, not past cutoff */
+  h_crank( pack, H_LATE );
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_SPRINT );
+  FD_TEST( fd_pack_microblock_complete( pack, 0UL ) );
+  fd_pack_end_block( pack );
+
+  /* Late first bundle: the block is skipped; VOTE_ONLY when we lead the
+     next slot, SPRINT otherwise.  Same when no bundle arrives at all. */
+  slot++;
+  fd_pack_harmonic_reset( pack, slot, 1 ); fd_pack_set_initializer_bundles_ready( pack );
+  { char const * w[1] = { "A" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 1UL, H_THRESHOLD )==FD_PACK_INSERT_REJECT_BLOCK_FAILED ); }
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_VOTE_ONLY );
+  FD_TEST( fd_pack_harmonic_end_flags( pack ) & FD_PACK_END_FLAG_HARMONIC_TIMEOUT );
+  FD_TEST( fd_pack_avail_txn_cnt( pack )==0UL );
+  fd_pack_end_block( pack );
+  slot++;
+  fd_pack_harmonic_reset( pack, slot, 0 ); fd_pack_set_initializer_bundles_ready( pack );
+  h_crank( pack, H_THRESHOLD );
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_SPRINT );
+  fd_pack_end_block( pack );
+
+  /* Cutoff: a bundle arriving after the cutoff stops the block; the
+     bundles accepted before it still execute. */
+  slot++;
+  fd_pack_harmonic_reset( pack, slot, 0 ); fd_pack_set_initializer_bundles_ready( pack );
+  { char const * w[1] = { "A" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 1UL, H_EARLY )>=0 ); }
+  { char const * w[1] = { "B" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 2UL, H_LATE )==FD_PACK_INSERT_REJECT_BLOCK_FAILED ); }
+  FD_TEST( fd_pack_harmonic_stopped( pack ) );
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==1UL );
+  FD_TEST( h_sched( pack, 0UL, 1 )==1UL );
+  FD_TEST( fd_pack_microblock_complete( pack, 0UL ) );
+  fd_pack_end_block( pack );
+
+  /* Revert: the block stream is considered bad.  Pending block bundles
+     are dropped, nothing further is admitted, and the slot continues in
+     SPRINT (even when we lead the next slot) with our own transactions,
+     which may touch the reverted bundle's accounts freely.  Bundles
+     already dispatched keep running. */
+  slot++;
+  fd_pack_harmonic_reset( pack, slot, 1 ); fd_pack_set_initializer_bundles_ready( pack );
+  { char const * w[2] = { "A", "B" };
+    bundle = h_bundle( pack, _bundle, 2UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 2UL, slot, 1UL, H_EARLY )>=0 ); }
+  { char const * w[1] = { "C" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 2UL, H_EARLY )>=0 ); }
+  { char const * w[1] = { "E" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 3UL, H_EARLY )>=0 ); }
+  FD_TEST( h_sched( pack, 0UL, 1 )==2UL ); /* A,B on bank 0 */
+  FD_TEST( h_sched( pack, 1UL, 1 )==1UL ); /* C on bank 1 */
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==1UL );
+  fd_pack_harmonic_bank_failed( pack, 0UL );
+  FD_TEST( fd_pack_harmonic_stopped( pack ) );
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_SPRINT );
+  FD_TEST( fd_pack_harmonic_end_flags( pack ) & FD_PACK_END_FLAG_HARMONIC_REVERTED );
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==0UL );
+  FD_TEST( fd_pack_avail_txn_cnt( pack )==0UL );
+  FD_TEST( fd_pack_harmonic_inflight_cnt( pack )==1UL );
+  FD_TEST( !fd_pack_verify( pack, pack_verify_scratch ) );
+  { char const * w[1] = { "F" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 4UL, H_EARLY )==FD_PACK_INSERT_REJECT_BLOCK_FAILED ); }
+  FD_TEST( fd_pack_microblock_complete( pack, 1UL ) );
+
+  /* make_transaction indexes the test scratch by signer, so ordinary
+     transactions use small indices; bundle signers start at 5000. */
+  ulong i = 0UL;
+  make_transaction( i, 500U, 500U, 10.0, "A", "",  NULL, NULL ); insert( i++, pack ); /* writes an account the reverted bundle wrote */
+  make_transaction( i, 500U, 500U, 10.0, "F", "B", NULL, NULL ); insert( i++, pack ); /* reads one */
+  make_transaction( i, 500U, 500U, 10.0, "G", "H", NULL, NULL ); insert( i++, pack ); /* unrelated */
+  FD_TEST( fd_pack_avail_txn_cnt( pack )==3UL );
+  FD_TEST( h_sched( pack, 0UL, 1 )==3UL );
+  FD_TEST( fd_pack_avail_txn_cnt( pack )==0UL );
+  FD_TEST( !fd_pack_verify( pack, pack_verify_scratch ) );
+  FD_TEST( fd_pack_microblock_complete( pack, 0UL ) );
+  fd_pack_end_block( pack );
+
+  /* A block bundle containing a vote is refused like any bundle, which
+     stops the block. */
+  slot++;
+  fd_pack_harmonic_reset( pack, slot, 0 ); fd_pack_set_initializer_bundles_ready( pack );
+  { char const * w[1] = { "A" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 1UL, H_EARLY )>=0 ); }
+  bundle = fd_pack_insert_bundle_init( pack, _bundle, 2UL );
+  make_transaction1     ( bundle[0]->txnp, h_signer++, 500U, 500U, 11.0, "B", "", NULL, NULL );
+  make_vote_transaction1( bundle[1]->txnp, h_signer++ );
+  FD_TEST( h_fini( pack, bundle, 2UL, slot, 2UL, H_EARLY )==FD_PACK_INSERT_REJECT_BUNDLE_BLACKLIST );
+  FD_TEST( fd_pack_harmonic_stopped( pack ) );
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==1UL );
+  FD_TEST( h_sched( pack, 0UL, 1 )==1UL );
+  FD_TEST( fd_pack_microblock_complete( pack, 0UL ) );
+  FD_TEST( !fd_pack_verify( pack, pack_verify_scratch ) );
+  fd_pack_end_block( pack );
+
+  /* A block bundle whose transaction is reported executed elsewhere
+     (it landed over TPU in an earlier block) is deleted like any bundle,
+     and the rest of the block is dropped rather than run around it. */
+  slot++;
+  fd_pack_harmonic_reset( pack, slot, 0 ); fd_pack_set_initializer_bundles_ready( pack );
+  fd_ed25519_sig_t dup_sig;
+  { char const * w[1] = { "A" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 1UL, H_EARLY )>=0 ); }
+  { char const * w[2] = { "B", "C" };
+    bundle = h_bundle( pack, _bundle, 2UL, w, 500U );
+    memcpy( &dup_sig, txnp_get_signatures( bundle[1]->txnp ), sizeof(fd_ed25519_sig_t) );
+    FD_TEST( h_fini( pack, bundle, 2UL, slot, 2UL, H_EARLY )>=0 ); }
+  { char const * w[1] = { "D" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 3UL, H_EARLY )>=0 ); }
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==4UL );
+  FD_TEST( fd_pack_delete_transaction( pack, fd_type_pun( &dup_sig ) )>=1UL );
+  FD_TEST( fd_pack_harmonic_stopped( pack ) );
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==0UL );
+  FD_TEST( fd_pack_avail_txn_cnt( pack )==0UL );
+  FD_TEST( !fd_pack_verify( pack, pack_verify_scratch ) );
+  h_crank( pack, H_EARLY );
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_SPRINT );
+  fd_pack_end_block( pack );
+
+  /* A bundle that can never fit in this block drops the rest of the
+     block instead of stalling it.  Use up the per-account write budget
+     on Z with ordinary transactions first. */
+  ulong z_used = 0UL;
+  for(;;) {
+    ulong z_cost;
+    make_transaction( i, 1000000U, 500U, 10.0, "Z", "", NULL, &z_cost );
+    FD_TEST( z_cost>0UL );
+    if( z_used+z_cost>FD_PACK_TEST_MAX_WRITE_COST_PER_ACCT ) break; /* one more would not fit: exactly the state we want */
+    FD_TEST( insert( i++, pack )>=0 );
+    FD_TEST( h_sched( pack, 0UL, 0 )==1UL );
+    FD_TEST( fd_pack_microblock_complete( pack, 0UL ) );
+    z_used += z_cost;
+  }
+  slot++;
+  fd_pack_harmonic_reset( pack, slot, 0 ); fd_pack_set_initializer_bundles_ready( pack );
+  { char const * w[1] = { "Y" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 1UL, H_EARLY )>=0 ); }
+  { char const * w[1] = { "Z" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 1000000U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 2UL, H_EARLY )>=0 ); }
+  { char const * w[1] = { "W" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 3UL, H_EARLY )>=0 ); }
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_HARMONIC );
+  FD_TEST( h_sched( pack, 1UL, 1 )==1UL ); /* Y in flight on bank 1 */
+  /* Z cannot fit.  While Y is in flight its rebate could free room, so
+     Z waits at the head and W must not overtake it. */
+  FD_TEST( h_sched( pack, 0UL, 1 )==0UL );
+  FD_TEST( !fd_pack_harmonic_stopped( pack ) );
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==2UL );
+  FD_TEST( h_sched( pack, 0UL, 1 )==0UL );
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==2UL );
+  /* Nothing in flight any more: Z truly cannot fit, drop the rest. */
+  FD_TEST( fd_pack_microblock_complete( pack, 1UL ) );
+  FD_TEST( h_sched( pack, 0UL, 1 )==0UL );
+  FD_TEST( fd_pack_harmonic_stopped( pack ) );
+  FD_TEST( fd_pack_harmonic_end_flags( pack ) & FD_PACK_END_FLAG_HARMONIC_FAILED );
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==0UL );
+  FD_TEST( fd_pack_avail_txn_cnt( pack )==0UL );
+  FD_TEST( !fd_pack_verify( pack, pack_verify_scratch ) );
+  fd_pack_end_block( pack ); /* also resets the initializer bundle state */
+
+  /* Durable nonces: a block bundle displaces a pending fallback
+     transaction on the same nonce, but two block bundles on one nonce
+     cannot both land, so the second is refused and stops the block. */
+  slot++;
+  fd_pack_harmonic_reset( pack, slot, 0 ); fd_pack_set_initializer_bundles_ready( pack );
+  { ulong deleted;
+    fd_txn_e_t * txn = fd_pack_insert_txn_init( pack );
+    make_nonce_transaction1( txn->txnp, i++, 10.0, 5, 0, 'n' );
+    FD_TEST( fd_pack_insert_txn_fini( pack, txn, 1000UL, &deleted )==FD_PACK_INSERT_ACCEPT_NONCE_NONVOTE_ADD ); }
+  FD_TEST( fd_pack_avail_txn_cnt( pack )==1UL );
+  bundle = fd_pack_insert_bundle_init( pack, _bundle, 1UL );
+  make_nonce_transaction1( bundle[0]->txnp, h_signer++, 11.0, 5, 0, 'n' );
+  FD_TEST( h_fini( pack, bundle, 1UL, slot, 1UL, H_EARLY )==FD_PACK_INSERT_ACCEPT_NONCE_NONVOTE_REPLACE );
+  FD_TEST( fd_pack_avail_txn_cnt( pack )==1UL );
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==1UL );
+  bundle = fd_pack_insert_bundle_init( pack, _bundle, 1UL );
+  make_nonce_transaction1( bundle[0]->txnp, h_signer++, 11.0, 5, 0, 'n' );
+  FD_TEST( h_fini( pack, bundle, 1UL, slot, 2UL, H_EARLY )==FD_PACK_INSERT_REJECT_NONCE_PRIORITY );
+  FD_TEST( fd_pack_harmonic_stopped( pack ) );
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==1UL );
+  /* ... and neither a fallback transaction nor a fallback bundle on that
+     nonce may displace the pending block bundle */
+  { ulong deleted;
+    fd_txn_e_t * txn = fd_pack_insert_txn_init( pack );
+    make_nonce_transaction1( txn->txnp, i++, 13.0, 5, 0, 'n' );
+    FD_TEST( fd_pack_insert_txn_fini( pack, txn, 1000UL, &deleted )==FD_PACK_INSERT_REJECT_NONCE_PRIORITY );
+    bundle = fd_pack_insert_bundle_init( pack, _bundle, 1UL );
+    make_nonce_transaction1( bundle[0]->txnp, h_signer++, 13.0, 5, 0, 'n' );
+    FD_TEST( fd_pack_insert_bundle_fini( pack, bundle, 1UL, 1000UL, 0, NULL, &deleted )==FD_PACK_INSERT_REJECT_NONCE_PRIORITY ); }
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==1UL );
+  FD_TEST( fd_pack_avail_txn_cnt( pack )==1UL );
+  FD_TEST( h_sched( pack, 0UL, 1 )==1UL );
+  FD_TEST( fd_pack_microblock_complete( pack, 0UL ) );
+  FD_TEST( !fd_pack_verify( pack, pack_verify_scratch ) );
+  fd_pack_end_block( pack );
+
+  /* The crank is a real bundle: it is scheduled first, with revert
+     protection, and block bundles wait for it to land. */
+  slot++;
+  fd_pack_harmonic_reset( pack, slot, 0 );
+  { char const * w[1] = { "A" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 1UL, H_EARLY )>=0 ); }
+  FD_TEST( h_sched( pack, 0UL, 1 )==0UL ); /* initializer bundle required first */
+  { char const * w[1] = { "K" };
+    ulong deleted;
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( fd_pack_harmonic_insert_bundle_fini( pack, bundle, 1UL, 0UL, 1000UL, 1, NULL, H_EARLY, H_THRESHOLD, H_CUTOFF, &deleted )>=0 ); }
+  FD_TEST( h_sched( pack, 0UL, 1 )==1UL );
+  FD_TEST( outcome.results[0].txnp->flags & FD_TXN_P_FLAGS_BUNDLE             );
+  FD_TEST( outcome.results[0].txnp->flags & FD_TXN_P_FLAGS_INITIALIZER_BUNDLE );
+  FD_TEST( h_sched( pack, 1UL, 1 )==0UL ); /* crank pending */
+  FD_TEST( fd_pack_microblock_complete( pack, 0UL ) );
+  { union{ fd_pack_rebate_t rebate[1]; uchar footprint[USHORT_MAX]; } report[1];
+    memset( report, 0, sizeof(fd_pack_rebate_t) );
+    report->rebate->ib_result = 1;
+    fd_pack_rebate_cus( pack, report->rebate ); }
+  FD_TEST( h_sched( pack, 1UL, 1 )==1UL );
+  FD_TEST( !(outcome.results[0].txnp->flags & FD_TXN_P_FLAGS_BUNDLE) );
+  FD_TEST( fd_pack_microblock_complete( pack, 1UL ) );
+  FD_TEST( !fd_pack_verify( pack, pack_verify_scratch ) );
+  fd_pack_end_block( pack );
+}
+
 int
 main( int     argc,
       char ** argv ) {
@@ -1732,6 +2087,7 @@ main( int     argc,
   test_duplicate_sig();
   test_nonce();
   test_bundle_nonce();
+  test_harmonic();
   if( extra_benchmark ) {
     performance_test( extra_benchmark );
     performance_test2();
