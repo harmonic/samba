@@ -2059,6 +2059,108 @@ test_harmonic( void ) {
   FD_TEST( fd_pack_microblock_complete( pack, 1UL ) );
   FD_TEST( !fd_pack_verify( pack, pack_verify_scratch ) );
   fd_pack_end_block( pack );
+
+  /* Crank still admitted after a stop */
+  slot++;
+  fd_pack_harmonic_reset( pack, slot, 0 );
+  { char const * w[1] = { "A" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 1UL, H_EARLY )>=0 ); }
+  { char const * w[1] = { "B" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 3UL, H_EARLY )==FD_PACK_INSERT_REJECT_BLOCK_FAILED ); }
+  FD_TEST( fd_pack_harmonic_stopped( pack ) );
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==1UL );
+  FD_TEST( h_sched( pack, 0UL, 1 )==0UL ); /* initializer bundle required first */
+  { char const * w[1] = { "K" };
+    ulong deleted;
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( fd_pack_harmonic_insert_bundle_fini( pack, bundle, 1UL, 0UL, 1000UL, 1, NULL, H_EARLY, H_THRESHOLD, H_CUTOFF, &deleted )>=0 ); }
+  FD_TEST( h_sched( pack, 0UL, 1 )==1UL );
+  FD_TEST( outcome.results[0].txnp->flags & FD_TXN_P_FLAGS_INITIALIZER_BUNDLE );
+  FD_TEST( fd_pack_microblock_complete( pack, 0UL ) );
+  { union{ fd_pack_rebate_t rebate[1]; uchar footprint[USHORT_MAX]; } report[1];
+    memset( report, 0, sizeof(fd_pack_rebate_t) );
+    report->rebate->ib_result = 1;
+    fd_pack_rebate_cus( pack, report->rebate ); }
+  FD_TEST( h_sched( pack, 1UL, 1 )==1UL ); /* A runs */
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==0UL );
+  h_crank( pack, H_EARLY );
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_SPRINT );
+  FD_TEST( fd_pack_microblock_complete( pack, 1UL ) );
+  FD_TEST( !fd_pack_verify( pack, pack_verify_scratch ) );
+  fd_pack_end_block( pack );
+
+  /* Crank never arrives: pending bundles dropped at slot end */
+  slot++;
+  fd_pack_harmonic_reset( pack, slot, 0 );
+  { char const * w[1] = { "A" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 1UL, H_EARLY )>=0 ); }
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_HARMONIC );
+  FD_TEST( h_sched( pack, 0UL, 1 )==0UL );
+  fd_pack_harmonic_state_crank( pack, H_LATE, H_THRESHOLD, H_CUTOFF, 1, 0UL, 0UL, 1 );
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_SPRINT );
+  FD_TEST( fd_pack_harmonic_end_flags( pack ) & FD_PACK_END_FLAG_HARMONIC_FAILED );
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==0UL );
+  FD_TEST( fd_pack_avail_txn_cnt( pack )==0UL );
+  fd_pack_harmonic_state_crank( pack, H_LATE, H_THRESHOLD, H_CUTOFF, 1, 0UL, 0UL, 1 );
+  FD_TEST( fd_pack_harmonic_done( pack ) );
+  FD_TEST( !fd_pack_verify( pack, pack_verify_scratch ) );
+  fd_pack_end_block( pack );
+
+  /* Stopped while UNDECIDED: leave immediately */
+  slot++;
+  fd_pack_harmonic_reset( pack, slot, 1 ); fd_pack_set_initializer_bundles_ready( pack );
+  { char const * w[1] = { "A" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 2UL, H_EARLY )==FD_PACK_INSERT_REJECT_BLOCK_FAILED ); }
+  FD_TEST( fd_pack_harmonic_stopped( pack ) );
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_UNDECIDED );
+  h_crank( pack, H_EARLY );
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_VOTE_ONLY );
+  fd_pack_end_block( pack );
+
+  /* Stale revert from the previous slot is ignored */
+  slot++;
+  fd_pack_harmonic_reset( pack, slot, 0 ); fd_pack_set_initializer_bundles_ready( pack );
+  { char const * w[1] = { "A" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 1UL, H_EARLY )>=0 ); }
+  FD_TEST( h_sched( pack, 0UL, 1 )==1UL ); /* A in flight on bank 0 when the slot ends */
+  fd_pack_end_block( pack );
+  slot++;
+  fd_pack_harmonic_reset( pack, slot, 0 ); fd_pack_set_initializer_bundles_ready( pack );
+  { char const * w[1] = { "B" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini( pack, bundle, 1UL, slot, 1UL, H_EARLY )>=0 ); }
+  fd_pack_harmonic_bank_failed( pack, 0UL ); /* stale completion of A */
+  FD_TEST( !fd_pack_harmonic_stopped( pack ) );
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_HARMONIC );
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==1UL );
+  FD_TEST( h_sched( pack, 0UL, 1 )==1UL );
+  FD_TEST( fd_pack_microblock_complete( pack, 0UL ) );
+  FD_TEST( !fd_pack_verify( pack, pack_verify_scratch ) );
+  fd_pack_end_block( pack );
+
+  /* Nonce displacement deletes the whole fallback bundle */
+  slot++;
+  fd_pack_harmonic_reset( pack, slot, 0 ); fd_pack_set_initializer_bundles_ready( pack );
+  { ulong deleted;
+    bundle = fd_pack_insert_bundle_init( pack, _bundle, 2UL );
+    make_nonce_transaction1( bundle[0]->txnp, h_signer++, 10.0, 5, 0, 'm' );
+    make_transaction1     ( bundle[1]->txnp, h_signer++, 500U, 500U, 10.0, "Q", "", NULL, NULL );
+    FD_TEST( fd_pack_insert_bundle_fini( pack, bundle, 2UL, 1000UL, 0, NULL, &deleted )>=0 ); }
+  FD_TEST( fd_pack_avail_txn_cnt( pack )==2UL );
+  bundle = fd_pack_insert_bundle_init( pack, _bundle, 1UL );
+  make_nonce_transaction1( bundle[0]->txnp, h_signer++, 11.0, 5, 0, 'm' );
+  FD_TEST( h_fini( pack, bundle, 1UL, slot, 1UL, H_EARLY )==FD_PACK_INSERT_ACCEPT_NONCE_NONVOTE_REPLACE );
+  FD_TEST( fd_pack_avail_txn_cnt( pack )==1UL ); /* only the block bundle remains */
+  FD_TEST( fd_pack_harmonic_pending_cnt( pack )==1UL );
+  FD_TEST( !fd_pack_verify( pack, pack_verify_scratch ) );
+  FD_TEST( h_sched( pack, 0UL, 1 )==1UL );
+  FD_TEST( fd_pack_microblock_complete( pack, 0UL ) );
+  fd_pack_end_block( pack );
 }
 
 int
