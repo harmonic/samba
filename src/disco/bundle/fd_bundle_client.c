@@ -1163,6 +1163,14 @@ fd_bundle_client_grpc_rx_end(
     break;
   case FD_BUNDLE_CLIENT_REQ_SetStrategy:
     ctx->set_strategy_wait = 0;
+    /* Engine does not support SetStrategy; continue without it */
+    if( FD_UNLIKELY( resp->grpc_status!=FD_GRPC_STATUS_OK &&
+                     resp->grpc_status!=FD_GRPC_STATUS_UNAUTHENTICATED &&
+                     resp->grpc_status!=FD_GRPC_STATUS_PERMISSION_DENIED ) ) {
+      FD_LOG_WARNING(( "SetStrategy rejected by block engine (gRPC status %u-%s), continuing without it",
+                       resp->grpc_status, fd_grpc_status_cstr( resp->grpc_status ) ));
+      ctx->set_strategy_done = 1;
+    }
     break;
   default:
     break;
@@ -1546,6 +1554,9 @@ fd_bundle_client_handle_block_batch(
   if( FD_UNLIKELY( !pb_decode( istream, &block_engine_SubscribeBundlesResponse_msg, &res ) ) ) {
     ctx->metrics.decode_fail_cnt++;
     FD_LOG_WARNING(( "Protobuf decode of (block_engine.SubscribeBundlesResponse) for blocks failed: %s", istream->errmsg ));
+    /* Later bundles in this message were dropped without a seq
+       number; reset so the seq is tainted */
+    ctx->defer_reset = 1;
     return;
   }
 }
@@ -1871,9 +1882,7 @@ fd_bundle_tpu_client_step1( fd_bundle_tile_t * ctx,
   reconnect_tpu:
     sleep_start = fd_bundle_now( ctx );
     if( FD_UNLIKELY( sleep_start < ctx->tpu_backoff_until ) ) {
-      long wait_dur = ctx->tpu_backoff_until - sleep_start;
-      FD_LOG_DEBUG(( "TPU endpoint backoff wait (+%.2fs)", (double)wait_dur/1e9 ));
-      fd_log_sleep( fd_long_min( wait_dur, 1e6 ) );
+      /* Do not sleep here: the block stream must not stall */
       return;
     }
     FD_LOG_INFO(( "TPU endpoint attempting reconnect" ));

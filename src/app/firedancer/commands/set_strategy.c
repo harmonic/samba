@@ -94,9 +94,11 @@ set_strategy_cmd_fn( args_t *   args,
     return;
   }
 
+  /* The tile owns defer_reset (a bitfield), so signal it via strategy_seq */
   FD_COMPILER_MFENCE();
-  bundle_ctx->strategy    = new_strategy;
-  bundle_ctx->defer_reset = 1;
+  FD_VOLATILE( bundle_ctx->strategy ) = new_strategy;
+  FD_COMPILER_MFENCE();
+  FD_VOLATILE( bundle_ctx->strategy_seq ) = FD_VOLATILE_CONST( bundle_ctx->strategy_seq )+1UL;
   FD_COMPILER_MFENCE();
 
   ulong pack_tile_idx = fd_topo_find_tile( &config->topo, "pack", 0UL );
