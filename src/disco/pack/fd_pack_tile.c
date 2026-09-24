@@ -877,6 +877,8 @@ after_credit( fd_pack_ctx_t *     ctx,
         /* Already logged a warning in this case */
         fd_pack_insert_bundle_cancel( ctx->pack, bundle, 1UL );
         ctx->crank->metrics[ 2 ]++; /* BUNDLE_CRANK_RESULT_CREATION_FAILED' */
+        /* Harmonic: the block cannot execute without the crank */
+        if( FD_UNLIKELY( harmonic_crank ) ) fd_pack_harmonic_abort( ctx->pack, FD_PACK_END_FLAG_HARMONIC_FAILED );
       }
     }
   }
@@ -1347,7 +1349,19 @@ after_frag( fd_pack_ctx_t *     ctx,
     ctx->harmonic_threshold_ns = ctx->slot_start_ns + slot_dur/2L;
     ctx->harmonic_cutoff_ns    = ctx->slot_end_ns - (long)FD_PACK_HARMONIC_VOTE_TAIL_NS;
 
-    /* Reset harmonic state for new slot.
+    fd_pack_limits_t limits[ 1 ];
+    limits->max_cost_per_block = ctx->limits.slot_max_cost;
+    limits->max_data_bytes_per_block = ctx->slot_max_data;
+    limits->max_microblocks_per_block = ctx->slot_max_microblocks;
+    limits->max_vote_cost_per_block = ctx->limits.slot_max_vote_cost;
+    limits->max_write_cost_per_acct = ctx->limits.slot_max_write_cost_per_acct;
+    limits->max_txn_per_microblock = ULONG_MAX; /* unused */
+    limits->max_allocated_data_per_block = ctx->limits.slot_max_allocated_data_per_block;
+    fd_pack_set_block_limits( ctx->pack, limits );
+    fd_pack_pacing_update_consumed_cus( ctx->pacer, fd_pack_current_block_cost( ctx->pack ), now );
+
+    /* Reset harmonic state for new slot.  Must follow
+       fd_pack_set_block_limits, whose vote limit the reset throttles.
        Note: pack's acct_in_use is cleared by fd_pack_end_block, so we don't
        need to explicitly clear account locks here.
        Set harmonic_block_slot to leader_slot so block txns for other slots are dropped. */
@@ -1364,17 +1378,6 @@ after_frag( fd_pack_ctx_t *     ctx,
                     ctx->harmonic_threshold_ns, ctx->harmonic_cutoff_ns,
                     ctx->_became_leader->leader_next_slot ));
     }
-
-    fd_pack_limits_t limits[ 1 ];
-    limits->max_cost_per_block = ctx->limits.slot_max_cost;
-    limits->max_data_bytes_per_block = ctx->slot_max_data;
-    limits->max_microblocks_per_block = ctx->slot_max_microblocks;
-    limits->max_vote_cost_per_block = ctx->limits.slot_max_vote_cost;
-    limits->max_write_cost_per_acct = ctx->limits.slot_max_write_cost_per_acct;
-    limits->max_txn_per_microblock = ULONG_MAX; /* unused */
-    limits->max_allocated_data_per_block = ctx->limits.slot_max_allocated_data_per_block;
-    fd_pack_set_block_limits( ctx->pack, limits );
-    fd_pack_pacing_update_consumed_cus( ctx->pacer, fd_pack_current_block_cost( ctx->pack ), now );
 
     break;
   }
