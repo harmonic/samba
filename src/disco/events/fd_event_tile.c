@@ -330,6 +330,9 @@ after_frag( fd_event_tile_t *   ctx,
         case FD_TXN_M_TPU_SOURCE_GOSSIP: protocol = 3; break;
         case FD_TXN_M_TPU_SOURCE_BUNDLE: protocol = 4; break;
         case FD_TXN_M_TPU_SOURCE_TXSEND: protocol = 5; break;
+        /* Harmonic sources map to the closest existing variant */
+        case FD_TXN_M_TPU_SOURCE_HARMONIC: protocol = 4; break;
+        case FD_TXN_M_TPU_SOURCE_HTPU:     protocol = 1; break;
         default:
           FD_LOG_ERR(( "unexpected source_tpu %u", txnm->source_tpu ));
       }
