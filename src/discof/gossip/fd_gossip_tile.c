@@ -339,7 +339,13 @@ handle_tpu_update( fd_gossip_tile_ctx_t *             ctx,
      When connected to a remote relayer, we advertise the remote TPU address
      so other validators send transactions there. When disconnected, we
      revert to our local TPU address. */
-  if( msg->status == FD_BUNDLE_TPU_UPDATE_CONNECTED ) {
+  /* Treat a zero relayer address as disconnected */
+  int addrs_valid = msg->tpu_ip4_addr && msg->tpu_port && msg->tpu_fwd_ip4_addr && msg->tpu_fwd_port;
+  if( FD_UNLIKELY( msg->status == FD_BUNDLE_TPU_UPDATE_CONNECTED && !addrs_valid ) ) {
+    FD_LOG_WARNING(( "TPU relayer returned an invalid TPU address, advertising local TPU instead" ));
+  }
+
+  if( msg->status == FD_BUNDLE_TPU_UPDATE_CONNECTED && addrs_valid ) {
     /* Update TPU addresses to remote endpoint.
        Port values in contact_info are stored in network byte order. */
     ushort tpu_port_nbo         = fd_ushort_bswap( msg->tpu_port );
