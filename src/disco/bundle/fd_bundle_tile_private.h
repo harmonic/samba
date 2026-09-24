@@ -184,6 +184,8 @@ struct fd_bundle_tile {
 
   /* Scheduling strategy selection */
   int   strategy;               /* block_engine_SchedulingStrategy value */
+  ulong strategy_seq;           /* bumped by the set-strategy command */
+  ulong strategy_seq_applied;   /* last strategy_seq acted on */
   uchar set_strategy_done : 1;  /* SetStrategy RPC succeeded for this connection */
   uchar set_strategy_wait : 1;  /* Request already in-flight? */
 
@@ -298,6 +300,11 @@ struct fd_bundle_tile {
   /* TPU status for gossip updates */
   uchar tpu_status_recent;  /* most recently observed TPU status */
   uchar tpu_status_gossip;  /* last TPU status sent to gossip link */
+  /* TPU address last sent to gossip */
+  uint   tpu_gossip_tpu_ip4_addr;
+  ushort tpu_gossip_tpu_port;
+  uint   tpu_gossip_tpu_fwd_ip4_addr;
+  ushort tpu_gossip_tpu_fwd_port;
 
   /* ========== Harmonic block mode  ========== */
 

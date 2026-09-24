@@ -325,6 +325,13 @@ before_credit( fd_bundle_tile_t *  ctx,
 
   if( FD_UNLIKELY( ctx->halt_signing ) ) return;
 
+  /* set-strategy changed the strategy; reconnect to resend it */
+  ulong strategy_seq = FD_VOLATILE_CONST( ctx->strategy_seq );
+  if( FD_UNLIKELY( strategy_seq!=ctx->strategy_seq_applied ) ) {
+    ctx->strategy_seq_applied = strategy_seq;
+    ctx->defer_reset          = 1;
+  }
+
   if( FD_UNLIKELY( ctx->sleep_mode ) ) {
     if( ctx->tcp_sock>=0 ) {
       fd_bundle_client_reset( ctx );
@@ -497,7 +504,7 @@ after_credit( fd_bundle_tile_t *  ctx,
   }
 
   /* Drive the TPU endpoint if enabled */
-  if( FD_UNLIKELY( ctx->tpu_conn_enabled ) ) {
+  if( FD_UNLIKELY( ctx->tpu_conn_enabled && !ctx->halt_signing ) ) {
     fd_bundle_tpu_client_step( ctx, charge_busy );
   }
 
@@ -511,9 +518,19 @@ after_credit( fd_bundle_tile_t *  ctx,
 
   /* Publish TPU status updates to gossip link */
   if( ctx->gossip_out.mem ) {
-    if( FD_UNLIKELY( ctx->tpu_status_recent != ctx->tpu_status_gossip ) ) {
+    int connected    = ctx->tpu_status_recent==FD_BUNDLE_STATE_CONNECTED;
+    int addr_changed = connected &&
+                       ( ctx->tpu_gossip_tpu_ip4_addr     != ctx->tpu_config_tpu_ip4_addr     ||
+                         ctx->tpu_gossip_tpu_port         != ctx->tpu_config_tpu_port         ||
+                         ctx->tpu_gossip_tpu_fwd_ip4_addr != ctx->tpu_config_tpu_fwd_ip4_addr ||
+                         ctx->tpu_gossip_tpu_fwd_port     != ctx->tpu_config_tpu_fwd_port );
+    if( FD_UNLIKELY( ctx->tpu_status_recent != ctx->tpu_status_gossip || addr_changed ) ) {
       fd_bundle_tile_publish_tpu_update( ctx, stem );
-      ctx->tpu_status_gossip = ctx->tpu_status_recent;
+      ctx->tpu_status_gossip           = ctx->tpu_status_recent;
+      ctx->tpu_gossip_tpu_ip4_addr     = ctx->tpu_config_tpu_ip4_addr;
+      ctx->tpu_gossip_tpu_port         = ctx->tpu_config_tpu_port;
+      ctx->tpu_gossip_tpu_fwd_ip4_addr = ctx->tpu_config_tpu_fwd_ip4_addr;
+      ctx->tpu_gossip_tpu_fwd_port     = ctx->tpu_config_tpu_fwd_port;
       *charge_busy = 1;
     }
   }
@@ -845,6 +862,12 @@ unprivileged_init( fd_topo_t const *      topo,
   if( !has_replay_in ) memset( &ctx->replay_in, 0, sizeof(ctx->replay_in) );
 
   ctx->tpu_status_gossip = 127;  /* Force initial update */
+  ctx->tpu_gossip_tpu_ip4_addr     = 0U;
+  ctx->tpu_gossip_tpu_port         = 0;
+  ctx->tpu_gossip_tpu_fwd_ip4_addr = 0U;
+  ctx->tpu_gossip_tpu_fwd_port     = 0;
+  ctx->strategy_seq                = 0UL;
+  ctx->strategy_seq_applied        = 0UL;
   ctx->tpu_status_recent = FD_BUNDLE_STATE_DISCONNECTED;
 
   fd_bundle_tile_parse_endpoint( ctx, tile );
