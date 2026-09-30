@@ -7,6 +7,7 @@
 #include "packet.pb.h"
 #include "shared.pb.h"
 #include "bundle.pb.h"
+#include "block.pb.h"
 #include "timestamp.pb.h"
 
 #if PB_PROTO_HEADER_VERSION != 40

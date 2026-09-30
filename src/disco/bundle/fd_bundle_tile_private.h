@@ -37,6 +37,7 @@ typedef struct {
   ulong  bundle_txn_cnt; /* txns in this bundle, in [1, FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE] */
   uchar  commission;
   uchar  commission_pubkey[ 32 ];
+  uchar  revert_protected; /* 0 for a standalone block txn */
   uchar  payload[ FD_TXN_MTU ];
 } fd_bundle_harmonic_staged_txn_t;
 
@@ -314,14 +315,13 @@ struct fd_bundle_tile {
   uchar harmonic_block_subscription_live : 1;
   uchar harmonic_block_subscription_wait : 1;
 
-  /* Harmonic block state.  A block is streamed as a sequence of bundles
-     (BundleUuid messages whose uuid is the slot).  harmonic_block_seq
-     numbers the bundles within the current block starting at 1 and is
-     reset whenever the slot changes; pack uses it to detect a dropped
-     bundle. */
+  /* Harmonic block state.  A block is streamed as block.Block messages
+     whose transactions form bundles (a standalone transaction is a
+     bundle of one).  harmonic_block_seq numbers the bundles within the
+     current block starting at 1 and is reset whenever the slot changes;
+     pack uses it to detect a dropped bundle. */
   ulong harmonic_block_seq;
-  ulong harmonic_block_txn_cnt;
-  ulong harmonic_block_slot;  /* Current block's slot (parsed from uuid) */
+  ulong harmonic_block_slot;  /* Current block's slot */
   /* Set when the connection is reset, cleared when we become leader.  A
      reset between became_leader and the end of that slot may have lost
      bundles we cannot account for, so the next block's numbering starts
@@ -339,20 +339,13 @@ struct fd_bundle_tile {
      published order.  Sized to bundle.out_depth so a single fd_h2_rx
      pass (bounded by rbuf_rx) cannot overflow it.
 
-     Per-entry bundle_id/bundle_txn_cnt/commission/commission_pubkey
-     allow multiple bundles to coexist in the staging buffer when the
-     server pipelines BundleUuids across one or more gRPC messages
-     decoded in the same I/O turn.  after_credit publishes whole
-     bundles only, never a prefix of one.
-
-     harmonic_staged_bundle_id/_txn_cnt are the metadata of the bundle
-     currently being decoded, snapshotted for the per-txn stage
-     callback. */
+     Per-entry bundle metadata allows multiple bundles to coexist in the
+     staging buffer when several Blocks are decoded in the same I/O
+     turn.  after_credit publishes whole bundles only, never a prefix of
+     one. */
   fd_bundle_harmonic_staged_txn_t * harmonic_staging;
   ulong                             harmonic_staging_max;
   ulong                             harmonic_pending_len;
-  ulong                             harmonic_staged_bundle_id;
-  ulong                             harmonic_staged_bundle_txn_cnt;
 
   /* PoH became_leader message */
   fd_became_leader_t _became_leader[1];
@@ -367,7 +360,7 @@ typedef struct fd_bundle_tile fd_bundle_tile_t;
 #define FD_BUNDLE_CLIENT_REQ_Bundle_GetBlockBuilderFeeInfo      6
 
 /* Harmonic block endpoint request context IDs */
-#define FD_BUNDLE_CLIENT_REQ_SubscribeBlocks                    7
+#define FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2                   7
 /* Leader window info submission */
 #define FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo             8
 

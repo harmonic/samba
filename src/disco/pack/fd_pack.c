@@ -1643,7 +1643,8 @@ insert_bundle_fini_impl( fd_pack_t          * pack,
                          int                  initializer_bundle,
                          void         const * bundle_meta,
                          ulong              * delete_cnt,
-                         int                  harmonic ) {
+                         int                  harmonic,
+                         int                  revert_protected ) {
 
   int err = 0;
   *delete_cnt = 0UL;
@@ -1902,10 +1903,10 @@ insert_bundle_fini_impl( fd_pack_t          * pack,
      x+1) which is x++ */
   *rel_idx = fd_ulong_max( bundle_idx+1UL, *rel_idx );
 
-  if( FD_UNLIKELY( harmonic & (txn_cnt==1UL) & !initializer_bundle ) ) {
-    /* A block bundle of one may be a plain transaction that is allowed
-       to fail, so it executes without revert protection.  It still
-       keeps its place in the block FIFO. */
+  if( FD_UNLIKELY( harmonic & !revert_protected & !initializer_bundle ) ) {
+    /* A standalone block transaction is allowed to fail, so it executes
+       without revert protection.  It still keeps its place in the block
+       FIFO. */
     bundle[ 0 ]->txnp->flags &= ~FD_TXN_P_FLAGS_BUNDLE;
   }
 
@@ -1920,7 +1921,7 @@ fd_pack_insert_bundle_fini( fd_pack_t          * pack,
                             int                  initializer_bundle,
                             void         const * bundle_meta,
                             ulong              * delete_cnt ) {
-  return insert_bundle_fini_impl( pack, bundle, txn_cnt, expires_at, initializer_bundle, bundle_meta, delete_cnt, 0 );
+  return insert_bundle_fini_impl( pack, bundle, txn_cnt, expires_at, initializer_bundle, bundle_meta, delete_cnt, 0, 1 );
 }
 static inline void
 insert_bundle_impl( fd_pack_t           * pack,
@@ -2848,8 +2849,8 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
   if( FD_UNLIKELY( harmonic && pack->harmonic_decision==HARMONIC_MODE_HARMONIC ) ) {
     /* Block bundles are scheduled exactly like regular bundles: one
        bundle per microblock, FIFO with head-of-line blocking, so the
-       stream order is honored by construction.  Nothing else is
-       scheduled while the block is executing. */
+       stream order is honored by construction.  Only votes, and only in
+       the vote tail, are scheduled alongside them. */
     if( FD_UNLIKELY( pack->initializer_bundle_state==FD_PACK_IB_STATE_FAILED ) ) {
       fd_pack_harmonic_abort( pack, FD_PACK_END_FLAG_HARMONIC_FAILED );
       return 0UL;
@@ -2880,8 +2881,13 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
       } else {
         fd_pack_harmonic_abort( pack, FD_PACK_END_FLAG_HARMONIC_FAILED );
       }
+      return 0UL;
     }
-    return 0UL;
+    /* No block bundle is ready: fill the bank with votes if the pack
+       tile allows them (the vote tail).  Votes take account locks like
+       any microblock, so block bundles still run in stream order. */
+    if( !(schedule_flags & FD_PACK_SCHEDULE_VOTE) ) return 0UL;
+    schedule_flags = FD_PACK_SCHEDULE_VOTE;
   }
 
   /* TODO: Decide if these are exactly how we want to handle limits */
@@ -3078,6 +3084,7 @@ fd_pack_harmonic_insert_bundle_fini( fd_pack_t          * pack,
                                      fd_txn_e_t * const * bundle,
                                      ulong                txn_cnt,
                                      ulong                bundle_id,
+                                     int                  revert_protected,
                                      ulong                expires_at,
                                      int                  initializer_bundle,
                                      void         const * bundle_meta,
@@ -3134,7 +3141,7 @@ fd_pack_harmonic_insert_bundle_fini( fd_pack_t          * pack,
     return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
   }
 
-  int result = insert_bundle_fini_impl( pack, bundle, txn_cnt, expires_at, initializer_bundle, bundle_meta, delete_cnt, 1 );
+  int result = insert_bundle_fini_impl( pack, bundle, txn_cnt, expires_at, initializer_bundle, bundle_meta, delete_cnt, 1, revert_protected );
   if( FD_UNLIKELY( result<0 ) ) {
     /* The bundle was cancelled by the insert.  Everything pending is
        earlier in the block and still executes; nothing later may.  If

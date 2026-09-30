@@ -1537,11 +1537,9 @@ telemetry = true
         # this option to 'false'.
         tls_cert_verify = true
 
-        # If set to true, enables a third stream (SubscribeBlocks) on the same
-        # bundle connection.  Block subscriptions are tagged with the intended
-        # slot rather than bundle_id:string, and have no len=5 transaction limit.
-        # Normal bundle subscriptions (len<=5) remain active when harmonic_block_mode
-        # is enabled.
+        # If set to true, enables a third stream (SubscribeBlocks2) on the same
+        # bundle connection for harmonic blocks.  Normal bundle subscriptions
+        # remain active.
         harmonic_block_mode = false
 
         # Scheduling strategy to pass to the block engine.  Accepted values:

@@ -209,7 +209,7 @@ FD_FN_UNUSED static void
 test_bundle_env_mock_harmonic_block_stream( fd_bundle_tile_t * ctx ) {
   ctx->harmonic_block_subscription_live = 1;
 
-  fd_grpc_h2_stream_t * stream = fd_grpc_client_stream_acquire( ctx->grpc_client, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks );
+  fd_grpc_h2_stream_t * stream = fd_grpc_client_stream_acquire( ctx->grpc_client, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2 );
   FD_TEST( stream );
   stream->hdrs.h2_status     = 200;
   stream->hdrs.is_grpc_proto = 1;

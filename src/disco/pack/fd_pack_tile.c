@@ -199,9 +199,11 @@ typedef struct {
      slot_max_microblocks.  Consumed by after_credit which publishes
      the updated bound to POH over the pack_poh link. */
   int pending_reduce_mb_bound;
-  /* harmonic_cutoff_ns = slot_end_ns - FD_PACK_HARMONIC_VOTE_TAIL_NS: last
-     time a harmonic block txn may arrive; tail is vote/sprint. */
+  /* harmonic_cutoff_ns = slot_end_ns: last time a harmonic block txn may
+     arrive.  harmonic_vote_ns = slot_end_ns - FD_PACK_HARMONIC_VOTE_TAIL_NS:
+     from then on votes interleave with block bundles. */
   long harmonic_cutoff_ns;
+  long harmonic_vote_ns;
 
   /* pacer is used for pacing CUs through the slot, i.e. deciding when
      to schedule a microblock given the number of CUs that have been
@@ -275,6 +277,7 @@ typedef struct {
     ulong txn_received;
     ulong min_blockhash_slot;
     int   is_harmonic;     /* Harmonic: bundle came from the block stream */
+    int   revert_protected; /* Harmonic: 0 for a standalone block txn */
     fd_txn_e_t * _txn[ FD_PACK_MAX_TXN_PER_BUNDLE ];
     fd_txn_e_t * const * bundle; /* points to _txn when non-NULL */
   } current_bundle[1];
@@ -843,7 +846,7 @@ after_credit( fd_pack_ctx_t *     ctx,
         if( !harmonic_crank ) {
           retval = fd_pack_insert_bundle_fini( ctx->pack, bundle, 1UL, ctx->leader_slot-1UL, 1, NULL, &deleted );
         } else {
-          retval = fd_pack_harmonic_insert_bundle_fini( ctx->pack, bundle, 1UL, 0UL, ctx->leader_slot-1UL, 1, NULL,
+          retval = fd_pack_harmonic_insert_bundle_fini( ctx->pack, bundle, 1UL, 0UL, 1, ctx->leader_slot-1UL, 1, NULL,
                                                         fd_clock_tile_now( ctx->clock ), ctx->harmonic_threshold_ns, ctx->harmonic_cutoff_ns, &deleted );
         }
         FD_MCNT_INC( PACK, TXN_DELETED, deleted );
@@ -910,6 +913,12 @@ after_credit( fd_pack_ctx_t *     ctx,
                                         | fd_int_if( i<pacing_execle_cnt, FD_PACK_SCHEDULE_TXN,    0 );
           break;
       }
+    }
+
+    /* Harmonic: votes join the block's bundles only in the vote tail */
+    if( FD_UNLIKELY( ctx->harmonic && fd_pack_harmonic_state( ctx->pack )==HARMONIC_MODE_HARMONIC &&
+                     fd_clock_tile_now( ctx->clock )<ctx->harmonic_vote_ns ) ) {
+      flags &= ~FD_PACK_SCHEDULE_VOTE;
     }
 
     fd_pack_out_ctx_t * execle_out = &ctx->execle_out[ i ];
@@ -1138,6 +1147,7 @@ during_frag( fd_pack_ctx_t * ctx,
         ctx->current_bundle->min_blockhash_slot = ULONG_MAX;
         ctx->current_bundle->txn_received       = 0UL;
         ctx->current_bundle->is_harmonic        = source_tpu==FD_TXN_M_TPU_SOURCE_HARMONIC;
+        ctx->current_bundle->revert_protected   = txnm->block_engine.revert_protected;
 
         if( FD_UNLIKELY( ctx->current_bundle->txn_cnt==0UL ) ) {
           FD_MCNT_INC( PACK, TXN_PARTIAL_BUNDLE, 1UL );
@@ -1347,7 +1357,8 @@ after_frag( fd_pack_ctx_t *     ctx,
     long slot_dur = ctx->slot_end_ns - ctx->slot_start_ns;
     if( FD_UNLIKELY( slot_dur < 0L ) ) slot_dur = 0L;
     ctx->harmonic_threshold_ns = ctx->slot_start_ns + slot_dur/2L;
-    ctx->harmonic_cutoff_ns    = ctx->slot_end_ns - (long)FD_PACK_HARMONIC_VOTE_TAIL_NS;
+    ctx->harmonic_cutoff_ns    = ctx->slot_end_ns;
+    ctx->harmonic_vote_ns      = ctx->slot_end_ns - (long)FD_PACK_HARMONIC_VOTE_TAIL_NS;
 
     fd_pack_limits_t limits[ 1 ];
     limits->max_cost_per_block = ctx->limits.slot_max_cost;
@@ -1405,6 +1416,7 @@ after_frag( fd_pack_ctx_t *     ctx,
         int result;
         if( FD_UNLIKELY( ctx->harmonic & ctx->current_bundle->is_harmonic ) ) {
           result = fd_pack_harmonic_insert_bundle_fini( ctx->pack, ctx->current_bundle->bundle, ctx->current_bundle->txn_cnt, ctx->current_bundle->id,
+                                                        ctx->current_bundle->revert_protected,
                                                         ctx->current_bundle->min_blockhash_slot, 0, ctx->blk_engine_cfg, fd_clock_tile_now( ctx->clock ),
                                                         ctx->harmonic_threshold_ns, ctx->harmonic_cutoff_ns, &deleted );
         } else {

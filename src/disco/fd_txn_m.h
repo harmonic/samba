@@ -76,7 +76,12 @@ struct fd_txn_m {
     uchar commission;
     uchar commission_pubkey[ 32 ];
 
-    /* alignof is 8, so 7 bytes of padding here */
+    /* Harmonic: 1 for a block stream bundle, 0 for a standalone block
+       transaction.  Travels with every txn of the bundle; only pack
+       reads it, to decide revert protection. */
+    uchar revert_protected;
+
+    /* alignof is 8, so 6 bytes of padding here */
 
   } block_engine;
 

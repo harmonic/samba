@@ -435,9 +435,10 @@ after_credit( fd_bundle_tile_t *  ctx,
           .source_tpu     = FD_TXN_M_TPU_SOURCE_HARMONIC,
           .first_seen_nanos = s->first_seen_nanos,
           .block_engine   = {
-            .bundle_id      = s->bundle_id,
-            .bundle_txn_cnt = s->bundle_txn_cnt,
-            .commission     = s->commission,
+            .bundle_id        = s->bundle_id,
+            .bundle_txn_cnt   = s->bundle_txn_cnt,
+            .commission       = s->commission,
+            .revert_protected = s->revert_protected,
           },
         };
         fd_memcpy( txnm->block_engine.commission_pubkey, s->commission_pubkey, 32UL );

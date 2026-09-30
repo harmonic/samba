@@ -4,6 +4,7 @@
 #include "fd_bundle_auth.h"
 #include "fd_bundle_tile_private.h"
 #include "fd_bundle_tile.h"
+#include "proto/block.pb.h"
 #include "proto/block_engine.pb.h"
 #include "proto/bundle.pb.h"
 #include "proto/packet.pb.h"
@@ -29,7 +30,7 @@
 
 
 /* Forward declarations for harmonic block handlers */
-static void fd_bundle_client_handle_block_batch( fd_bundle_tile_t * ctx, pb_istream_t * istream );
+static void fd_bundle_client_handle_block( fd_bundle_tile_t * ctx, pb_istream_t * istream );
 
 __attribute__((weak)) long
 fd_bundle_now( fd_bundle_tile_t const * ctx ) {
@@ -59,8 +60,6 @@ fd_bundle_client_reset( fd_bundle_tile_t * ctx ) {
   ctx->harmonic_block_subscription_live = 0;
   ctx->harmonic_block_subscription_wait = 0;
   ctx->harmonic_pending_len             = 0UL;
-  ctx->harmonic_staged_bundle_id        = 0UL;
-  ctx->harmonic_staged_bundle_txn_cnt   = 0UL;
   ctx->harmonic_block_seq               = 0UL;
   ctx->harmonic_block_slot              = 0UL;
   ctx->harmonic_seq_tainted             = 1;
@@ -291,8 +290,8 @@ fd_bundle_client_subscribe_bundles( fd_bundle_tile_t * ctx ) {
   ctx->bundle_subscription_wait = 1;
 }
 
-/* Subscribe to harmonic blocks: a stream of bundles whose uuid is the
-   slot as a decimal string. */
+/* Subscribe to harmonic blocks: a stream of block.Block messages whose
+   transactions carry explicit bundle boundaries. */
 static void
 fd_bundle_client_subscribe_blocks( fd_bundle_tile_t * ctx ) {
   if( FD_UNLIKELY( fd_grpc_client_request_is_blocked( ctx->grpc_client ) ) ) return;
@@ -302,11 +301,11 @@ fd_bundle_client_subscribe_blocks( fd_bundle_tile_t * ctx ) {
   fd_cstr_printf( req.version,     sizeof(req.version),     NULL, "%s", fd_version_cstr    );
   fd_cstr_printf( req.commit_hash, sizeof(req.commit_hash), NULL, "%s", fd_commit_ref_cstr );
 
-  static char const path[] = "/block_engine.BlockEngineValidator/SubscribeBlocks";
+  static char const path[] = "/block_engine.BlockEngineValidator/SubscribeBlocks2";
   fd_grpc_h2_stream_t * request = fd_grpc_client_request_start(
       ctx->grpc_client,
       path, sizeof(path)-1,
-      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks,
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2,
       &block_engine_SubscribeBlocksRequest_msg, &req,
       ctx->auther.access_token, ctx->auther.access_token_sz,
       0 /* is_streaming */
@@ -1007,7 +1006,7 @@ fd_bundle_client_grpc_rx_start(
     ctx->bundle_subscription_live = 1;
     ctx->bundle_subscription_wait = 0;
     break;
-  case FD_BUNDLE_CLIENT_REQ_SubscribeBlocks:
+  case FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2:
     ctx->harmonic_block_subscription_live = 1;
     ctx->harmonic_block_subscription_wait = 0;
     FD_LOG_INFO(( "Block subscription stream started" ));
@@ -1050,8 +1049,8 @@ fd_bundle_client_grpc_rx_msg(
   case FD_BUNDLE_CLIENT_REQ_Bundle_GetBlockBuilderFeeInfo:
     fd_bundle_client_handle_builder_fee_info( ctx, &istream );
     break;
-  case FD_BUNDLE_CLIENT_REQ_SubscribeBlocks:
-    fd_bundle_client_handle_block_batch( ctx, &istream );
+  case FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2:
+    fd_bundle_client_handle_block( ctx, &istream );
     break;
   case FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo: {
     /* Handle SubmitLeaderWindowInfoResponse (empty response) */
@@ -1101,7 +1100,7 @@ fd_bundle_client_request_failed( fd_bundle_tile_t * ctx,
     ctx->bundle_subscription_live = 0;
     ctx->bundle_subscription_wait = 0;
     break;
-  case FD_BUNDLE_CLIENT_REQ_SubscribeBlocks:
+  case FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2:
     ctx->harmonic_block_subscription_live = 0;
     ctx->harmonic_block_subscription_wait = 0;
     break;
@@ -1147,12 +1146,12 @@ fd_bundle_client_grpc_rx_end(
     FD_LOG_INFO(( "SubscribeBundles stream failed (gRPC status %u-%s). Reconnecting ...",
                   resp->grpc_status, fd_grpc_status_cstr( resp->grpc_status ) ));
     return;
-  case FD_BUNDLE_CLIENT_REQ_SubscribeBlocks:
+  case FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2:
     ctx->harmonic_block_subscription_live = 0;
     ctx->harmonic_block_subscription_wait = 0;
     fd_bundle_tile_backoff( ctx, fd_bundle_now( ctx ) );
     ctx->defer_reset = 1;
-    FD_LOG_INFO(( "SubscribeBlocks stream failed (gRPC status %u-%s). Reconnecting ...",
+    FD_LOG_INFO(( "SubscribeBlocks2 stream failed (gRPC status %u-%s). Reconnecting ...",
                   resp->grpc_status, fd_grpc_status_cstr( resp->grpc_status ) ));
     return;
   case FD_BUNDLE_CLIENT_REQ_Bundle_GetBlockBuilderFeeInfo:
@@ -1342,8 +1341,8 @@ fd_bundle_request_ctx_cstr( ulong request_ctx ) {
     return "SubscribeBundles";
   case FD_BUNDLE_CLIENT_REQ_Bundle_GetBlockBuilderFeeInfo:
     return "GetBlockBuilderFeeInfo";
-  case FD_BUNDLE_CLIENT_REQ_SubscribeBlocks:
-    return "SubscribeBlocks";
+  case FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2:
+    return "SubscribeBlocks2";
   case FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo:
     return "SubmitLeaderWindowInfo";
   case FD_BUNDLE_CLIENT_REQ_SetStrategy:
@@ -1357,9 +1356,11 @@ fd_bundle_request_ctx_cstr( ulong request_ctx ) {
 
 /* ========== Block mode protobuf handlers ========== */
 
-/* Append one harmonic block txn to in-tile staging (published from after_credit). */
+/* Stage one block transaction with its raw builder bundle_id; bundle
+   metadata is assigned once the whole Block is decoded.  An empty
+   payload is staged with payload_sz==0 so its bundle is dropped whole. */
 static bool
-fd_harmonic_block_client_visit_pb_block_txn_stage(
+fd_harmonic_block_client_visit_pb_txn(
     pb_istream_t *     istream,
     pb_field_t const * field,
     void **            arg
@@ -1367,197 +1368,116 @@ fd_harmonic_block_client_visit_pb_block_txn_stage(
   (void)field;
   fd_bundle_tile_t * ctx = *arg;
 
-  packet_Packet packet = packet_Packet_init_default;
-  if( FD_UNLIKELY( !pb_decode( istream, &packet_Packet_msg, &packet ) ) ) {
-    ctx->metrics.decode_fail_cnt++;
-    FD_LOG_WARNING(( "Protobuf decode of block (packet.Packet) failed" ));
-    return false;
-  }
-
-  if( FD_UNLIKELY( packet.data.size == 0 ) ) {
-    FD_LOG_WARNING(( "Block server delivered an empty packet, ignoring" ));
-    return true;
-  }
-
-  if( FD_UNLIKELY( packet.data.size > FD_TXN_MTU ) ) {
-    FD_LOG_WARNING(( "Block server delivered an oversize transaction, ignoring" ));
-    return true;
-  }
-
   if( FD_UNLIKELY( ctx->harmonic_pending_len>=ctx->harmonic_staging_max ) ) {
-    /* Safety net.  This should not occur in practice: staging is sized
-       to bundle.out_depth (default 16384) and one fd_h2_rx pass is
-       bounded by rbuf_rx capacity.  If we ever do hit this, drop the
-       in-progress decode so the SubscribeBundlesResponse parse fails
-       and the gRPC stream is torn down + reconnected; that is
-       preferable to silently truncating a block. */
+    /* Safety net: staging is sized to bundle.out_depth.  Failing the
+       decode resets the stream rather than silently truncating a block. */
     FD_LOG_WARNING(( "harmonic staging full (%lu/%lu)",
                      ctx->harmonic_pending_len, ctx->harmonic_staging_max ));
     return false;
   }
 
-  uint _ip4; uint ip4 = fd_uint_if( packet.has_meta, fd_cstr_to_ip4_addr( packet.meta.addr, &_ip4 ) ? _ip4 : ctx->server_ip4_addr, ctx->server_ip4_addr );
+  block_Transaction txn = block_Transaction_init_default;
+  if( FD_UNLIKELY( !pb_decode( istream, &block_Transaction_msg, &txn ) ) ) {
+    ctx->metrics.decode_fail_cnt++;
+    FD_LOG_WARNING(( "Protobuf decode of (block.Transaction) failed: %s", istream->errmsg ));
+    return false;
+  }
 
-  fd_bundle_harmonic_staged_txn_t * s = &ctx->harmonic_staging[ ctx->harmonic_pending_len ];
-  fd_memcpy( s->payload, packet.data.bytes, packet.data.size );
-  s->payload_sz    = (ushort)packet.data.size;
-  s->source_ipv4   = ip4;
+  fd_bundle_harmonic_staged_txn_t * s = &ctx->harmonic_staging[ ctx->harmonic_pending_len++ ];
+  s->bundle_id  = txn.bundle_id;
+  s->payload_sz = (ushort)txn.transaction.size;
+  if( FD_UNLIKELY( !txn.transaction.size ) ) {
+    FD_LOG_WARNING(( "Block server delivered an empty transaction, dropping its bundle" ));
+    return true;
+  }
+  fd_memcpy( s->payload, txn.transaction.bytes, txn.transaction.size );
+  s->source_ipv4      = ctx->server_ip4_addr;
   s->first_seen_nanos = fd_bundle_now( ctx );
-  /* Snapshot per-bundle metadata so we can drain entries from
-     different bundles correctly in after_credit. */
-  s->bundle_id      = ctx->harmonic_staged_bundle_id;
-  s->bundle_txn_cnt = ctx->harmonic_staged_bundle_txn_cnt;
-  s->commission     = (uchar)ctx->builder_commission;
+  s->commission       = (uchar)ctx->builder_commission;
   fd_memcpy( s->commission_pubkey, ctx->builder_pubkey, 32UL );
-  ctx->harmonic_pending_len++;
-
   return true;
 }
 
-/* Called for each transaction in a block.  Counts transactions. */
-static bool
-fd_harmonic_block_client_visit_pb_block_txn_preflight(
-    pb_istream_t *     istream,
-    pb_field_t const * field,
-    void **            arg
-) {
-  (void)istream; (void)field;
-  fd_bundle_tile_t * ctx = *arg;
-  ctx->harmonic_block_txn_cnt++;
-  return true;
-}
+/* Split the txns staged from one Block (staging[start..]) into bundles:
+   a run of equal nonzero bundle_id is a revert protected bundle, and
+   bundle_id 0 is a standalone transaction.  Each takes the next
+   sequence number.  A bundle that cannot travel whole is dropped, and
+   the gap in the sequence makes pack stop the block.  Returns 0 if the
+   stream must be failed. */
+static int
+fd_harmonic_block_assign_bundles( fd_bundle_tile_t * ctx,
+                                  ulong              start ) {
+  fd_bundle_harmonic_staged_txn_t * staging = ctx->harmonic_staging;
+  ulong const end = ctx->harmonic_pending_len;
+  ulong       out = start;
+  for( ulong i=start; i<end; ) {
+    ulong const raw_id = staging[ i ].bundle_id;
+    ulong       n      = 1UL;
+    while( raw_id && i+n<end && staging[ i+n ].bundle_id==raw_id ) n++;
 
-/* Called for each BundleUuid in a SubscribeBlocks response. */
-static bool
-fd_harmonic_block_client_visit_pb_block_uuid(
-    pb_istream_t *     istream,
-    pb_field_t const * field,
-    void **            arg
-) {
-  (void)field;
-  fd_bundle_tile_t * ctx = *arg;
-
-  ctx->harmonic_block_txn_cnt = 0UL;
-
-  /* First pass: Count number of transactions and extract slot from uuid */
-  pb_istream_t peek = *istream;
-  bundle_BundleUuid bundle = bundle_BundleUuid_init_default;
-  bundle.bundle.packets = (pb_callback_t) {
-    .funcs.decode = fd_harmonic_block_client_visit_pb_block_txn_preflight,
-    .arg          = ctx
-  };
-  if( FD_UNLIKELY( !pb_decode( &peek, &bundle_BundleUuid_msg, &bundle ) ) ) {
-    ctx->metrics.decode_fail_cnt++;
-    FD_LOG_WARNING(( "Protobuf decode of block (bundle.BundleUuid) failed: %s", peek.errmsg ));
-    return false;
-  }
-
-  /* Parse uuid as slot number.  For blocks, uuid contains a decimal slot string. */
-  if( FD_LIKELY( bundle.uuid.size>0UL && bundle.uuid.size<21UL ) ) {
-    char slot_str[ 21 ];
-    fd_memcpy( slot_str, bundle.uuid.bytes, bundle.uuid.size );
-    slot_str[ bundle.uuid.size ] = '\0';
-
-    char * endptr = NULL;
-    ulong slot = strtoul( slot_str, &endptr, 10 );
-    if( FD_UNLIKELY( endptr==slot_str || *endptr!='\0' ) ) {
-      /* We cannot tell which block this belongs to, so we cannot leave
-         a gap for pack to see.  Fail the stream instead; the reset marks
-         the sequence tainted. */
-      FD_LOG_WARNING(( "Invalid block slot in uuid: %s", slot_str ));
-      ctx->metrics.decode_fail_cnt++;
-      return false;
+    if( FD_UNLIKELY( ctx->harmonic_block_seq>=FD_TXN_M_HARMONIC_SEQ_MASK ) ) {
+      FD_LOG_WARNING(( "HARMONIC: block slot=%lu, too many bundles in block, failing stream", ctx->harmonic_block_slot ));
+      return 0;
     }
-    if( FD_UNLIKELY( slot!=ctx->harmonic_block_slot ) ) {
-      /* First bundle of a new block: restart the per-block sequence.
-         After a reset, start at 2 so pack stops this block. */
-      ctx->harmonic_block_slot = slot;
-      ctx->harmonic_block_seq  = ctx->harmonic_seq_tainted ? 1UL : 0UL;
-    }
-  } else {
-    FD_LOG_WARNING(( "Invalid block uuid size: %lu", (ulong)bundle.uuid.size ));
-    ctx->metrics.decode_fail_cnt++;
-    return false;
-  }
-
-  /* Each BundleUuid on the block stream is a bundle (a plain
-     transaction is a bundle of one) and travels the regular bundle
-     path, so it must respect the bundle size limit.  Skipping a bundle
-     leaves a gap in the sequence, which makes pack stop accepting the
-     rest of this block. */
-  if( FD_UNLIKELY( ctx->harmonic_block_txn_cnt>FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE ) ) {
-    FD_LOG_WARNING(( "HARMONIC: rejecting block bundle slot=%lu with txn_cnt %lu (exceeds %lu)",
-                     ctx->harmonic_block_slot, ctx->harmonic_block_txn_cnt, FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE ));
     ctx->harmonic_block_seq++;
-    return true;
+
+    int valid = n<=FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE;
+    for( ulong j=i; j<i+n; j++ ) valid &= staging[ j ].payload_sz!=0;
+    if( FD_UNLIKELY( !valid ) ) {
+      FD_LOG_WARNING(( "HARMONIC: dropping block bundle slot=%lu seq=%lu with %lu txns",
+                       ctx->harmonic_block_slot, ctx->harmonic_block_seq, n ));
+      i += n;
+      continue;
+    }
+
+    ulong const id = FD_TXN_M_HARMONIC_BUNDLE_ID( ctx->harmonic_block_slot, ctx->harmonic_block_seq );
+    for( ulong j=0UL; j<n; j++ ) {
+      /* out<=i, so compacting forward never overwrites unread entries */
+      if( FD_UNLIKELY( out!=i ) ) staging[ out+j ] = staging[ i+j ];
+      staging[ out+j ].bundle_id        = id;
+      staging[ out+j ].bundle_txn_cnt   = n;
+      staging[ out+j ].revert_protected = !!raw_id;
+    }
+    out += n;
+    i   += n;
+    ctx->harmonic_block_received_cnt++;
   }
-  if( FD_UNLIKELY( ctx->harmonic_block_seq>=FD_TXN_M_HARMONIC_SEQ_MASK ) ) {
-    FD_LOG_WARNING(( "HARMONIC: block bundle slot=%lu, too many bundles in block, failing stream", ctx->harmonic_block_slot ));
-    return false;
-  }
-
-  ctx->harmonic_block_seq++;
-  ctx->harmonic_block_received_cnt++;
-
-  FD_LOG_DEBUG(( "Received block bundle slot=%lu seq=%lu, %lu packets",
-                 ctx->harmonic_block_slot, ctx->harmonic_block_seq, ctx->harmonic_block_txn_cnt ));
-
-  bundle = (bundle_BundleUuid)bundle_BundleUuid_init_default;
-
-  /* Snapshot bundle-scoped metadata so the per-txn stage callback can
-     attach it to each entry.  Multiple bundles may be staged before
-     after_credit drains them, so entries carry their own metadata. */
-  ulong  const len_before = ctx->harmonic_pending_len;
-  ctx->harmonic_staged_bundle_id      = FD_TXN_M_HARMONIC_BUNDLE_ID( ctx->harmonic_block_slot, ctx->harmonic_block_seq );
-  ctx->harmonic_staged_bundle_txn_cnt = ctx->harmonic_block_txn_cnt;
-
-  bundle.bundle.packets = (pb_callback_t) {
-    .funcs.decode = fd_harmonic_block_client_visit_pb_block_txn_stage,
-    .arg          = ctx
-  };
-
-  if( FD_UNLIKELY( !pb_decode( istream, &bundle_BundleUuid_msg, &bundle ) ) ) {
-    ctx->metrics.decode_fail_cnt++;
-    FD_LOG_WARNING(( "Protobuf decode of block (bundle.BundleUuid) failed (internal error): %s", istream->errmsg ));
-    /* Roll back partially-staged txns from THIS block only; keep
-       previously-staged blocks intact so they still get published. */
-    ctx->harmonic_pending_len = len_before;
-    return false;
-  }
-
-  /* Every packet counted in preflight must have been staged, or the
-     bundle would reach pack short and be treated as partial.  Drop the
-     whole bundle instead; the gap in the sequence stops the block. */
-  if( FD_UNLIKELY( ctx->harmonic_pending_len-len_before!=ctx->harmonic_block_txn_cnt ) ) {
-    FD_LOG_WARNING(( "HARMONIC: block bundle slot=%lu seq=%lu had %lu packets but staged %lu, dropping bundle",
-                     ctx->harmonic_block_slot, ctx->harmonic_block_seq, ctx->harmonic_block_txn_cnt,
-                     ctx->harmonic_pending_len-len_before ));
-    ctx->harmonic_pending_len = len_before;
-    return true;
-  }
-
-  return true;
+  ctx->harmonic_pending_len = out;
+  return 1;
 }
 
-/* Handle a SubscribeBundlesResponse for harmonic blocks.
-   Note: Uses the same proto as bundles but with different semantics. */
+/* Handle a block.Block from the SubscribeBlocks2 stream. */
 static void
-fd_bundle_client_handle_block_batch(
+fd_bundle_client_handle_block(
     fd_bundle_tile_t * ctx,
     pb_istream_t *     istream
 ) {
-  block_engine_SubscribeBundlesResponse res = block_engine_SubscribeBundlesResponse_init_default;
-  res.bundles = (pb_callback_t) {
-    .funcs.decode = fd_harmonic_block_client_visit_pb_block_uuid,
+  ulong const start = ctx->harmonic_pending_len;
+  block_Block block = block_Block_init_default;
+  block.transactions = (pb_callback_t) {
+    .funcs.decode = fd_harmonic_block_client_visit_pb_txn,
     .arg          = ctx
   };
-  if( FD_UNLIKELY( !pb_decode( istream, &block_engine_SubscribeBundlesResponse_msg, &res ) ) ) {
+  if( FD_UNLIKELY( !pb_decode( istream, &block_Block_msg, &block ) ) ) {
     ctx->metrics.decode_fail_cnt++;
-    FD_LOG_WARNING(( "Protobuf decode of (block_engine.SubscribeBundlesResponse) for blocks failed: %s", istream->errmsg ));
-    /* Later bundles in this message were dropped without a seq
-       number; reset so the seq is tainted */
+    FD_LOG_WARNING(( "Protobuf decode of (block.Block) failed: %s", istream->errmsg ));
+    /* None of this block was numbered; reset so the seq is tainted.
+       Blocks staged earlier are kept and still get published. */
+    ctx->harmonic_pending_len = start;
     ctx->defer_reset = 1;
     return;
+  }
+
+  if( FD_UNLIKELY( block.slot!=ctx->harmonic_block_slot ) ) {
+    /* First message of a new block: restart the per-block sequence.
+       After a reset, start at 2 so pack stops this block. */
+    ctx->harmonic_block_slot = block.slot;
+    ctx->harmonic_block_seq  = ctx->harmonic_seq_tainted ? 1UL : 0UL;
+  }
+
+  if( FD_UNLIKELY( !fd_harmonic_block_assign_bundles( ctx, start ) ) ) {
+    ctx->harmonic_pending_len = start;
+    ctx->defer_reset = 1;
   }
 }
 
