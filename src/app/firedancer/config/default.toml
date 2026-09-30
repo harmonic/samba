@@ -954,7 +954,7 @@ telemetry = true
     # `mainnet`, except when using unique scheduling strategies.  For
     # development and benchmarking, it can be useful to increase this
     # number further.
-    execle_tile_count = 2
+    execle_tile_count = 4
 
     # How many execrp tiles to run.  These tiles execute transactions
     # that are being replayed when our validator is not leader, and is
