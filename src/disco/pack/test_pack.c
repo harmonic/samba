@@ -1733,15 +1733,27 @@ h_bundle( fd_pack_t *          pack,
 }
 
 static int
+h_fini_rp( fd_pack_t *          pack,
+           fd_txn_e_t * const * bundle,
+           ulong                txn_cnt,
+           ulong                slot,
+           ulong                seq,
+           long                 now,
+           int                  revert_protected ) {
+  ulong deleted;
+  return fd_pack_harmonic_insert_bundle_fini( pack, bundle, txn_cnt, FD_TXN_M_HARMONIC_BUNDLE_ID( slot, seq ), revert_protected,
+                                              1000UL, 0, NULL, now, H_THRESHOLD, H_CUTOFF, &deleted );
+}
+
+/* Bundles of one are standalone transactions unless stated otherwise */
+static int
 h_fini( fd_pack_t *          pack,
         fd_txn_e_t * const * bundle,
         ulong                txn_cnt,
         ulong                slot,
         ulong                seq,
         long                 now ) {
-  ulong deleted;
-  return fd_pack_harmonic_insert_bundle_fini( pack, bundle, txn_cnt, FD_TXN_M_HARMONIC_BUNDLE_ID( slot, seq ), 1000UL, 0, NULL,
-                                              now, H_THRESHOLD, H_CUTOFF, &deleted );
+  return h_fini_rp( pack, bundle, txn_cnt, slot, seq, now, txn_cnt>1UL );
 }
 
 static ulong
@@ -1752,6 +1764,47 @@ h_sched( fd_pack_t * pack, ulong bank, int harmonic ) {
 static void
 h_crank( fd_pack_t * pack, long now ) {
   fd_pack_harmonic_state_crank( pack, now, H_THRESHOLD, H_CUTOFF, 0, 0UL, 0UL, 0 );
+}
+
+/* A block bundle of one keeps revert protection and a standalone block
+   transaction does not.  Votes join the block only when the pack tile
+   allows them (the vote tail), and never ahead of a ready bundle. */
+static void
+test_harmonic_bundle_of_one_and_votes( void ) {
+  FD_LOG_NOTICE(( "TEST HARMONIC BUNDLE OF ONE AND VOTES" ));
+  fd_pack_t * pack = init_all( 128UL, 4UL, 32UL, &outcome );
+  fd_txn_e_t * _bundle[ FD_PACK_MAX_TXN_PER_BUNDLE ];
+  fd_txn_e_t * const * bundle;
+  ulong slot = 1000UL;
+  ulong i    = 0UL;
+  int   no_votes = ALL & ~FD_PACK_SCHEDULE_VOTE;
+
+  fd_pack_harmonic_reset( pack, slot, 0 ); fd_pack_set_initializer_bundles_ready( pack );
+  { char const * w[1] = { "A" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini_rp( pack, bundle, 1UL, slot, 1UL, H_EARLY, 1 )>=0 ); }
+  { char const * w[1] = { "B" };
+    bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
+    FD_TEST( h_fini_rp( pack, bundle, 1UL, slot, 2UL, H_EARLY, 0 )>=0 ); }
+  make_vote_transaction( i ); insert( i++, pack );
+
+  FD_TEST( fd_pack_schedule_next_microblock( pack, FD_PACK_TEST_MAX_COST_PER_BLOCK, 1.0f, 0UL, no_votes, 1, outcome.results )==1UL );
+  FD_TEST( outcome.results[0].txnp->flags & FD_TXN_P_FLAGS_BUNDLE );
+  FD_TEST( fd_pack_schedule_next_microblock( pack, FD_PACK_TEST_MAX_COST_PER_BLOCK, 1.0f, 1UL, no_votes, 1, outcome.results )==1UL );
+  FD_TEST( !(outcome.results[0].txnp->flags & FD_TXN_P_FLAGS_BUNDLE) );
+
+  /* Before the vote tail the vote waits; in it, an idle bank takes it */
+  FD_TEST( fd_pack_schedule_next_microblock( pack, FD_PACK_TEST_MAX_COST_PER_BLOCK, 1.0f, 2UL, no_votes, 1, outcome.results )==0UL );
+  FD_TEST( fd_pack_schedule_next_microblock( pack, FD_PACK_TEST_MAX_COST_PER_BLOCK, 1.0f, 2UL, ALL,      1, outcome.results )==1UL );
+  FD_TEST( outcome.results[0].txnp->flags & FD_TXN_P_FLAGS_IS_SIMPLE_VOTE );
+  FD_TEST( fd_pack_harmonic_state( pack )==HARMONIC_MODE_HARMONIC );
+
+  FD_TEST( fd_pack_microblock_complete( pack, 0UL ) );
+  FD_TEST( fd_pack_microblock_complete( pack, 1UL ) );
+  FD_TEST( fd_pack_microblock_complete( pack, 2UL ) );
+  FD_TEST( !fd_pack_verify( pack, pack_verify_scratch ) );
+  fd_pack_end_block( pack );
+  fd_pack_delete( fd_pack_leave( pack ) );
 }
 
 static void
@@ -2044,7 +2097,7 @@ test_harmonic( void ) {
   { char const * w[1] = { "K" };
     ulong deleted;
     bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
-    FD_TEST( fd_pack_harmonic_insert_bundle_fini( pack, bundle, 1UL, 0UL, 1000UL, 1, NULL, H_EARLY, H_THRESHOLD, H_CUTOFF, &deleted )>=0 ); }
+    FD_TEST( fd_pack_harmonic_insert_bundle_fini( pack, bundle, 1UL, 0UL, 1, 1000UL, 1, NULL, H_EARLY, H_THRESHOLD, H_CUTOFF, &deleted )>=0 ); }
   FD_TEST( h_sched( pack, 0UL, 1 )==1UL );
   FD_TEST( outcome.results[0].txnp->flags & FD_TXN_P_FLAGS_BUNDLE             );
   FD_TEST( outcome.results[0].txnp->flags & FD_TXN_P_FLAGS_INITIALIZER_BUNDLE );
@@ -2075,7 +2128,7 @@ test_harmonic( void ) {
   { char const * w[1] = { "K" };
     ulong deleted;
     bundle = h_bundle( pack, _bundle, 1UL, w, 500U );
-    FD_TEST( fd_pack_harmonic_insert_bundle_fini( pack, bundle, 1UL, 0UL, 1000UL, 1, NULL, H_EARLY, H_THRESHOLD, H_CUTOFF, &deleted )>=0 ); }
+    FD_TEST( fd_pack_harmonic_insert_bundle_fini( pack, bundle, 1UL, 0UL, 1, 1000UL, 1, NULL, H_EARLY, H_THRESHOLD, H_CUTOFF, &deleted )>=0 ); }
   FD_TEST( h_sched( pack, 0UL, 1 )==1UL );
   FD_TEST( outcome.results[0].txnp->flags & FD_TXN_P_FLAGS_INITIALIZER_BUNDLE );
   FD_TEST( fd_pack_microblock_complete( pack, 0UL ) );
@@ -2190,6 +2243,7 @@ main( int     argc,
   test_nonce();
   test_bundle_nonce();
   test_harmonic();
+  test_harmonic_bundle_of_one_and_votes();
   if( extra_benchmark ) {
     performance_test( extra_benchmark );
     performance_test2();

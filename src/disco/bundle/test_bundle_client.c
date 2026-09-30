@@ -1,4 +1,5 @@
 #include "test_bundle_common.c"
+#include "proto/block.pb.h"
 #include "proto/block_engine.pb.h"
 #include "proto/packet.pb.h"
 #include "../../ballet/base58/fd_base58.h"
@@ -787,119 +788,53 @@ FD_UNIT_TEST( bundle_client_subscribe_packets ) {
 
 /* ========== Harmonic block tests ========== */
 
-/* Helper to encode a block message with given slot and txn count.
-   Returns the size of the encoded message. */
-static ulong
-encode_block_msg( uchar * buf, ulong buf_sz, ulong slot, ulong txn_cnt, ulong txn_sz ) {
-  /* Slot as string */
-  char slot_str[21];
-  ulong slot_str_len = 0;
-  ulong s = slot;
-  if( s==0 ) {
-    slot_str[slot_str_len++] = '0';
-  } else {
-    char tmp[21];
-    ulong tmp_len = 0;
-    while( s ) {
-      tmp[tmp_len++] = (char)('0' + (s % 10));
-      s /= 10;
-    }
-    for( ulong i=0; i<tmp_len; i++ ) {
-      slot_str[slot_str_len++] = tmp[tmp_len-1-i];
-    }
+typedef struct {
+  ulong const * bundle_ids;
+  ulong         txn_cnt;
+  ulong         txn_sz;
+} block_enc_t;
+
+static bool
+encode_block_txns( pb_ostream_t *     stream,
+                   pb_field_t const * field,
+                   void * const *     arg ) {
+  block_enc_t const * e = *arg;
+  for( ulong i=0UL; i<e->txn_cnt; i++ ) {
+    block_Transaction txn = block_Transaction_init_default;
+    txn.transaction.size = (pb_size_t)e->txn_sz;
+    memset( txn.transaction.bytes, 0x42, e->txn_sz );
+    txn.bundle_id = e->bundle_ids[ i ];
+    if( !pb_encode_tag_for_field( stream, field ) ) return false;
+    if( !pb_encode_submessage( stream, &block_Transaction_msg, &txn ) ) return false;
   }
-  slot_str[slot_str_len] = '\0';
-
-  /* Create a single packet proto */
-  uchar single_pkt[2100];
-  pb_ostream_t pkt_stream = pb_ostream_from_buffer( single_pkt, sizeof(single_pkt) );
-  packet_Packet pkt = packet_Packet_init_default;
-  pkt.data.size = (pb_size_t)txn_sz;
-  memset( pkt.data.bytes, 0x42, txn_sz );
-  pkt.has_meta = 0;
-  if( !pb_encode( &pkt_stream, &packet_Packet_msg, &pkt ) ) {
-    FD_LOG_WARNING(( "pb_encode failed: %s", PB_GET_ERROR(&pkt_stream) ));
-    return 0;
-  }
-  ulong single_pkt_sz = pkt_stream.bytes_written;
-
-  /* Calculate Bundle size */
-  ulong bundle_content_sz = 0;
-  for( ulong i=0; i<txn_cnt; i++ ) {
-    bundle_content_sz += 1;  /* field tag 0x1a */
-    ulong sz = single_pkt_sz;
-    do { bundle_content_sz++; sz >>= 7; } while( sz );
-    bundle_content_sz += single_pkt_sz;
-  }
-
-  /* Calculate BundleUuid size */
-  ulong bundle_uuid_content_sz = 0;
-  bundle_uuid_content_sz += 1;  /* field tag 0x0a */
-  ulong sz = bundle_content_sz;
-  do { bundle_uuid_content_sz++; sz >>= 7; } while( sz );
-  bundle_uuid_content_sz += bundle_content_sz;
-  bundle_uuid_content_sz += 1;  /* field tag 0x12 */
-  sz = slot_str_len;
-  do { bundle_uuid_content_sz++; sz >>= 7; } while( sz );
-  bundle_uuid_content_sz += slot_str_len;
-
-  /* Helper macro to encode a varint */
-  #define ENCODE_VARINT(val) do { \
-    ulong _v = (val); \
-    while( _v >= 0x80 ) { \
-      *ptr++ = (uchar)((_v & 0x7F) | 0x80); \
-      _v >>= 7; \
-    } \
-    *ptr++ = (uchar)_v; \
-  } while(0)
-
-  /* Encode */
-  uchar * ptr = buf;
-  uchar * const end = buf + buf_sz;
-
-  /* Field 1: bundles */
-  *ptr++ = 0x0a;
-  ENCODE_VARINT( bundle_uuid_content_sz );
-
-  /* BundleUuid.bundle (field 1) */
-  *ptr++ = 0x0a;
-  ENCODE_VARINT( bundle_content_sz );
-
-  /* Bundle.packets */
-  for( ulong i=0; i<txn_cnt; i++ ) {
-    if( ptr + single_pkt_sz + 10 >= end ) {
-      FD_LOG_WARNING(( "Buffer overflow at packet %lu", i ));
-      return 0;
-    }
-    *ptr++ = 0x1a;
-    ENCODE_VARINT( single_pkt_sz );
-    memcpy( ptr, single_pkt, single_pkt_sz );
-    ptr += single_pkt_sz;
-  }
-
-  /* BundleUuid.uuid (field 2) */
-  *ptr++ = 0x12;
-  ENCODE_VARINT( slot_str_len );
-
-  #undef ENCODE_VARINT
-  memcpy( ptr, slot_str, slot_str_len );
-  ptr += slot_str_len;
-
-  return (ulong)(ptr - buf);
+  return true;
 }
 
-/* A block is streamed as a sequence of BundleUuid messages that all
-   carry the slot as uuid.  encode_block_msg emits exactly one of them,
-   so concatenating its output gives a response with several bundles. */
+/* Encodes a block.Block for slot whose i-th transaction carries
+   bundle_ids[i] and is txn_sz bytes of 0x42.  Returns the encoded size,
+   or 0 on failure. */
+static ulong
+encode_block_ids( uchar * buf, ulong buf_sz, ulong slot, ulong const * bundle_ids, ulong txn_cnt, ulong txn_sz ) {
+  block_enc_t enc = { .bundle_ids = bundle_ids, .txn_cnt = txn_cnt, .txn_sz = txn_sz };
+  block_Block block = block_Block_init_default;
+  block.slot = slot;
+  block.transactions = (pb_callback_t) { .funcs.encode = encode_block_txns, .arg = &enc };
+  pb_ostream_t stream = pb_ostream_from_buffer( buf, buf_sz );
+  if( !pb_encode( &stream, &block_Block_msg, &block ) ) {
+    FD_LOG_WARNING(( "pb_encode failed: %s", PB_GET_ERROR( &stream ) ));
+    return 0UL;
+  }
+  return stream.bytes_written;
+}
+
+/* Encodes a block of bundle_cnt revert protected bundles, each of
+   txns_per_bundle transactions. */
 static ulong
 encode_block_stream_msg( uchar * buf, ulong buf_sz, ulong slot, ulong bundle_cnt, ulong txns_per_bundle, ulong txn_sz ) {
-  ulong off = 0UL;
-  for( ulong i=0UL; i<bundle_cnt; i++ ) {
-    ulong sz = encode_block_msg( buf+off, buf_sz-off, slot, txns_per_bundle, txn_sz );
-    if( !sz ) return 0UL;
-    off += sz;
-  }
-  return off;
+  ulong ids[ 64 ];
+  FD_TEST( bundle_cnt*txns_per_bundle<=64UL );
+  for( ulong i=0UL; i<bundle_cnt*txns_per_bundle; i++ ) ids[ i ] = 1UL + i/txns_per_bundle;
+  return encode_block_ids( buf, buf_sz, slot, ids, bundle_cnt*txns_per_bundle, txn_sz );
 }
 
 /* Static buffer for block message with slot 12345678: 1 bundle of 2 txns */
@@ -967,7 +902,7 @@ FD_UNIT_TEST( harmonic_block_slot_parsing ) {
   fd_bundle_client_grpc_callbacks.rx_msg(
       state,
       subscribe_blocks_msg_slot_12345678, subscribe_blocks_msg_slot_12345678_sz,
-      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2
   );
 
   FD_TEST( state->harmonic_block_slot==12345678UL );
@@ -1005,7 +940,7 @@ FD_UNIT_TEST( harmonic_block_multi_bundle ) {
   fd_bundle_client_grpc_callbacks.rx_msg(
       state,
       subscribe_blocks_msg_slot_99999999, subscribe_blocks_msg_slot_99999999_sz,
-      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2
   );
 
   FD_TEST( state->harmonic_block_slot==99999999UL );
@@ -1046,7 +981,7 @@ FD_UNIT_TEST( harmonic_block_oversize_bundle_rejected ) {
   fd_bundle_client_grpc_callbacks.rx_msg(
       state,
       subscribe_blocks_msg_oversize, subscribe_blocks_msg_oversize_sz,
-      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2
   );
   FD_TEST( state->harmonic_block_slot==77777777UL );
   FD_TEST( state->harmonic_block_seq==1UL );
@@ -1057,7 +992,7 @@ FD_UNIT_TEST( harmonic_block_oversize_bundle_rejected ) {
   uchar  msg[ 256 ];
   ulong  msg_sz = encode_block_stream_msg( msg, sizeof(msg), 77777777UL, 1UL, 2UL, 1UL );
   FD_TEST( msg_sz>0UL );
-  fd_bundle_client_grpc_callbacks.rx_msg( state, msg, msg_sz, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks );
+  fd_bundle_client_grpc_callbacks.rx_msg( state, msg, msg_sz, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2 );
   FD_TEST( state->harmonic_block_seq==2UL );
   FD_TEST( state->harmonic_block_received_cnt==1UL );
   FD_TEST( state->harmonic_pending_len==2UL );
@@ -1065,6 +1000,75 @@ FD_UNIT_TEST( harmonic_block_oversize_bundle_rejected ) {
   FD_TEST( state->harmonic_staging[0].bundle_txn_cnt==2UL );
 
   FD_LOG_NOTICE(( "Oversize harmonic block bundle rejection test passed" ));
+  test_bundle_env_destroy( env );
+}
+
+/* bundle_id 0 marks a standalone transaction; any other run of equal
+   bundle_id is a revert protected bundle, including a bundle of one. */
+FD_UNIT_TEST( harmonic_block_standalone_and_bundle_of_one ) {
+  FD_LOG_NOTICE(( "Testing harmonic standalone txns and bundles of one" ));
+  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
+  test_bundle_env_enable_harmonic_block_mode( env, wksp );
+  test_bundle_env_mock_harmonic_block_conn( env );
+  fd_bundle_tile_t * state = env->state;
+
+  state->builder_info_avail = 1;
+
+  ulong const ids[ 6 ] = { 0UL, 7UL, 0UL, 0UL, 9UL, 9UL };
+  uchar msg[ 512 ];
+  ulong msg_sz = encode_block_ids( msg, sizeof(msg), 4242UL, ids, 6UL, 1UL );
+  FD_TEST( msg_sz>0UL );
+  fd_bundle_client_grpc_callbacks.rx_msg( state, msg, msg_sz, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2 );
+
+  ulong const seq[ 6 ] = { 1UL, 2UL, 3UL, 4UL, 5UL, 5UL };
+  ulong const cnt[ 6 ] = { 1UL, 1UL, 1UL, 1UL, 2UL, 2UL };
+  uchar const rp [ 6 ] = { 0,   1,   0,   0,   1,   1   };
+  FD_TEST( state->harmonic_pending_len==6UL );
+  FD_TEST( state->harmonic_block_seq==5UL );
+  FD_TEST( state->harmonic_block_received_cnt==5UL );
+  for( ulong i=0UL; i<6UL; i++ ) {
+    FD_TEST( state->harmonic_staging[ i ].bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 4242UL, seq[ i ] ) );
+    FD_TEST( state->harmonic_staging[ i ].bundle_txn_cnt==cnt[ i ] );
+    FD_TEST( state->harmonic_staging[ i ].revert_protected==rp[ i ] );
+  }
+
+  FD_TEST( flush_harmonic_staging( state )==6UL );
+  for( ulong i=0UL; i<6UL; i++ ) FD_TEST( published_txn( env, i, NULL )->block_engine.revert_protected==rp[ i ] );
+
+  test_bundle_env_destroy( env );
+}
+
+/* An empty transaction drops its whole bundle, leaving a gap in the
+   sequence so pack stops the block. */
+FD_UNIT_TEST( harmonic_block_empty_txn_drops_bundle ) {
+  FD_LOG_NOTICE(( "Testing harmonic empty txn drops its bundle" ));
+  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
+  test_bundle_env_enable_harmonic_block_mode( env, wksp );
+  test_bundle_env_mock_harmonic_block_conn( env );
+  fd_bundle_tile_t * state = env->state;
+
+  state->builder_info_avail = 1;
+
+  /* Bundle 5 is [full, empty]; the standalone txn after it survives */
+  static block_Transaction txns[ 3 ];
+  txns[ 0 ] = (block_Transaction){ .transaction = { .size = 1U, .bytes = { 0x42 } }, .bundle_id = 5UL };
+  txns[ 1 ] = (block_Transaction){ .bundle_id = 5UL };
+  txns[ 2 ] = (block_Transaction){ .transaction = { .size = 1U, .bytes = { 0x42 } } };
+  uchar msg[ 512 ];
+  pb_ostream_t stream = pb_ostream_from_buffer( msg, sizeof(msg) );
+  FD_TEST( pb_encode_tag( &stream, PB_WT_VARINT, block_Block_slot_tag ) && pb_encode_varint( &stream, 4242UL ) );
+  for( ulong i=0UL; i<3UL; i++ ) {
+    FD_TEST( pb_encode_tag( &stream, PB_WT_STRING, block_Block_transactions_tag ) );
+    FD_TEST( pb_encode_submessage( &stream, &block_Transaction_msg, &txns[ i ] ) );
+  }
+  fd_bundle_client_grpc_callbacks.rx_msg( state, msg, stream.bytes_written, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2 );
+
+  FD_TEST( state->harmonic_block_seq==2UL );
+  FD_TEST( state->harmonic_block_received_cnt==1UL );
+  FD_TEST( state->harmonic_pending_len==1UL );
+  FD_TEST( state->harmonic_staging[ 0 ].bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 4242UL, 2UL ) );
+  FD_TEST( state->harmonic_staging[ 0 ].revert_protected==0 );
+
   test_bundle_env_destroy( env );
 }
 
@@ -1084,7 +1088,7 @@ FD_UNIT_TEST( harmonic_reset_taints_sequence ) {
   fd_bundle_client_grpc_callbacks.rx_msg(
       state,
       subscribe_blocks_msg_slot_12345678, subscribe_blocks_msg_slot_12345678_sz,
-      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2
   );
   FD_TEST( state->harmonic_block_seq==1UL );
   FD_TEST( state->harmonic_staging[0].bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 12345678UL, 1UL ) );
@@ -1099,7 +1103,7 @@ FD_UNIT_TEST( harmonic_reset_taints_sequence ) {
   fd_bundle_client_grpc_callbacks.rx_msg(
       state,
       subscribe_blocks_msg_slot_12345678, subscribe_blocks_msg_slot_12345678_sz,
-      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2
   );
   FD_TEST( state->harmonic_block_seq==2UL );
   FD_TEST( state->harmonic_staging[0].bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 12345678UL, 2UL ) );
@@ -1110,7 +1114,7 @@ FD_UNIT_TEST( harmonic_reset_taints_sequence ) {
   fd_bundle_client_grpc_callbacks.rx_msg(
       state,
       subscribe_blocks_msg_slot_99999999, subscribe_blocks_msg_slot_99999999_sz,
-      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2
   );
   FD_TEST( state->harmonic_block_seq==3UL );
   FD_TEST( state->harmonic_staging[0].bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 99999999UL, 1UL ) );
@@ -1156,7 +1160,7 @@ FD_UNIT_TEST( all_three_sources ) {
   fd_bundle_client_grpc_callbacks.rx_msg(
       state,
       subscribe_blocks_msg_slot_99999999, subscribe_blocks_msg_slot_99999999_sz,
-      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2
   );
   FD_TEST( state->harmonic_block_received_cnt==3UL );
   FD_TEST( state->harmonic_pending_len==6UL );
@@ -1205,7 +1209,7 @@ FD_UNIT_TEST( interleaved_sources ) {
   fd_bundle_client_grpc_callbacks.rx_msg(
       state,
       subscribe_blocks_msg_slot_99999999, subscribe_blocks_msg_slot_99999999_sz,
-      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2
   );
   FD_TEST( state->harmonic_block_received_cnt==3UL );
   FD_TEST( state->harmonic_block_slot==99999999UL );
@@ -1228,7 +1232,7 @@ FD_UNIT_TEST( interleaved_sources ) {
   fd_bundle_client_grpc_callbacks.rx_msg(
       state,
       subscribe_blocks_msg_slot_12345678, subscribe_blocks_msg_slot_12345678_sz,
-      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2
   );
   FD_TEST( state->harmonic_block_received_cnt==4UL );
   FD_TEST( state->harmonic_block_slot==12345678UL );
@@ -1264,7 +1268,7 @@ FD_UNIT_TEST( harmonic_staging_partial_drain ) {
   fd_bundle_client_grpc_callbacks.rx_msg(
       state,
       subscribe_blocks_msg_8txns, subscribe_blocks_msg_8txns_sz,
-      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2
   );
   FD_TEST( state->harmonic_pending_len==8UL );
   FD_TEST( state->harmonic_block_slot==55555555UL );
@@ -1320,7 +1324,7 @@ FD_UNIT_TEST( harmonic_before_credit_gate ) {
   fd_bundle_client_grpc_callbacks.rx_msg(
       state,
       subscribe_blocks_msg_slot_12345678, subscribe_blocks_msg_slot_12345678_sz,
-      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2
   );
   FD_TEST( state->harmonic_pending_len==2UL );
 
@@ -1358,7 +1362,7 @@ FD_UNIT_TEST( harmonic_before_credit_gate ) {
   fd_bundle_client_grpc_callbacks.rx_msg(
       state,
       subscribe_blocks_msg_slot_99999999, subscribe_blocks_msg_slot_99999999_sz,
-      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2
   );
   FD_TEST( state->harmonic_pending_len==6UL );
   FD_TEST( state->harmonic_block_slot==99999999UL );
@@ -1386,11 +1390,9 @@ FD_UNIT_TEST( reset_clears_harmonic_state ) {
   fd_bundle_client_grpc_callbacks.rx_msg(
       state,
       subscribe_blocks_msg_slot_12345678, subscribe_blocks_msg_slot_12345678_sz,
-      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2
   );
   FD_TEST( state->harmonic_pending_len==2UL );
-  FD_TEST( state->harmonic_staged_bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 12345678UL, 1UL ) );
-  FD_TEST( state->harmonic_staged_bundle_txn_cnt==2UL );
   FD_TEST( state->harmonic_block_received_cnt==1UL );
 
   /* Reset must clear harmonic staging so stale data does not leak
@@ -1398,8 +1400,6 @@ FD_UNIT_TEST( reset_clears_harmonic_state ) {
   fd_bundle_client_reset( state );
 
   FD_TEST( state->harmonic_pending_len==0UL );
-  FD_TEST( state->harmonic_staged_bundle_id==0UL );
-  FD_TEST( state->harmonic_staged_bundle_txn_cnt==0UL );
   FD_TEST( state->harmonic_block_seq==0UL );
   FD_TEST( state->harmonic_block_subscription_live==0 );
   FD_TEST( state->harmonic_block_subscription_wait==0 );
@@ -1720,9 +1720,10 @@ flush_harmonic_staging_budgeted( fd_bundle_tile_t * state, ulong budget ) {
         .source_ipv4    = s->source_ipv4,
         .source_tpu     = FD_TXN_M_TPU_SOURCE_HARMONIC,
         .block_engine   = {
-          .bundle_id      = s->bundle_id,
-          .bundle_txn_cnt = s->bundle_txn_cnt,
-          .commission     = s->commission,
+          .bundle_id        = s->bundle_id,
+          .bundle_txn_cnt   = s->bundle_txn_cnt,
+          .commission       = s->commission,
+          .revert_protected = s->revert_protected,
         },
       };
       fd_memcpy( txnm->block_engine.commission_pubkey, s->commission_pubkey, 32UL );

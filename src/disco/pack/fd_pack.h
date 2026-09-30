@@ -658,9 +658,9 @@ void fd_pack_set_initializer_bundles_ready( fd_pack_t * pack );
 #define FD_PACK_SCHEDULE_BUNDLE 2
 #define FD_PACK_SCHEDULE_TXN    4
 
-/* FD_PACK_HARMONIC_VOTE_TAIL_NS: last portion of the leader slot reserved for
-   vote/sprint scheduling after harmonic block txns are cut off.
-   harmonic_cutoff_ns = slot_end_ns - VOTE_TAIL_NS. */
+/* FD_PACK_HARMONIC_VOTE_TAIL_NS: last portion of the leader slot in
+   which votes interleave with harmonic block bundles.  Block bundles are
+   accepted until slot_end_ns. */
 #define FD_PACK_HARMONIC_VOTE_TAIL_NS ( 20000000L )
 
 #define HARMONIC_MODE_UNDECIDED   (0)
@@ -756,7 +756,8 @@ fd_pack_schedule_next_microblock( fd_pack_t  * pack,
    which applies the block admission rules once per bundle (see the
    comment above the implementation) and otherwise behaves like
    fd_pack_insert_bundle_fini.  bundle_id is the FD_TXN_M_HARMONIC_BUNDLE_ID
-   of the bundle (ignored for the crank), now_ns is the pack tile's
+   of the bundle (ignored for the crank), revert_protected is 0 for a
+   standalone block transaction, which may fail, now_ns is the pack tile's
    wallclock, and the threshold/cutoff are the slot's admission bounds.
    Returns an FD_PACK_INSERT_* code; a negative code means the bundle was
    cancelled.  FD_PACK_INSERT_REJECT_BLOCK_FAILED means the bundle was
@@ -768,6 +769,7 @@ int fd_pack_harmonic_insert_bundle_fini( fd_pack_t          * pack,
                                          fd_txn_e_t * const * bundle,
                                          ulong                txn_cnt,
                                          ulong                bundle_id,
+                                         int                  revert_protected,
                                          ulong                expires_at,
                                          int                  initializer_bundle,
                                          void         const * bundle_meta,
