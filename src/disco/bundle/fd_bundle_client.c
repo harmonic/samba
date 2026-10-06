@@ -416,7 +416,18 @@ fd_bundle_client_step_reconnect( fd_bundle_tile_t * ctx,
     fd_bundle_auther_poll( &ctx->auther, ctx->grpc_client, ctx->keyguard_client );
     return 1;
   }
-  if( FD_UNLIKELY( ctx->auther.state!=FD_BUNDLE_AUTH_STATE_DONE_WAIT ) ) return 0;
+  if( FD_UNLIKELY( ctx->auther.state<FD_BUNDLE_AUTH_STATE_DONE_WAIT ) ) return 0;
+  if( ctx->auther.state==FD_BUNDLE_AUTH_STATE_DONE_WAIT ) {
+    if( FD_UNLIKELY( now>=ctx->auther.reauth_at ) ) {
+      FD_LOG_INFO(( "Re-authenticating with bundle server" ));
+      fd_bundle_auther_reset( &ctx->auther );
+      return 1;
+    }
+    if( FD_UNLIKELY( now>=ctx->auther.refresh_at ) ) {
+      fd_bundle_auther_refresh( &ctx->auther );
+      return 1;
+    }
+  }
 
   /* Set scheduling strategy */
   if( FD_UNLIKELY( !ctx->set_strategy_done && !ctx->set_strategy_wait ) ) {
@@ -1041,7 +1052,13 @@ fd_bundle_client_grpc_rx_msg(
     }
     break;
   case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthTokens:
-    if( FD_UNLIKELY( !fd_bundle_auther_handle_tokens_resp( &ctx->auther, protobuf, protobuf_sz ) ) ) {
+    if( FD_UNLIKELY( !fd_bundle_auther_handle_tokens_resp( &ctx->auther, protobuf, protobuf_sz, fd_bundle_now( ctx ) ) ) ) {
+      ctx->metrics.decode_fail_cnt++;
+      fd_bundle_tile_backoff( ctx, fd_bundle_now( ctx ) );
+    }
+    break;
+  case FD_BUNDLE_CLIENT_REQ_Auth_RefreshAccessToken:
+    if( FD_UNLIKELY( !fd_bundle_auther_handle_refresh_resp( &ctx->auther, protobuf, protobuf_sz, fd_bundle_now( ctx ) ) ) ) {
       ctx->metrics.decode_fail_cnt++;
       fd_bundle_tile_backoff( ctx, fd_bundle_now( ctx ) );
     }
@@ -1090,6 +1107,7 @@ fd_bundle_client_request_failed( fd_bundle_tile_t * ctx,
   switch( request_ctx ) {
   case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthChallenge:
   case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthTokens:
+  case FD_BUNDLE_CLIENT_REQ_Auth_RefreshAccessToken:
     fd_bundle_auther_handle_request_fail( &ctx->auther );
     break;
   case FD_BUNDLE_CLIENT_REQ_Bundle_GetBlockBuilderFeeInfo:
@@ -1259,7 +1277,7 @@ fd_bundle_client_status( fd_bundle_tile_t const * ctx ) {
     return FD_BUNDLE_STATE_CONNECTING; /* connection is not ready */
   }
 
-  if( FD_UNLIKELY( ctx->auther.state != FD_BUNDLE_AUTH_STATE_DONE_WAIT ) ) {
+  if( FD_UNLIKELY( ctx->auther.state<FD_BUNDLE_AUTH_STATE_DONE_WAIT ) ) {
     return FD_BUNDLE_STATE_CONNECTING; /* not authenticated */
   }
 
@@ -1315,7 +1333,7 @@ fd_bundle_tpu_client_status( fd_bundle_tile_t const * ctx ) {
     return FD_BUNDLE_STATE_CONNECTING;
   }
 
-  if( FD_UNLIKELY( ctx->tpu_auther.state != FD_BUNDLE_AUTH_STATE_DONE_WAIT ) ) {
+  if( FD_UNLIKELY( ctx->tpu_auther.state<FD_BUNDLE_AUTH_STATE_DONE_WAIT ) ) {
     return FD_BUNDLE_STATE_CONNECTING;
   }
 
@@ -1341,6 +1359,8 @@ fd_bundle_request_ctx_cstr( ulong request_ctx ) {
     return "GenerateAuthChallenge";
   case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthTokens:
     return "GenerateAuthTokens";
+  case FD_BUNDLE_CLIENT_REQ_Auth_RefreshAccessToken:
+    return "RefreshAccessToken";
   case FD_BUNDLE_CLIENT_REQ_Bundle_SubscribePackets:
     return "SubscribePackets";
   case FD_BUNDLE_CLIENT_REQ_Bundle_SubscribeBundles:
@@ -1737,9 +1757,20 @@ fd_bundle_tpu_client_step_reconnect( fd_bundle_tile_t * ctx,
     fd_bundle_auther_poll( &ctx->tpu_auther, ctx->tpu_grpc_client, ctx->keyguard_client );
     return 1;
   }
-  if( FD_UNLIKELY( ctx->tpu_auther.state!=FD_BUNDLE_AUTH_STATE_DONE_WAIT ) ) {
+  if( FD_UNLIKELY( ctx->tpu_auther.state<FD_BUNDLE_AUTH_STATE_DONE_WAIT ) ) {
     FD_LOG_DEBUG(( "TPU endpoint waiting on auth (state=%d)", ctx->tpu_auther.state ));
     return 0;
+  }
+  if( ctx->tpu_auther.state==FD_BUNDLE_AUTH_STATE_DONE_WAIT ) {
+    if( FD_UNLIKELY( now>=ctx->tpu_auther.reauth_at ) ) {
+      FD_LOG_INFO(( "Re-authenticating with TPU endpoint" ));
+      fd_bundle_auther_reset( &ctx->tpu_auther );
+      return 1;
+    }
+    if( FD_UNLIKELY( now>=ctx->tpu_auther.refresh_at ) ) {
+      fd_bundle_auther_refresh( &ctx->tpu_auther );
+      return 1;
+    }
   }
 
   /* Request TPU configs (periodically refresh) */
@@ -1952,10 +1983,15 @@ fd_bundle_tpu_client_grpc_rx_msg( void *       app_ctx,
   }
   break;
 case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthTokens:
-  if( FD_UNLIKELY( !fd_bundle_auther_handle_tokens_resp( &ctx->tpu_auther, protobuf, protobuf_sz ) ) ) {
+  if( FD_UNLIKELY( !fd_bundle_auther_handle_tokens_resp( &ctx->tpu_auther, protobuf, protobuf_sz, fd_bundle_now( ctx ) ) ) ) {
     ctx->metrics.decode_fail_cnt++;
   }
   break;
+  case FD_BUNDLE_CLIENT_REQ_Auth_RefreshAccessToken:
+    if( FD_UNLIKELY( !fd_bundle_auther_handle_refresh_resp( &ctx->tpu_auther, protobuf, protobuf_sz, fd_bundle_now( ctx ) ) ) ) {
+      ctx->metrics.decode_fail_cnt++;
+    }
+    break;
   case FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU:
     /* Handle packets from TPU endpoint */
     fd_bundle_tpu_client_handle_packet_batch( ctx, &istream );
@@ -1976,6 +2012,7 @@ fd_bundle_tpu_client_request_failed( fd_bundle_tile_t * ctx,
   switch( request_ctx ) {
   case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthChallenge:
   case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthTokens:
+  case FD_BUNDLE_CLIENT_REQ_Auth_RefreshAccessToken:
     fd_bundle_auther_handle_request_fail( &ctx->tpu_auther );
     break;
   case FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU:
@@ -2041,6 +2078,7 @@ fd_bundle_tpu_client_grpc_rx_timeout( void * app_ctx,
   switch( request_ctx ) {
   case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthChallenge:
   case FD_BUNDLE_CLIENT_REQ_Auth_GenerateAuthTokens:
+  case FD_BUNDLE_CLIENT_REQ_Auth_RefreshAccessToken:
     fd_bundle_auther_handle_request_fail( &ctx->tpu_auther );
     break;
   case FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU:
