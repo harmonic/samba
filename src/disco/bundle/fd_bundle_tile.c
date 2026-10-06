@@ -312,7 +312,7 @@ after_frag( fd_bundle_tile_t *  ctx,
   /* Bundles for this slot are requested from here on, so nothing has
      been lost yet: numbering for the next block starts at 1. */
   ctx->harmonic_seq_tainted = 0;
-  fd_bundle_client_submit_leader_window_info( ctx, ctx->_became_leader->slot, ctx->_became_leader->slot_start_ns );
+  fd_bundle_client_submit_leader_window_info( ctx, ctx->_became_leader->slot, ctx->_became_leader->slot_end_ns );
 }
 
 static void

@@ -65,9 +65,13 @@ typedef struct _block_engine_BlockBuilderFeeInfoResponse {
 } block_engine_BlockBuilderFeeInfoResponse;
 
 typedef struct _block_engine_SubmitLeaderWindowInfoRequest {
+    /* Send time if end_timestamp is set (latency only), else when the leader slot begins. */
     bool has_start_timestamp;
     google_protobuf_Timestamp start_timestamp;
     uint64_t slot;
+    /* When the leader slot ends. */
+    bool has_end_timestamp;
+    google_protobuf_Timestamp end_timestamp;
 } block_engine_SubmitLeaderWindowInfoRequest;
 
 typedef struct _block_engine_SubmitLeaderWindowInfoResponse {
@@ -114,7 +118,7 @@ extern "C" {
 #define block_engine_SubscribeBlocksRequest_init_default {"", ""}
 #define block_engine_BlockBuilderFeeInfoRequest_init_default {0}
 #define block_engine_BlockBuilderFeeInfoResponse_init_default {"", 0}
-#define block_engine_SubmitLeaderWindowInfoRequest_init_default {false, google_protobuf_Timestamp_init_default, 0}
+#define block_engine_SubmitLeaderWindowInfoRequest_init_default {false, google_protobuf_Timestamp_init_default, 0, false, google_protobuf_Timestamp_init_default}
 #define block_engine_SubmitLeaderWindowInfoResponse_init_default {0}
 #define block_engine_SetStrategyRequest_init_default {_block_engine_SchedulingStrategy_MIN}
 #define block_engine_SetStrategyResponse_init_default {0}
@@ -125,7 +129,7 @@ extern "C" {
 #define block_engine_SubscribeBlocksRequest_init_zero {"", ""}
 #define block_engine_BlockBuilderFeeInfoRequest_init_zero {0}
 #define block_engine_BlockBuilderFeeInfoResponse_init_zero {"", 0}
-#define block_engine_SubmitLeaderWindowInfoRequest_init_zero {false, google_protobuf_Timestamp_init_zero, 0}
+#define block_engine_SubmitLeaderWindowInfoRequest_init_zero {false, google_protobuf_Timestamp_init_zero, 0, false, google_protobuf_Timestamp_init_zero}
 #define block_engine_SubmitLeaderWindowInfoResponse_init_zero {0}
 #define block_engine_SetStrategyRequest_init_zero {_block_engine_SchedulingStrategy_MIN}
 #define block_engine_SetStrategyResponse_init_zero {0}
@@ -140,6 +144,7 @@ extern "C" {
 #define block_engine_BlockBuilderFeeInfoResponse_commission_tag 2
 #define block_engine_SubmitLeaderWindowInfoRequest_start_timestamp_tag 1
 #define block_engine_SubmitLeaderWindowInfoRequest_slot_tag 2
+#define block_engine_SubmitLeaderWindowInfoRequest_end_timestamp_tag 3
 #define block_engine_SetStrategyRequest_strategy_tag 1
 
 /* Struct field encoding specification for nanopb */
@@ -186,10 +191,12 @@ X(a, STATIC,   SINGULAR, UINT64,   commission,        2)
 
 #define block_engine_SubmitLeaderWindowInfoRequest_FIELDLIST(X, a) \
 X(a, STATIC,   OPTIONAL, MESSAGE,  start_timestamp,   1) \
-X(a, STATIC,   SINGULAR, UINT64,   slot,              2)
+X(a, STATIC,   SINGULAR, UINT64,   slot,              2) \
+X(a, STATIC,   OPTIONAL, MESSAGE,  end_timestamp,     3)
 #define block_engine_SubmitLeaderWindowInfoRequest_CALLBACK NULL
 #define block_engine_SubmitLeaderWindowInfoRequest_DEFAULT NULL
 #define block_engine_SubmitLeaderWindowInfoRequest_start_timestamp_MSGTYPE google_protobuf_Timestamp
+#define block_engine_SubmitLeaderWindowInfoRequest_end_timestamp_MSGTYPE google_protobuf_Timestamp
 
 #define block_engine_SubmitLeaderWindowInfoResponse_FIELDLIST(X, a) \
 
@@ -238,7 +245,7 @@ extern const pb_msgdesc_t block_engine_SetStrategyResponse_msg;
 #define block_engine_BlockBuilderFeeInfoResponse_size 57
 #define block_engine_SetStrategyRequest_size     2
 #define block_engine_SetStrategyResponse_size    0
-#define block_engine_SubmitLeaderWindowInfoRequest_size 35
+#define block_engine_SubmitLeaderWindowInfoRequest_size 59
 #define block_engine_SubmitLeaderWindowInfoResponse_size 0
 #define block_engine_SubscribeBlocksRequest_size 76
 #define block_engine_SubscribeBundlesRequest_size 0

@@ -508,12 +508,12 @@ void
 fd_bundle_client_send_ping( fd_bundle_tile_t * ctx );
 
 /* fd_bundle_client_submit_leader_window_info notifies the auction house
-   that we are leader for a given slot. */
+   that we are leader for a given slot ending at end_timestamp_ns. */
 
 void
 fd_bundle_client_submit_leader_window_info( fd_bundle_tile_t * ctx,
                                             ulong              slot,
-                                            long               start_timestamp_ns );
+                                            long               end_timestamp_ns );
 
 /* ========== TPU endpoint functions ========== */
 

@@ -373,15 +373,21 @@ fd_bundle_client_set_strategy( fd_bundle_tile_t * ctx ) {
 void
 fd_bundle_client_submit_leader_window_info( fd_bundle_tile_t * ctx,
                                             ulong              slot,
-                                            long               start_timestamp_ns ) {
+                                            long               end_timestamp_ns ) {
   if( FD_UNLIKELY( !ctx->grpc_client ) ) return; /* no client */
   if( FD_UNLIKELY( fd_grpc_client_request_is_blocked( ctx->grpc_client ) ) ) return;
 
+  /* With end_timestamp set, start_timestamp is the send time and only
+     measures latency */
+  long start_timestamp_ns = fd_log_wallclock();
   block_engine_SubmitLeaderWindowInfoRequest req = block_engine_SubmitLeaderWindowInfoRequest_init_default;
   req.slot = slot;
   req.has_start_timestamp = 1;
   req.start_timestamp.seconds = start_timestamp_ns / (long)1e9;
   req.start_timestamp.nanos   = (int32_t)( start_timestamp_ns % (long)1e9 );
+  req.has_end_timestamp = 1;
+  req.end_timestamp.seconds = end_timestamp_ns / (long)1e9;
+  req.end_timestamp.nanos   = (int32_t)( end_timestamp_ns % (long)1e9 );
 
   static char const path[] = "/block_engine.BlockEngineValidator/SubmitLeaderWindowInfo";
   fd_grpc_h2_stream_t * request = fd_grpc_client_request_start(
@@ -396,7 +402,7 @@ fd_bundle_client_submit_leader_window_info( fd_bundle_tile_t * ctx,
   fd_grpc_client_deadline_set(
       request,
       FD_GRPC_DEADLINE_RX_END,
-      fd_log_wallclock() + FD_BUNDLE_CLIENT_REQUEST_TIMEOUT );
+      start_timestamp_ns + FD_BUNDLE_CLIENT_REQUEST_TIMEOUT );
 
   ctx->submit_leader_window_info_wait = 1;
   FD_LOG_INFO(( "Submitting leader window info for slot %lu", slot ));

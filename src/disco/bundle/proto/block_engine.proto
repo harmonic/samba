@@ -36,8 +36,11 @@ message BlockBuilderFeeInfoResponse {
 }
 
 message SubmitLeaderWindowInfoRequest {
+  // Send time if end_timestamp is set (latency only), else when the leader slot begins.
   google.protobuf.Timestamp start_timestamp = 1;
   uint64 slot = 2;
+  // When the leader slot ends.
+  google.protobuf.Timestamp end_timestamp = 3;
 }
 
 message SubmitLeaderWindowInfoResponse {}
