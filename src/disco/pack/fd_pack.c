@@ -59,9 +59,6 @@ fd_hash_32( ulong        seed,
   return h;
 }
 
-/* Vote CU cap while harmonic is throttling votes (restored from full_max_vote_cost_per_block). */
-#define FD_PACK_HARMONIC_VOTE_COST_PER_BLOCK (4UL*1000UL*1000UL)
-
 /* Declare a bunch of helper structs used for pack-internal data
    structures. */
 typedef struct {
@@ -611,7 +608,6 @@ struct fd_pack_private {
 
   ulong      cumulative_block_cost;
   ulong      cumulative_vote_cost;
-  ulong      full_max_vote_cost_per_block; /* Original vote limit, restored after harmonic */
 
   /* expire_before: Any transactions with expires_at strictly less than
      the current expire_before are removed from the available pending
@@ -654,6 +650,8 @@ struct fd_pack_private {
      harmonic_inflight: block bundle microblocks dispatched to banks.
      harmonic_bank_outstanding: bit i set iff bank i's outstanding
        microblock is a block bundle.
+     harmonic_bank_vote_mode: bit i set iff that block bundle was
+       dispatched while votes were being interleaved.
      harmonic_block_txn_completed: block bundle microblocks completed.
      block_end_flags: bitset of FD_PACK_END_FLAG_* for the slot report. */
   ulong harmonic_bundle_idx;
@@ -663,9 +661,9 @@ struct fd_pack_private {
   int   harmonic_stopped;
   ulong harmonic_inflight;
   ulong harmonic_bank_outstanding;
+  ulong harmonic_bank_vote_mode;
   ulong harmonic_block_txn_completed;
   int   block_end_flags;
-  int   leader_next_slot;
 
   /* penalty_treaps: an fd_map_dynamic mapping hotly contended account
      addresses to treaps of transactions that write to them.  We try not
@@ -927,7 +925,6 @@ fd_pack_new( void                   * mem,
   pack->bundle_meta_sz              = bundle_meta_sz;
   pack->bank_tile_cnt               = bank_tile_cnt;
   pack->lim[0]                      = *limits;
-  pack->full_max_vote_cost_per_block = limits->max_vote_cost_per_block;
   pack->pending_txn_cnt             = 0UL;
   pack->microblock_cnt              = 0UL;
   pack->data_bytes_consumed         = 0UL;
@@ -1038,9 +1035,9 @@ fd_pack_new( void                   * mem,
   pack->harmonic_stopped             = 0;
   pack->harmonic_inflight            = 0UL;
   pack->harmonic_bank_outstanding    = 0UL;
+  pack->harmonic_bank_vote_mode      = 0UL;
   pack->block_end_flags              = 0;
   pack->harmonic_block_txn_completed = 0UL;
-  pack->leader_next_slot             = 0;
 
   return mem;
 }
@@ -1982,6 +1979,10 @@ fd_pack_peek_harmonic_meta( fd_pack_t const * pack ) {
   treap_rev_iter_t _cur=treap_rev_iter_init( pack->pending_blocks, pack->pool );
   if( FD_UNLIKELY( treap_rev_iter_done( _cur ) ) ) return NULL; /* empty */
 
+  fd_pack_ord_txn_t * cur = treap_rev_iter_ele( _cur, pack->pool );
+  int is_ib = !!(cur->txn->flags & FD_TXN_P_FLAGS_INITIALIZER_BUNDLE);
+  if( FD_UNLIKELY( is_ib ) ) return NULL;
+
   return (void const *)((uchar const *)pack->bundle_meta + (ulong)_cur * pack->bundle_meta_sz);
 }
 
@@ -2507,6 +2508,7 @@ fd_pack_microblock_complete( fd_pack_t * pack,
   ulong const harmonic_bmsk = 1UL<<bank_tile;
   if( FD_UNLIKELY( pack->harmonic_bank_outstanding & harmonic_bmsk ) ) {
     pack->harmonic_bank_outstanding &= ~harmonic_bmsk;
+    pack->harmonic_bank_vote_mode   &= ~harmonic_bmsk;
     FD_TEST( pack->harmonic_inflight > 0UL );
     pack->harmonic_inflight--;
     pack->harmonic_block_txn_completed++;
@@ -2833,17 +2835,11 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
                                   fd_txn_e_t * out ) {
 
   /* Harmonic mode gating (when harmonic is on):
-     decided == 0 (undecided):  don't schedule anything yet
-     decided == 1 (harmonic):   only schedule from pending_blocks
-     decided == -1 (sprint):    normal scheduling
-     decided == -2 (failed):    block validation failed, normal scheduling
-     decided == -4 (vote_only): only schedule votes (leader next slot) */
+     UNDECIDED: don't schedule anything yet
+     HARMONIC:  only schedule from pending_blocks, and votes when allowed
+     FALLBACK:  normal scheduling */
   if( FD_UNLIKELY( harmonic && pack->harmonic_decision==HARMONIC_MODE_UNDECIDED ) ) {
     return 0UL;
-  }
-
-  if( FD_UNLIKELY( harmonic && pack->harmonic_decision==HARMONIC_MODE_VOTE_ONLY ) ) {
-    schedule_flags = FD_PACK_SCHEDULE_VOTE;
   }
 
   if( FD_UNLIKELY( harmonic && pack->harmonic_decision==HARMONIC_MODE_HARMONIC ) ) {
@@ -2859,6 +2855,7 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
     if( FD_LIKELY( bundle_result>0 ) ) {
       pack->harmonic_inflight++;
       pack->harmonic_bank_outstanding |= 1UL<<bank_tile;
+      pack->harmonic_bank_vote_mode   |= fd_ulong_if( !!(schedule_flags & FD_PACK_SCHEDULE_VOTE), 1UL<<bank_tile, 0UL );
       return (ulong)bundle_result;
     }
     if( FD_UNLIKELY( bundle_result==TRY_BUNDLE_DOES_NOT_FIT ) ) {
@@ -2997,12 +2994,20 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
        in the sequence, or a short bundle), arrives too late, reverts at
        execution, or can never fit in the block, no later bundle is
        accepted (harmonic_stopped);
-     - when a bundle reverts, the block stream is considered bad: every
-       block bundle still pending (all of which are later in stream
-       order) is dropped, nothing further is admitted, and the slot
-       continues in SPRINT with our own transactions.  Block bundles
-       already in flight on other banks were account-disjoint from the
-       reverted one when dispatched and are left to finish. */
+     - when a bundle reverts, every block bundle still pending (all of
+       which are later in stream order) is dropped and nothing further
+       is admitted.  Block bundles already in flight on other banks were
+       account-disjoint from the reverted one when dispatched and are
+       left to finish.  A bundle dispatched while votes are interleaved
+       may revert on vote account state the builder did not see, so its
+       revert is not a stream error and the block continues.
+
+   Any stop before the cutoff means the block stream is bad: once the
+   bundles accepted before it have been dispatched, the slot continues
+   in FALLBACK with our own transactions.  A stop before the block has
+   started (still UNDECIDED, waiting for its crank) falls back at once.
+   A stop after the cutoff is not a stream failure; the block is simply
+   over. */
 
 static void
 harmonic_drop_pending( fd_pack_t * pack ) {
@@ -3012,16 +3017,15 @@ harmonic_drop_pending( fd_pack_t * pack ) {
   }
 }
 
-/* harmonic_leave moves from UNDECIDED/HARMONIC to the mode used for the
-   rest of the slot and lifts the vote cost cap applied while a block
-   executes. */
+/* harmonic_fallback gives up on the block for the rest of the slot and
+   packs our own transactions instead. */
 
 static void
-harmonic_leave( fd_pack_t * pack,
-                int         flag ) {
-  pack->block_end_flags             |= flag;
-  pack->lim->max_vote_cost_per_block = pack->full_max_vote_cost_per_block;
-  pack->harmonic_decision            = pack->leader_next_slot ? HARMONIC_MODE_VOTE_ONLY : HARMONIC_MODE_SPRINT;
+harmonic_fallback( fd_pack_t * pack,
+                   int         flag ) {
+  harmonic_drop_pending( pack );
+  pack->block_end_flags   |= flag;
+  pack->harmonic_decision  = HARMONIC_MODE_FALLBACK;
 }
 
 void
@@ -3032,6 +3036,11 @@ fd_pack_harmonic_stop( fd_pack_t * pack,
   }
   pack->harmonic_stopped  = 1;
   pack->block_end_flags  |= flag;
+  /* The block has not started: none of it runs */
+  if( FD_UNLIKELY( pack->harmonic_decision==HARMONIC_MODE_UNDECIDED ) ) {
+    harmonic_fallback( pack, 0 );
+    FD_LOG_INFO(( "HARMONIC: UNDECIDED -> FALLBACK (stopped, flags=%d)", pack->block_end_flags ));
+  }
 }
 
 void
@@ -3049,23 +3058,17 @@ fd_pack_harmonic_bank_failed( fd_pack_t * pack,
     fd_pack_microblock_complete( pack, bank_tile );
     return;
   }
-  FD_LOG_WARNING(( "HARMONIC: block bundle reverted on bank %lu, dropping the rest of the block", bank_tile ));
-  fd_pack_microblock_complete( pack, bank_tile );
-  fd_pack_harmonic_abort( pack, FD_PACK_END_FLAG_HARMONIC_REVERTED );
-  if( FD_LIKELY( pack->harmonic_decision==HARMONIC_MODE_HARMONIC ) ) {
-    pack->lim->max_vote_cost_per_block = pack->full_max_vote_cost_per_block;
-    pack->harmonic_decision            = HARMONIC_MODE_SPRINT;
+  if( FD_LIKELY( !(pack->harmonic_bank_vote_mode & (1UL<<bank_tile)) ) ) {
+    FD_LOG_WARNING(( "HARMONIC: block bundle reverted on bank %lu, dropping the rest of the block", bank_tile ));
+    fd_pack_harmonic_abort( pack, FD_PACK_END_FLAG_HARMONIC_REVERTED );
   }
+  fd_pack_microblock_complete( pack, bank_tile );
 }
 
 void
 fd_pack_harmonic_reset( fd_pack_t * pack,
-                        ulong       leader_slot,
-                        int         leader_next_slot ) {
+                        ulong       leader_slot ) {
   harmonic_drop_pending( pack );
-
-  /* Throttle votes while the block executes; harmonic_leave restores it */
-  pack->lim->max_vote_cost_per_block = fd_ulong_min( FD_PACK_HARMONIC_VOTE_COST_PER_BLOCK, pack->full_max_vote_cost_per_block );
 
   pack->harmonic_bundle_idx          = 1UL;
   pack->harmonic_decision            = HARMONIC_MODE_UNDECIDED;
@@ -3074,9 +3077,9 @@ fd_pack_harmonic_reset( fd_pack_t * pack,
   pack->harmonic_stopped             = 0;
   pack->harmonic_inflight            = 0UL;
   pack->harmonic_bank_outstanding    = 0UL;
+  pack->harmonic_bank_vote_mode      = 0UL;
   pack->harmonic_block_txn_completed = 0UL;
   pack->block_end_flags              = 0;
-  pack->leader_next_slot             = leader_next_slot;
 }
 
 int
@@ -3094,9 +3097,8 @@ fd_pack_harmonic_insert_bundle_fini( fd_pack_t          * pack,
                                      ulong              * delete_cnt ) {
   *delete_cnt = 0UL;
 
-  /* The crank is still accepted after a stop; pending bundles need it */
   int accepting = (pack->harmonic_decision==HARMONIC_MODE_UNDECIDED) | (pack->harmonic_decision==HARMONIC_MODE_HARMONIC);
-  if( FD_UNLIKELY( (!accepting) | (pack->harmonic_stopped & !initializer_bundle) ) ) {
+  if( FD_UNLIKELY( (!accepting) | pack->harmonic_stopped ) ) {
     fd_pack_insert_bundle_cancel( pack, bundle, txn_cnt );
     return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
   }
@@ -3120,36 +3122,38 @@ fd_pack_harmonic_insert_bundle_fini( fd_pack_t          * pack,
     }
     pack->harmonic_next_seq++;
 
-    if( FD_UNLIKELY( pack->harmonic_decision==HARMONIC_MODE_UNDECIDED ) ) {
-      if( FD_LIKELY( now_ns<harmonic_threshold_ns ) ) {
-        pack->harmonic_decision = HARMONIC_MODE_HARMONIC;
-        FD_LOG_INFO(( "HARMONIC: UNDECIDED -> HARMONIC (arrival=%ld < threshold=%ld)", now_ns, harmonic_threshold_ns ));
-      } else {
-        FD_LOG_INFO(( "HARMONIC: first block bundle arrived after threshold (arrival=%ld >= threshold=%ld)", now_ns, harmonic_threshold_ns ));
-        harmonic_leave( pack, FD_PACK_END_FLAG_HARMONIC_TIMEOUT );
-        fd_pack_insert_bundle_cancel( pack, bundle, txn_cnt );
-        return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
-      }
-    } else if( FD_UNLIKELY( now_ns>harmonic_cutoff_ns ) ) {
+    if( FD_UNLIKELY( pack->harmonic_decision==HARMONIC_MODE_HARMONIC && now_ns>harmonic_cutoff_ns ) ) {
       FD_LOG_INFO(( "HARMONIC: block bundle arrived after cutoff (arrival=%ld, cutoff=%ld)", now_ns, harmonic_cutoff_ns ));
       fd_pack_insert_bundle_cancel( pack, bundle, txn_cnt );
       fd_pack_harmonic_stop( pack, FD_PACK_END_FLAG_HARMONIC_TIMEOUT );
       return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
     }
-  } else if( FD_UNLIKELY( pack->harmonic_decision!=HARMONIC_MODE_HARMONIC ) ) {
+  }
+
+  if( FD_UNLIKELY( pack->harmonic_decision==HARMONIC_MODE_UNDECIDED && now_ns>=harmonic_threshold_ns ) ) {
+    FD_LOG_INFO(( "HARMONIC: UNDECIDED -> FALLBACK (block did not start before threshold=%ld)", harmonic_threshold_ns ));
+    harmonic_fallback( pack, FD_PACK_END_FLAG_HARMONIC_TIMEOUT );
     fd_pack_insert_bundle_cancel( pack, bundle, txn_cnt );
     return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
   }
 
   int result = insert_bundle_fini_impl( pack, bundle, txn_cnt, expires_at, initializer_bundle, bundle_meta, delete_cnt, 1, revert_protected );
   if( FD_UNLIKELY( result<0 ) ) {
-    /* The bundle was cancelled by the insert.  Everything pending is
-       earlier in the block and still executes; nothing later may.  If
-       the crank itself cannot be inserted nothing can execute, so the
-       pending bundles are dropped as well. */
-    FD_LOG_WARNING(( "HARMONIC: block %s rejected by pack (%d), no further block bundles this slot", initializer_bundle ? "crank" : "bundle", result ));
-    if( FD_UNLIKELY( initializer_bundle ) ) fd_pack_harmonic_abort( pack, FD_PACK_END_FLAG_HARMONIC_FAILED );
-    else                                    fd_pack_harmonic_stop ( pack, FD_PACK_END_FLAG_HARMONIC_FAILED );
+    /* The bundle was cancelled by the insert.  A crank is retried by
+       the pack tile.  For a block bundle, everything pending is earlier
+       in the block and still executes; nothing later may. */
+    if( FD_UNLIKELY( initializer_bundle ) ) return result;
+    FD_LOG_WARNING(( "HARMONIC: block bundle rejected by pack (%d), no further block bundles this slot", result ));
+    fd_pack_harmonic_stop( pack, FD_PACK_END_FLAG_HARMONIC_FAILED );
+    return result;
+  }
+
+  /* The block starts once its crank is in or not needed, so it never
+     runs against a tip state the block builder does not expect */
+  if( FD_UNLIKELY( pack->harmonic_decision==HARMONIC_MODE_UNDECIDED &&
+                   ( initializer_bundle || pack->initializer_bundle_state==FD_PACK_IB_STATE_READY ) ) ) {
+    pack->harmonic_decision = HARMONIC_MODE_HARMONIC;
+    FD_LOG_INFO(( "HARMONIC: UNDECIDED -> HARMONIC (arrival=%ld < threshold=%ld)", now_ns, harmonic_threshold_ns ));
   }
   return result;
 }
@@ -3175,80 +3179,57 @@ fd_pack_harmonic_state_crank( fd_pack_t * pack,
   switch( pack->harmonic_decision ) {
 
     case HARMONIC_MODE_UNDECIDED: {
-      /* Stopped before any bundle was accepted: fall back now */
-      if( FD_UNLIKELY( pack->harmonic_stopped ) ) {
-        harmonic_leave( pack, 0 );
-        FD_LOG_INFO(( "HARMONIC: UNDECIDED -> %s (stopped, flags=%d)",
-                      pack->harmonic_decision==HARMONIC_MODE_VOTE_ONLY ? "VOTE_ONLY" : "SPRINT", pack->block_end_flags ));
-        break;
-      }
+      ulong pending_cnt = treap_ele_cnt( pack->pending_blocks );
+      /* No block in time: fall back */
       if( approx_wallclock_ns>=harmonic_threshold_ns ) {
-        harmonic_leave( pack, FD_PACK_END_FLAG_HARMONIC_TIMEOUT );
-        FD_LOG_INFO(( "HARMONIC: UNDECIDED -> %s (threshold reached, no block bundles)",
-                      pack->harmonic_decision==HARMONIC_MODE_VOTE_ONLY ? "VOTE_ONLY" : "SPRINT" ));
+        harmonic_fallback( pack, FD_PACK_END_FLAG_HARMONIC_TIMEOUT );
+        FD_LOG_INFO(( "HARMONIC: UNDECIDED -> FALLBACK (block did not start before threshold, pending=%lu)", pending_cnt ));
+      } else if( pending_cnt && pack->initializer_bundle_state==FD_PACK_IB_STATE_READY ) {
+        pack->harmonic_decision = HARMONIC_MODE_HARMONIC;
+        FD_LOG_INFO(( "HARMONIC: UNDECIDED -> HARMONIC (crank not needed)" ));
       }
-      break;
+      return;
     }
 
     case HARMONIC_MODE_HARMONIC: {
-      ulong pending_cnt = treap_ele_cnt( pack->pending_blocks );
-
-      /* Slot ended and the crank never arrived: nothing pending can run */
-      if( FD_UNLIKELY( past_end_time && pending_cnt && !pack->harmonic_inflight &&
-                       pack->initializer_bundle_state==FD_PACK_IB_STATE_NOT_INITIALIZED ) ) {
-        FD_LOG_WARNING(( "HARMONIC: slot ended with %lu block bundles pending and no crank, dropping them", pending_cnt ));
-        fd_pack_harmonic_abort( pack, FD_PACK_END_FLAG_HARMONIC_FAILED );
-        pending_cnt = 0UL;
-      }
-
-      /* Leave once every accepted bundle has been dispatched and no
-         more can be accepted (past the cutoff, or stopped).  Bundles
+      /* Once every accepted bundle has been dispatched, a stop before
+         the cutoff means the block stream is bad: fall back.  Bundles
          still in flight keep their account locks, so nothing scheduled
          afterwards can conflict with them. */
-      if( pending_cnt==0UL && (approx_wallclock_ns>=harmonic_cutoff_ns || pack->harmonic_stopped) ) {
-        harmonic_leave( pack, 0 );
-        FD_LOG_INFO(( "HARMONIC: HARMONIC -> %s (inflight=%lu, completed=%lu, flags=%d)",
-                      pack->harmonic_decision==HARMONIC_MODE_VOTE_ONLY ? "VOTE_ONLY" : "SPRINT",
+      if( treap_ele_cnt( pack->pending_blocks ) ) return;
+      if( approx_wallclock_ns<harmonic_cutoff_ns ) {
+        if( FD_LIKELY( !pack->harmonic_stopped ) ) return;
+        harmonic_fallback( pack, 0 );
+        FD_LOG_INFO(( "HARMONIC: HARMONIC -> FALLBACK (inflight=%lu, completed=%lu, flags=%d)",
                       pack->harmonic_inflight, pack->harmonic_block_txn_completed, pack->block_end_flags ));
-        break;
-      }
-
-      if( FD_UNLIKELY( pending_cnt==0UL && pack->harmonic_inflight==0UL && past_end_time ) ) {
-        pack->block_end_flags             |= FD_PACK_END_FLAG_HARMONIC_TIMEOUT;
-        pack->harmonic_decision            = HARMONIC_MODE_DONE;
-        pack->lim->max_vote_cost_per_block = pack->full_max_vote_cost_per_block;
-        FD_LOG_INFO(( "HARMONIC: HARMONIC -> DONE (flags=%d)", pack->block_end_flags ));
+        return;
       }
       break;
     }
 
-    case HARMONIC_MODE_SPRINT:
-    case HARMONIC_MODE_FAILED:
-    case HARMONIC_MODE_VOTE_ONLY: {
-      if( treap_ele_cnt( pack->pending_blocks )==0UL && pack->harmonic_inflight==0UL ) {
-        pack->lim->max_vote_cost_per_block = pack->full_max_vote_cost_per_block;
-      }
-      if( FD_UNLIKELY( past_end_time ) ) {
-        char const * from = pack->harmonic_decision==HARMONIC_MODE_VOTE_ONLY ? "VOTE_ONLY" :
-                            pack->harmonic_decision==HARMONIC_MODE_SPRINT    ? "SPRINT"    : "FAILED";
-        if( pending_votes==0UL ) {
-          pack->harmonic_decision  = HARMONIC_MODE_DONE;
-          FD_LOG_INFO(( "HARMONIC: %s -> DONE (flags=%d)", from, pack->block_end_flags ));
-        } else if( tried_votes && schedule_cnt==0UL ) {
-          pack->block_end_flags   |= FD_PACK_END_FLAG_VOTE_DRAIN;
-          pack->harmonic_decision  = HARMONIC_MODE_DONE;
-          FD_LOG_INFO(( "HARMONIC: %s -> DONE (flags=%d)", from, pack->block_end_flags ));
-        }
-      }
+    case HARMONIC_MODE_FALLBACK:
       break;
-    }
 
     case HARMONIC_MODE_DONE:
-      break;
+      return;
 
     default:
       FD_LOG_ERR(( "HARMONIC: invalid state: %d", pack->harmonic_decision ));
-      break;
+      return;
+  }
+
+  /* A finished block or a fallback is done once the slot has ended and
+     the votes are drained */
+  if( FD_UNLIKELY( past_end_time ) ) {
+    char const * from = pack->harmonic_decision==HARMONIC_MODE_HARMONIC ? "HARMONIC" : "FALLBACK";
+    if( pending_votes==0UL ) {
+      pack->harmonic_decision  = HARMONIC_MODE_DONE;
+      FD_LOG_INFO(( "HARMONIC: %s -> DONE (flags=%d)", from, pack->block_end_flags ));
+    } else if( tried_votes && schedule_cnt==0UL ) {
+      pack->block_end_flags   |= FD_PACK_END_FLAG_VOTE_DRAIN;
+      pack->harmonic_decision  = HARMONIC_MODE_DONE;
+      FD_LOG_INFO(( "HARMONIC: %s -> DONE (flags=%d)", from, pack->block_end_flags ));
+    }
   }
 }
 
@@ -3262,7 +3243,6 @@ fd_pack_set_block_limits( fd_pack_t * pack, fd_pack_limits_t const * limits ) {
   FD_TEST( limits->max_vote_cost_per_block >= FD_PACK_MAX_VOTE_COST_PER_BLOCK_LOWER_BOUND );
   FD_TEST( limits->max_write_cost_per_acct >= FD_PACK_MAX_WRITE_COST_PER_ACCT_LOWER_BOUND );
 
-  pack->full_max_vote_cost_per_block      = limits->max_vote_cost_per_block;
   pack->lim->max_microblocks_per_block    = limits->max_microblocks_per_block;
   pack->lim->max_data_bytes_per_block     = limits->max_data_bytes_per_block;
   pack->lim->max_cost_per_block           = limits->max_cost_per_block;
@@ -3372,6 +3352,7 @@ fd_pack_end_block( fd_pack_t * pack ) {
   pack->cumulative_rebated_cus      = 0UL;
   pack->outstanding_microblock_mask = 0UL;
   pack->harmonic_bank_outstanding   = 0UL;
+  pack->harmonic_bank_vote_mode     = 0UL;
   pack->alloc_consumed              = 0UL;
   pack->block_end_flags             = 0;
 

@@ -665,10 +665,8 @@ void fd_pack_set_initializer_bundles_ready( fd_pack_t * pack );
 
 #define HARMONIC_MODE_UNDECIDED   (0)
 #define HARMONIC_MODE_HARMONIC   (1)
-#define HARMONIC_MODE_SPRINT     (-1)
-#define HARMONIC_MODE_FAILED     (-2)
-#define HARMONIC_MODE_VOTE_ONLY  (-4)
-#define HARMONIC_MODE_DONE       (-3)
+#define HARMONIC_MODE_FALLBACK   (-1)
+#define HARMONIC_MODE_DONE       (-2)
 
 #define FD_PACK_END_FLAG_HARMONIC_TIMEOUT  (1<<0) /* block never arrived, arrived late, or was cut off */
 #define FD_PACK_END_FLAG_VOTE_DRAIN        (1<<1) /* votes remained at slot end */
@@ -763,7 +761,7 @@ fd_pack_schedule_next_microblock( fd_pack_t  * pack,
    cancelled.  FD_PACK_INSERT_REJECT_BLOCK_FAILED means the bundle was
    not admitted (wrong slot or mode, gap in the sequence, too late). */
 
-void fd_pack_harmonic_reset( fd_pack_t * pack, ulong leader_slot, int leader_next_slot );
+void fd_pack_harmonic_reset( fd_pack_t * pack, ulong leader_slot );
 
 int fd_pack_harmonic_insert_bundle_fini( fd_pack_t          * pack,
                                          fd_txn_e_t * const * bundle,
@@ -779,12 +777,14 @@ int fd_pack_harmonic_insert_bundle_fini( fd_pack_t          * pack,
                                          ulong              * delete_cnt );
 
 /* fd_pack_harmonic_stop stops admitting block bundles for the rest of
-   the slot; bundles already accepted still execute.  fd_pack_harmonic_abort
-   additionally drops every block bundle still pending.  flag is OR'd
-   into the end-of-slot flags.  fd_pack_harmonic_bank_failed handles a
-   block bundle microblock on bank_tile that produced no entries: it
-   completes the microblock, aborts, and moves to SPRINT so the slot
-   continues with our own transactions.  Call it in place of
+   the slot.  Bundles already accepted still execute, unless the block
+   has not started, in which case they are dropped and pack falls back.
+   fd_pack_harmonic_abort additionally drops every block bundle still
+   pending.  flag is OR'd into the end-of-slot flags.
+   fd_pack_harmonic_bank_failed handles a block bundle microblock on
+   bank_tile that produced no entries: it completes the microblock and
+   aborts, unless the bundle was dispatched while votes were
+   interleaved, in which case the block continues.  Call it in place of
    fd_pack_microblock_complete for that bank. */
 
 void fd_pack_harmonic_stop       ( fd_pack_t * pack, int flag );

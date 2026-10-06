@@ -345,8 +345,7 @@ static void
 pack_crank_refresh_memo( fd_pack_ctx_t * ctx,
                          int             harmonic_state ) {
   char const * memo;
-  if( ctx->harmonic &&
-      (harmonic_state==HARMONIC_MODE_SPRINT || harmonic_state==HARMONIC_MODE_FAILED) ) {
+  if( ctx->harmonic && harmonic_state==HARMONIC_MODE_FALLBACK ) {
     memo = pack_schedule_strategy_memo( ctx->strategy );
   } else {
     memo = pack_crank_strategy_memo( ctx->runtime_cfg->harmonic_strategy );
@@ -670,7 +669,7 @@ after_credit( fd_pack_ctx_t *     ctx,
       ctx->execle_idle_bitset |= 1UL<<poll_cursor;
 
       /* Harmonic: the execle flags a block bundle microblock that
-         produced no entries; the rest of the block is dropped. */
+         produced no entries; pack decides whether that ends the block. */
       if( FD_UNLIKELY( ctx->harmonic && (fd_fseq_query( ctx->execle_current[poll_cursor] ) & FD_PACK_EXECLE_BUSY_FAIL_FLAG) ) ) {
         fd_pack_harmonic_bank_failed( ctx->pack, (ulong)poll_cursor );
       } else {
@@ -792,21 +791,20 @@ after_credit( fd_pack_ctx_t *     ctx,
     } else {
       /* Harmonic mode enabled */
       switch( harmonic_state ) {
+        case HARMONIC_MODE_UNDECIDED:
         case HARMONIC_MODE_HARMONIC:
-          /* In HARMONIC mode: only use harmonic meta (don't touch regular bundles) */
+          /* Crank for the block from its own meta (don't touch regular
+             bundles).  The block only starts once the crank is in. */
           top_meta = fd_pack_peek_harmonic_meta( ctx->pack );
           harmonic_crank = 1;
           break;
-        case HARMONIC_MODE_SPRINT:
-        case HARMONIC_MODE_FAILED:
-          /* SPRINT/FAILED: harmonic block done/failed, use regular bundle meta */
+        case HARMONIC_MODE_FALLBACK:
+          /* FALLBACK: no usable block, use regular bundle meta */
           top_meta = fd_pack_peek_bundle_meta( ctx->pack );
           break;
-        case HARMONIC_MODE_VOTE_ONLY:
-        case HARMONIC_MODE_UNDECIDED:
         case HARMONIC_MODE_DONE:
         default:
-          /* VOTE_ONLY/UNDECIDED/DONE: no bundle cranking */
+          /* DONE: no bundle cranking */
           break;
       }
     }
@@ -880,8 +878,6 @@ after_credit( fd_pack_ctx_t *     ctx,
         /* Already logged a warning in this case */
         fd_pack_insert_bundle_cancel( ctx->pack, bundle, 1UL );
         ctx->crank->metrics[ 2 ]++; /* BUNDLE_CRANK_RESULT_CREATION_FAILED' */
-        /* Harmonic: the block cannot execute without the crank */
-        if( FD_UNLIKELY( harmonic_crank ) ) fd_pack_harmonic_abort( ctx->pack, FD_PACK_END_FLAG_HARMONIC_FAILED );
       }
     }
   }
@@ -1371,23 +1367,21 @@ after_frag( fd_pack_ctx_t *     ctx,
     fd_pack_set_block_limits( ctx->pack, limits );
     fd_pack_pacing_update_consumed_cus( ctx->pacer, fd_pack_current_block_cost( ctx->pack ), now );
 
-    /* Reset harmonic state for new slot.  Must follow
-       fd_pack_set_block_limits, whose vote limit the reset throttles.
+    /* Reset harmonic state for new slot.
        Note: pack's acct_in_use is cleared by fd_pack_end_block, so we don't
        need to explicitly clear account locks here.
        Set harmonic_block_slot to leader_slot so block txns for other slots are dropped. */
     if( FD_UNLIKELY( ctx->harmonic ) ) {
-      fd_pack_harmonic_reset( ctx->pack, leader_slot, ctx->_became_leader->leader_next_slot );
+      fd_pack_harmonic_reset( ctx->pack, leader_slot );
       if( FD_UNLIKELY( ctx->current_bundle->bundle && ctx->current_bundle->is_harmonic ) ) {
         FD_MCNT_INC( PACK, TXN_PARTIAL_BUNDLE, ctx->current_bundle->txn_received );
         fd_pack_insert_bundle_cancel( ctx->pack, ctx->current_bundle->bundle, ctx->current_bundle->txn_cnt );
         ctx->current_bundle->bundle = NULL;
         ctx->current_bundle->id     = 0UL;
       }
-      FD_LOG_INFO(( "HARMONIC: new leader slot=%lu, start=%ld end=%ld threshold_ns=%ld cutoff_ns=%ld leader_next_slot=%d",
+      FD_LOG_INFO(( "HARMONIC: new leader slot=%lu, start=%ld end=%ld threshold_ns=%ld cutoff_ns=%ld",
                     ctx->leader_slot, ctx->slot_start_ns, ctx->slot_end_ns,
-                    ctx->harmonic_threshold_ns, ctx->harmonic_cutoff_ns,
-                    ctx->_became_leader->leader_next_slot ));
+                    ctx->harmonic_threshold_ns, ctx->harmonic_cutoff_ns ));
     }
 
     break;

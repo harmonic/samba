@@ -1112,11 +1112,6 @@ publish_became_leader( fd_pohh_tile_t * ctx,
   leader->bundle->config[0]       = config[0];
   leader->slot                    = slot;
 
-  /* Check if we are also the leader for slot+1 (consecutive leader slots).
-     Used by pack to decide VOTE_ONLY vs SPRINT after harmonic block completes. */
-  fd_pubkey_t const * next_slot_leader = fd_multi_epoch_leaders_get_leader_for_slot( ctx->mleaders, slot+1UL );
-  leader->leader_next_slot = next_slot_leader && !memcmp( next_slot_leader->key, ctx->identity_key.uc, 32UL );
-
   leader->limits.slot_max_cost                     = ctx->limits.slot_max_cost;
   leader->limits.slot_max_vote_cost                = ctx->limits.slot_max_vote_cost;
   leader->limits.slot_max_write_cost_per_acct      = ctx->limits.slot_max_write_cost_per_acct;
