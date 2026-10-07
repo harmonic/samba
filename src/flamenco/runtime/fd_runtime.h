@@ -272,6 +272,7 @@ struct fd_txn_out {
 
     fd_compute_budget_details_t compute_budget;            /* Compute budget details */
     fd_transaction_cost_t       txn_cost;                  /* Transaction cost */
+    int                         cost_added;                /* txn_cost is already in the cost tracker (fd_cost_tracker_try_add_costs) */
     ulong                       loaded_accounts_data_size; /* The actual transaction loaded data size */
     long                        accounts_resize_delta;     /* Transaction level tracking for account resizing */
 

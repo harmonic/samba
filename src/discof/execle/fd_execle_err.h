@@ -52,9 +52,11 @@ fd_execle_err_from_runtime_err( int err ) {
 
       case FD_RUNTIME_TXN_ERR_BUNDLE_PEER:                             return FD_METRICS_ENUM_TXN_RESULT_V_BUNDLE_PEER_IDX;
 
+      /* Harmonic block transactions are admitted by actual cost */
       case FD_RUNTIME_TXN_ERR_WOULD_EXCEED_MAX_BLOCK_COST_LIMIT:
       case FD_RUNTIME_TXN_ERR_WOULD_EXCEED_MAX_ACCOUNT_COST_LIMIT:
-      case FD_RUNTIME_TXN_ERR_WOULD_EXCEED_ACCOUNT_DATA_BLOCK_LIMIT:
+      case FD_RUNTIME_TXN_ERR_WOULD_EXCEED_ACCOUNT_DATA_BLOCK_LIMIT:   return FD_METRICS_ENUM_TXN_RESULT_V_COST_LIMIT_IDX;
+
       case FD_RUNTIME_TXN_ERR_WOULD_EXCEED_MAX_VOTE_COST_LIMIT:
       case FD_RUNTIME_TXN_ERR_WOULD_EXCEED_ACCOUNT_DATA_TOTAL_LIMIT:
       default: FD_LOG_ERR(( "Unknown runtime error %d", err ));

@@ -205,6 +205,67 @@ test_cost_tracker_multiple_accounts( fd_cost_tracker_t * ct ) {
   FD_TEST( ct->block_cost == 600UL );
 }
 
+/* fd_cost_tracker_try_add_costs adds a bundle all or none */
+static void
+test_cost_tracker_bundle( fd_cost_tracker_t * ct ) {
+  fd_features_t f;
+  static fd_txn_out_t txns[ 3 ];
+  memset( txns, 0, sizeof(txns) );
+
+  /* txn 0 writes A, txn 1 writes A and B, txn 2 writes B */
+  uchar const writes[ 3 ][ 2 ] = { { 'A', 0 }, { 'A', 'B' }, { 'B', 0 } };
+  uint  const costs [ 3 ]      = { 400U, 500U, 600U };
+  for( ulong i=0UL; i<3UL; i++ ) {
+    for( ulong j=0UL; j<2UL && writes[ i ][ j ]; j++ ) {
+      txns[ i ].accounts.keys[ j ].uc[ 0 ]  = writes[ i ][ j ];
+      txns[ i ].accounts.is_writable[ j ] = 1U;
+      txns[ i ].accounts.cnt++;
+    }
+    txns[ i ].details.txn_cost.transaction.programs_execution_cost      = costs[ i ];
+    txns[ i ].details.txn_cost.transaction.allocated_accounts_data_size = 100UL;
+  }
+
+  fd_features_enable_all( &f );
+  fd_cost_tracker_init( ct, &f, &FD_SLOT_PARAMS_400MS, 10UL );
+  ct->block_cost_limit   = 10000UL;
+  ct->account_cost_limit = 1000UL;
+  ct->data_size_limit    = 10000UL;
+
+  /* A already has 100 */
+  static fd_txn_out_t one;
+  memset( &one, 0, sizeof(one) );
+  one.accounts.cnt                                         = 1UL;
+  one.accounts.keys[ 0 ].uc[ 0 ]                           = 'A';
+  one.accounts.keys[ 1 ].uc[ 0 ]                           = 'B';
+  one.accounts.is_writable[ 0 ]                            = 1U;
+  one.accounts.is_writable[ 1 ]                            = 1U;
+  one.details.txn_cost.transaction.programs_execution_cost = 100U;
+  FD_TEST( fd_cost_tracker_try_add_cost( ct, &one )==FD_COST_TRACKER_SUCCESS );
+
+  /* B would reach 1100: nothing is added */
+  ulong failed_idx = ULONG_MAX;
+  FD_TEST( fd_cost_tracker_try_add_costs( ct, txns, 3UL, &failed_idx )==FD_COST_TRACKER_ERROR_WOULD_EXCEED_ACCOUNT_MAX_LIMIT );
+  FD_TEST( failed_idx==2UL );
+  FD_TEST( ct->block_cost==100UL );
+  FD_TEST( ct->allocated_accounts_data_size==0UL );
+  for( ulong i=0UL; i<3UL; i++ ) FD_TEST( !txns[ i ].details.cost_added );
+
+  /* A and B have their budgets back */
+  one.accounts.cnt                                         = 2UL;
+  one.details.txn_cost.transaction.programs_execution_cost = 900U;
+  FD_TEST( fd_cost_tracker_try_add_cost( ct, &one )==FD_COST_TRACKER_SUCCESS );
+
+  /* A bundle that fits is added whole and marked */
+  fd_cost_tracker_init( ct, &f, &FD_SLOT_PARAMS_400MS, 10UL );
+  ct->block_cost_limit   = 10000UL;
+  ct->account_cost_limit = 1000UL;
+  ct->data_size_limit    = 10000UL;
+  FD_TEST( fd_cost_tracker_try_add_costs( ct, txns, 2UL, &failed_idx )==FD_COST_TRACKER_SUCCESS );
+  FD_TEST( ct->block_cost==900UL );
+  FD_TEST( ct->allocated_accounts_data_size==200UL );
+  FD_TEST( txns[ 0 ].details.cost_added && txns[ 1 ].details.cost_added );
+}
+
 int main( int argc, char ** argv ) {
   fd_boot( &argc, &argv );
 
@@ -251,6 +312,7 @@ int main( int argc, char ** argv ) {
   test_cost_tracker_data_size_limit( cost_tracker );
   test_cost_tracker_rejection_non_mutating( cost_tracker );
   test_cost_tracker_multiple_accounts( cost_tracker );
+  test_cost_tracker_bundle( cost_tracker );
 
   /* TODO: Add more sophisticated tests for the cost tracker. */
   FD_LOG_NOTICE(( "pass" ));

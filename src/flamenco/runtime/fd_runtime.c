@@ -1297,7 +1297,7 @@ fd_runtime_commit_txn( fd_runtime_t *      runtime,
   FD_ATOMIC_FETCH_AND_ADD( &bank->f.total_compute_units_used, txn_out->details.compute_budget.compute_unit_limit-txn_out->details.compute_budget.compute_meter );
 
   fd_cost_tracker_t * cost_tracker = fd_cost_tracker_store_peek( fd_bank_cost_tracker( bank ), bank->cost_tracker_fork_id );
-  int res = fd_cost_tracker_try_add_cost( cost_tracker, txn_out );
+  int res = txn_out->details.cost_added ? FD_COST_TRACKER_SUCCESS : fd_cost_tracker_try_add_cost( cost_tracker, txn_out );
   if( FD_UNLIKELY( res!=FD_COST_TRACKER_SUCCESS ) ) {
     FD_LOG_DEBUG(( "fd_runtime_commit_txn: transaction failed to fit into block %d", res ));
     txn_out->err.is_committable = 0;
@@ -1410,6 +1410,7 @@ fd_runtime_new_txn_out( fd_txn_in_t const * txn_in,
 
   fd_compute_budget_details_new( &txn_out->details.compute_budget );
   fd_memset( &txn_out->details.txn_cost, 0, sizeof(txn_out->details.txn_cost) );
+  txn_out->details.cost_added = 0;
 
   txn_out->details.loaded_accounts_data_size = 0UL;
   txn_out->details.accounts_resize_delta     = 0L;

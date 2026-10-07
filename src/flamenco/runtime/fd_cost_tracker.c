@@ -463,3 +463,51 @@ fd_cost_tracker_try_add_cost( fd_cost_tracker_t * cost_tracker,
   fd_rwlock_unwrite( &cost_tracker_outer->lock );
   return FD_COST_TRACKER_SUCCESS;
 }
+
+int
+fd_cost_tracker_try_add_costs( fd_cost_tracker_t * cost_tracker,
+                               fd_txn_out_t *      txn_outs,
+                               ulong               txn_cnt,
+                               ulong *             failed_idx ) {
+  cost_tracker_outer_t * cost_tracker_outer = fd_type_pun( cost_tracker );
+  account_cost_map_t *   map                = fd_type_pun( cost_tracker_outer+1UL );
+  account_cost_t *       pool               = fd_type_pun( (void*)((ulong)cost_tracker_outer+cost_tracker_outer->pool_offset) );
+  fd_rwlock_write( &cost_tracker_outer->lock );
+
+  ulong const accounts_used = cost_tracker_outer->accounts_used;
+  int         err           = FD_COST_TRACKER_SUCCESS;
+  ulong       i;
+  for( i=0UL; i<txn_cnt; i++ ) {
+    fd_transaction_cost_t const * txn_cost = &txn_outs[ i ].details.txn_cost;
+    err = would_fit( cost_tracker, &txn_outs[ i ], txn_cost );
+    if( FD_UNLIKELY( err!=FD_COST_TRACKER_SUCCESS ) ) break;
+    cost_tracker->allocated_accounts_data_size += get_allocated_accounts_data_size( txn_cost );
+    add_transaction_execution_cost( cost_tracker, &txn_outs[ i ], transaction_cost_sum( txn_cost ) );
+  }
+
+  if( FD_UNLIKELY( err!=FD_COST_TRACKER_SUCCESS ) ) {
+    *failed_idx = i;
+    /* Undo the adds.  would_fit kept every sum within its limit, so
+       none saturated.  Accounts first written here are removed, so a
+       rejected bundle takes no space in the bounded account pool. */
+    while( i-- ) {
+      fd_txn_out_t const *          txn_out  = &txn_outs[ i ];
+      fd_transaction_cost_t const * txn_cost = &txn_out->details.txn_cost;
+      uint const                    cost     = transaction_cost_sum( txn_cost );
+      for( ulong j=0UL; j<txn_out->accounts.cnt; j++ ) {
+        if( FD_UNLIKELY( !txn_out->accounts.is_writable[ j ] ) ) continue;
+        account_cost_map_ele_query( map, &txn_out->accounts.keys[ j ], NULL, pool )->cost -= cost;
+      }
+      cost_tracker->block_cost                   -= cost;
+      cost_tracker->allocated_accounts_data_size -= get_allocated_accounts_data_size( txn_cost );
+    }
+    while( cost_tracker_outer->accounts_used>accounts_used ) {
+      account_cost_map_ele_remove( map, &pool[ --cost_tracker_outer->accounts_used ].account, NULL, pool );
+    }
+  } else {
+    for( i=0UL; i<txn_cnt; i++ ) txn_outs[ i ].details.cost_added = 1;
+  }
+
+  fd_rwlock_unwrite( &cost_tracker_outer->lock );
+  return err;
+}

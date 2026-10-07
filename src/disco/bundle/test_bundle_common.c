@@ -19,7 +19,9 @@ struct test_bundle_env {
   uchar *           out_dcache;
   int               server_sock;
   void *            deque_mem;
+  void *            tpu_deque_mem;
   ulong             waker_fseq[ FD_FSEQ_FOOTPRINT/sizeof(ulong) ] __attribute__((aligned(FD_FSEQ_ALIGN)));
+  ulong             harmonic_lost_fseq[ FD_FSEQ_FOOTPRINT/sizeof(ulong) ] __attribute__((aligned(FD_FSEQ_ALIGN)));
 
   fd_bundle_tile_t state[1];
 };
@@ -98,6 +100,22 @@ test_bundle_env_create( test_bundle_env_t * env,
   FD_TEST( env->deque_mem );
   state->pending_txns = pending_txn_join( pending_txn_new( env->deque_mem, pending_max ) );
   FD_TEST( state->pending_txns );
+  env->tpu_deque_mem      = fd_wksp_alloc_laddr( wksp, pending_txn_align(), pending_txn_footprint( pending_max ), 1UL );
+  FD_TEST( env->tpu_deque_mem );
+  state->tpu_pending_txns = pending_txn_join( pending_txn_new( env->tpu_deque_mem, pending_max ) );
+  FD_TEST( state->tpu_pending_txns );
+
+  /* Allocate harmonic staging (mirrors privileged_init) */
+  state->harmonic_staging_max = fd_bundle_harmonic_staging_max( state->grpc_buf_max );
+  state->harmonic_staging = fd_wksp_alloc_laddr(
+      wksp,
+      alignof(fd_bundle_harmonic_staged_txn_t),
+      sizeof(fd_bundle_harmonic_staged_txn_t) * state->harmonic_staging_max,
+      1UL );
+  FD_TEST( state->harmonic_staging );
+  state->harmonic_payload_max = fd_bundle_harmonic_payload_max( state->grpc_buf_max );
+  state->harmonic_payload     = fd_wksp_alloc_laddr( wksp, 1UL, state->harmonic_payload_max, 1UL );
+  FD_TEST( state->harmonic_payload );
 
   FD_TEST( fd_rng_new( state->rng, 0U, 0UL ) );
   long ka_interval = (long)1e9;
@@ -189,6 +207,30 @@ test_bundle_env_mock_conn( test_bundle_env_t * env ) {
   FD_TEST( fd_h2_rbuf_free_sz( ctx->grpc_client->frame_tx )>=2048UL );
 }
 
+/* ========== Harmonic block mode helpers ========== */
+
+/* Mock a live harmonic block stream on the bundle connection */
+FD_FN_UNUSED static void
+test_bundle_env_mock_harmonic_block_stream( fd_bundle_tile_t * ctx ) {
+  ctx->harmonic_block_subscription_live = 1;
+
+  fd_grpc_h2_stream_t * stream = fd_grpc_client_stream_acquire( ctx->grpc_client, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2 );
+  FD_TEST( stream );
+  stream->hdrs.h2_status     = 200;
+  stream->hdrs.is_grpc_proto = 1;
+}
+
+/* Enable harmonic block mode with a live block stream */
+FD_FN_UNUSED static void
+test_bundle_env_enable_harmonic( test_bundle_env_t * env ) {
+  fd_bundle_tile_t * ctx = env->state;
+  ctx->harmonic_block_mode = 1;
+  ctx->harmonic_block_slot = ULONG_MAX;
+  ctx->harmonic_lost_slot  = fd_fseq_join( fd_fseq_new( env->harmonic_lost_fseq, ULONG_MAX ) );
+  FD_TEST( ctx->harmonic_lost_slot );
+  test_bundle_env_mock_harmonic_block_stream( ctx );
+}
+
 static void
 test_bundle_env_destroy( test_bundle_env_t * env ) {
   if( env && env->server_sock>=0 ) {
@@ -203,5 +245,8 @@ test_bundle_env_destroy( test_bundle_env_t * env ) {
   fd_wksp_free_laddr( fd_dcache_delete( fd_dcache_leave( env->out_dcache ) ) );
   fd_wksp_free_laddr( env->state->grpc_client_mem );
   fd_wksp_free_laddr( pending_txn_delete( pending_txn_leave( env->state->pending_txns ) ) );
+  fd_wksp_free_laddr( pending_txn_delete( pending_txn_leave( env->state->tpu_pending_txns ) ) );
+  fd_wksp_free_laddr( env->state->harmonic_payload );
+  fd_wksp_free_laddr( env->state->harmonic_staging );
   fd_memset( env, 0, sizeof(test_bundle_env_t) );
 }
