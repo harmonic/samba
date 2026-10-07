@@ -20,6 +20,7 @@
 #include "../../choreo/rotor/fd_rotor.h"
 #include "../../disco/net/fd_net_tile.h"
 #include "../../discof/backup/fd_backup.h"
+#include "../../disco/bundle/fd_bundle_tpu.h"
 #include "../../discof/restore/fd_snapct_tile.h"
 #include "../../disco/gui/fd_gui_config_parse.h"
 #include "../../disco/quic/fd_tpu.h"
@@ -956,6 +957,23 @@ fd_topo_initialize( config_t * config ) {
     }
 
     if( leader_enabled ) fd_topob_tile_in(  topo, "bundle", 0UL,           "metric_in", "replay_slot",    0UL,        FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
+
+    /* Harmonic: the bundle tile tells pack which leader slot lost its
+       block stream, so pack falls back at once */
+    if( leader_enabled && config->tiles.bundle.harmonic_block_mode ) {
+      fd_topo_obj_t * lost_obj = fd_topob_obj( topo, "fseq", "metric_in" );
+      fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "bundle", 0UL ) ], lost_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
+      fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "pack",   0UL ) ], lost_obj, FD_SHMEM_JOIN_MODE_READ_ONLY  );
+      FD_TEST( fd_pod_insert_ulong( topo->props, "harmonic_lost_slot", lost_obj->id ) );
+    }
+
+    /* bundle_gossi: bundle tile publishes TPU endpoint updates to gossip. */
+    if( leader_enabled ) {
+      fd_topob_wksp( topo, "bundle_gossi" );
+      fd_topob_link( topo, "bundle_gossi", "bundle_gossi", 128UL, sizeof(fd_bundle_tpu_update_t), 1UL );
+      fd_topob_tile_out( topo, "bundle", 0UL, "bundle_gossi", 0UL );
+      fd_topob_tile_in( topo, "gossip", 0UL, "metric_in", "bundle_gossi", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
+    }
 
     if( config->tiles.gui.enabled ) { /* GUI is the only consumer of bundle_status */
       fd_topob_wksp( topo, "bundle_status" );
@@ -1904,6 +1922,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
       PARSE_BUNDLE_PUBKEY( pack, tip_payment_program_addr      );
       PARSE_BUNDLE_PUBKEY( pack, tip_distribution_authority    );
       tile->pack.bundle.commission_bps = config->tiles.bundle.commission_bps;
+      tile->pack.bundle.harmonic_block_mode = config->tiles.bundle.harmonic_block_mode;
       fd_cstr_ncpy( tile->pack.bundle.identity_key_path, config->paths.identity_key, sizeof(tile->pack.bundle.identity_key_path) );
       fd_cstr_ncpy( tile->pack.bundle.vote_account_path, config->paths.vote_account, sizeof(tile->pack.bundle.vote_account_path) );
     } else {
@@ -2066,6 +2085,11 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->bundle.out_depth = config->tiles.verify.receive_buffer_size;
     tile->bundle.keepalive_interval_nanos = config->tiles.bundle.keepalive_interval_millis * (ulong)1e6;
     tile->bundle.tls_cert_verify = !!config->tiles.bundle.tls_cert_verify;
+    fd_cstr_ncpy( tile->bundle.tpu_url, config->tiles.bundle.tpu_url, sizeof(tile->bundle.tpu_url) );
+    tile->bundle.tpu_url_len = strnlen( tile->bundle.tpu_url, sizeof(tile->bundle.tpu_url)-1UL );
+    fd_cstr_ncpy( tile->bundle.tpu_sni, config->tiles.bundle.tpu_tls_domain_name, sizeof(tile->bundle.tpu_sni) );
+    tile->bundle.tpu_sni_len = strnlen( tile->bundle.tpu_sni, sizeof(tile->bundle.tpu_sni)-1UL );
+    tile->bundle.harmonic_block_mode = config->tiles.bundle.harmonic_block_mode;
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "solcap" ) ) ) {
 

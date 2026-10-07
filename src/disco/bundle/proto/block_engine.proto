@@ -3,6 +3,8 @@ syntax = "proto3";
 import "packet.proto";
 import "shared.proto";
 import "bundle.proto";
+import "block.proto";
+import "timestamp.proto";
 
 package block_engine;
 
@@ -17,6 +19,14 @@ message SubscribeBundlesResponse {
   repeated bundle.BundleUuid bundles = 1;
 }
 
+// Request to subscribe to the block engine's block stream.  The block
+// engine records version/commit_hash against the connected validator,
+// so both are populated from the running binary.
+message SubscribeBlocksRequest {
+  string version = 1;
+  string commit_hash = 2;
+}
+
 message BlockBuilderFeeInfoRequest {}
 message BlockBuilderFeeInfoResponse {
   string pubkey = 1;
@@ -24,6 +34,16 @@ message BlockBuilderFeeInfoResponse {
   // commission (0-100)
   uint64 commission = 2;
 }
+
+message SubmitLeaderWindowInfoRequest {
+  // Send time if end_timestamp is set (latency only), else when the leader slot begins.
+  google.protobuf.Timestamp start_timestamp = 1;
+  uint64 slot = 2;
+  // When the leader slot ends.
+  google.protobuf.Timestamp end_timestamp = 3;
+}
+
+message SubmitLeaderWindowInfoResponse {}
 
 /// Validators can connect to Block Engines to receive packets and bundles.
 service BlockEngineValidator {
@@ -33,7 +53,17 @@ service BlockEngineValidator {
   /// Validators can subscribe to the block engine to receive a stream of simulated and profitable bundles
   rpc SubscribeBundles (SubscribeBundlesRequest) returns (stream SubscribeBundlesResponse) {}
 
+  // Subscribe to bundles (v2).  Used in place of SubscribeBundles when
+  // harmonic block mode is enabled.
+  rpc SubscribeBundles2 (SubscribeBundlesRequest) returns (stream SubscribeBundlesResponse) {}
+
+  // Subscribe to blocks with explicit bundle boundaries.
+  rpc SubscribeBlocks2 (SubscribeBlocksRequest) returns (stream block.Block) {}
+
   // Block builders can optionally collect fees. This returns fee information if a block builder wants to
   // collect one.
   rpc GetBlockBuilderFeeInfo (BlockBuilderFeeInfoRequest) returns (BlockBuilderFeeInfoResponse) {}
+
+  /// Validators submit information about their upcoming active leader slot.
+  rpc SubmitLeaderWindowInfo (SubmitLeaderWindowInfoRequest) returns (SubmitLeaderWindowInfoResponse) {}
 }
