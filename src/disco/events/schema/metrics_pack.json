@@ -234,7 +234,8 @@
                 "vote_replace":            { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Simple vote transaction replaced a lower priority transaction" },
                 "nonce_nonvote_add":       { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Durable nonce transaction added to pending transactions" },
                 "unused":                  { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Never produced: durable nonce transactions can't be simple votes" },
-                "nonce_nonvote_replace":   { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Durable nonce transaction replaced a lower priority transaction, likely one that uses the same durable nonce" }
+                "nonce_nonvote_replace":   { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Durable nonce transaction replaced a lower priority transaction, likely one that uses the same durable nonce" },
+                "block_rejected":          { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Harmonic block bundle refused (wrong mode, slot, cutoff, or failed validation)", "field_number": 421176758 }
             }
         },
         "schedule_regime_duration_nanos": {

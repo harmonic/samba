@@ -497,6 +497,13 @@ deliberate exception with lint-allow="<rule id>")
     <int value="3" name="Sleeping" label="Sleeping" />
 </enum>
 
+<enum name="BlockTxnDropReason">
+    <int value="0" name="WrongSlot" label="Block is for a slot other than our current leader slot" />
+    <int value="1" name="ConnReset" label="Block engine connection was reset during our leader slot, so the rest of its block is dropped" />
+    <int value="2" name="InvalidBundle" label="Bundle has more transactions than a bundle allows, or an empty transaction" />
+    <int value="3" name="Malformed" label="Block message failed to decode" />
+</enum>
+
 <tile name="bundle">
     <counter name="TxnRx" summary="Transactions received, including transactions within bundles" />
     <counter name="StandaloneTxnRx" summary="Transactions received outside of a bundle" />
@@ -510,6 +517,14 @@ deliberate exception with lint-allow="<rule id>")
     <gauge name="LastRttNanos" summary="Latest block engine HTTP/2 PING round trip, 0 if none since connect" />
     <gauge name="RttSmoothedNanos" summary="Smoothed block engine HTTP/2 PING round trip (RFC 9002), 0 if none since connect" />
     <gauge name="RttDeviationNanos" summary="Mean deviation of block engine HTTP/2 PING round trips (RFC 9002 rttvar), 0 if none since connect" />
+    <gauge name="TpuConnState" states="BundleConnState" summary="TPU endpoint connection state; Sleeping means the block engine connection is closed on purpose and the TPU connection is not serviced" />
+    <counter name="TpuTxnRx" summary="Transactions received from the TPU endpoint" />
+    <counter name="BlockRx" summary="Block messages received from the block engine" />
+    <counter name="BlockTxnRx" summary="Transactions from blocks published to verify" />
+    <counter name="BlockTxnDropped" enum="BlockTxnDropReason" summary="Transactions from blocks dropped before publishing, by reason" />
+    <counter name="LeaderWindowRequestTx" summary="Leader window info requests sent to the block engine" />
+    <counter name="LeaderWindowRequestFailed" summary="Leader window info requests that the block engine rejected, that timed out, or whose connection failed" />
+    <counter name="LeaderWindowRequestExpiredDropped" summary="Leader window info requests never sent because the slot ended or the next leader slot superseded them" />
     <histogram name="MessageRxDelayNanos" min="100000" max="1000000000">
         <summary>Local wall clock minus server timestamp per block engine message; includes clock skew, negative clamped to 0</summary>
     </histogram>
@@ -588,6 +603,7 @@ deliberate exception with lint-allow="<rule id>")
 
 <enum name="PackTxnInsertResult">
     <!-- Keep in sync with FD_PACK_INSERT_* in fd_pack.h -->
+    <int value="-17" name="BlockRejected" label="Harmonic block bundle refused (wrong mode, slot, cutoff, or failed validation)" />
     <int value="-16" name="InstrTooManyAccounts" label="Transaction has an instruction that references too many accounts" />
     <int value="-15" name="NonceConflict" label="Bundle with two conflicting durable nonce transactions" />
     <int value="-14" name="AccountBlocklisted" label="Transaction uses an account on the account blocklist" />
