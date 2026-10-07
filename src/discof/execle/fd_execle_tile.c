@@ -2,6 +2,7 @@
 
 #include "../../disco/tiles.h"
 #include "../../disco/pack/fd_pack.h"
+#include "../../disco/fd_txn_m.h"
 #include "../../disco/pack/fd_pack_cost.h"
 #include "../../ballet/blake3/fd_blake3.h"
 #include "../../ballet/bmtree/fd_bmtree.h"
@@ -18,6 +19,21 @@
 #include <time.h>
 #include <linux/futex.h>
 #include "generated/fd_execle_tile_seccomp.h"
+
+/* Harmonic: pack needs to know, at the moment it observes a microblock
+   from the block stream completing, whether it landed anything.  The
+   busy fseq is that observation point, so the fail flag rides on it.
+   Only microblocks whose transactions came from the block stream are
+   ever flagged; everything else keeps the plain sequence number. */
+static inline ulong
+execle_busy_val( ulong              seq,
+                 fd_txn_p_t const * txns,
+                 ulong              txn_cnt ) {
+  if( FD_LIKELY( txn_cnt==0UL || txns[ 0 ].source_tpu!=FD_TXN_M_TPU_SOURCE_HARMONIC ) ) return seq;
+  int any_in_block = 0;
+  for( ulong i=0UL; i<txn_cnt; i++ ) any_in_block |= !!(txns[ i ].flags & FD_TXN_P_FLAGS_EXECUTE_SUCCESS);
+  return seq | fd_ulong_if( !any_in_block, FD_PACK_EXECLE_BUSY_FAIL_FLAG, 0UL );
+}
 
 #define REBATE_BATCH_IDLE_LOOPS      (128UL)
 #define REBATE_BATCH_MAX_MICROBLOCKS (16UL)
@@ -386,6 +402,27 @@ handle_microblock( fd_execle_tile_t *  ctx,
       }
     }
 
+    /* Harmonic: as in handle_bundle, pack reserves no CUs for a block
+       transaction, so admit a standalone one by actual cost before it
+       commits.  One that does not fit is dropped, which ends the block. */
+    if( FD_UNLIKELY( txn->source_tpu==FD_TXN_M_TPU_SOURCE_HARMONIC ) ) {
+      fd_cost_tracker_t * cost_tracker = fd_cost_tracker_store_peek( fd_bank_cost_tracker( bank ), bank->cost_tracker_fork_id );
+      ulong failed_idx;
+      int err = fd_cost_tracker_try_add_costs( cost_tracker, txn_out, 1UL, &failed_idx );
+      if( FD_UNLIKELY( err ) ) {
+        txn_out->err.txn_err        = fd_cost_tracker_err_to_runtime_err( err );
+        txn_out->err.is_committable = 0;
+        txn->flags = (txn->flags & 0x00FFFFFFU) | ((uint)(-txn_out->err.txn_err)<<24);
+        fd_runtime_cancel_txn( ctx->runtime, bank, txn_in, txn_out );
+        fd_acct_addr_t const * writable_alt = ctx->_alt_accts[i];
+        if( FD_LIKELY( ctx->enable_rebates ) ) fd_pack_rebate_sum_add_txn( ctx->rebater, txn, &writable_alt, 1UL );
+        fd_metrics_tl[ MIDX( COUNTER, EXECLE, TXN_PROCESSED_BY_LANDING )+FD_METRICS_ENUM_TXN_LANDING_RESULT_V_DROPPED_IDX ]++;
+        fd_metrics_tl[ MIDX( COUNTER, EXECLE, TXN_PROCESSED )+(ulong)fd_execle_err_from_runtime_err( txn_out->err.txn_err ) ]++;
+        last_ticks = fd_tickcount();
+        continue;
+      }
+    }
+
     if( FD_UNLIKELY( txn_out->err.is_fees_only ) ) fd_metrics_tl[ MIDX( COUNTER, EXECLE, TXN_PROCESSED_BY_LANDING )+FD_METRICS_ENUM_TXN_LANDING_RESULT_V_FEES_ONLY_IDX ]++;
     else if( FD_UNLIKELY( txn_out->err.txn_err ) ) fd_metrics_tl[ MIDX( COUNTER, EXECLE, TXN_PROCESSED_BY_LANDING )+FD_METRICS_ENUM_TXN_LANDING_RESULT_V_FAILED_IDX ]++;
     else                                           fd_metrics_tl[ MIDX( COUNTER, EXECLE, TXN_PROCESSED_BY_LANDING )+FD_METRICS_ENUM_TXN_LANDING_RESULT_V_SUCCESS_IDX ]++;
@@ -478,7 +515,7 @@ handle_microblock( fd_execle_tile_t *  ctx,
 
   /* Indicate to pack tile we are done processing the transactions so
      it can pack new microblocks using these accounts. */
-  fd_fseq_update( ctx->busy_fseq, seq );
+  fd_fseq_update( ctx->busy_fseq, execle_busy_val( seq, (fd_txn_p_t const *)dst, txn_cnt ) );
 
   /* Now produce the merkle hash of the transactions for inclusion
      (mixin) to the PoH hash.  This is done on the execle tile because
@@ -568,6 +605,16 @@ handle_bundle( fd_execle_tile_t *  ctx,
 
     txn->flags = (txn->flags & 0x00FFFFFFU) | ((uint)(-txn_out->err.txn_err)<<24);
     if( FD_UNLIKELY( !txn_out->err.is_committable || txn_out->err.txn_err!=FD_RUNTIME_EXECUTE_SUCCESS ) ) failed_idx = i;
+  }
+
+  /* Harmonic: pack does not reserve CUs for block bundles, since the
+     builder fills the block by actual cost.  Admit the bundle by actual
+     cost before anything commits; one that does not fit fails whole,
+     which ends the block. */
+  if( FD_UNLIKELY( failed_idx==ULONG_MAX && txns[ 0 ].source_tpu==FD_TXN_M_TPU_SOURCE_HARMONIC ) ) {
+    fd_cost_tracker_t * cost_tracker = fd_cost_tracker_store_peek( fd_bank_cost_tracker( bank ), bank->cost_tracker_fork_id );
+    int err = fd_cost_tracker_try_add_costs( cost_tracker, ctx->txn_out, txn_cnt, &failed_idx );
+    if( FD_UNLIKELY( err ) ) ctx->txn_out[ failed_idx ].err.txn_err = fd_cost_tracker_err_to_runtime_err( err );
   }
 
   /* If all of the transactions in the bundle executed successfully, we
@@ -670,7 +717,7 @@ handle_bundle( fd_execle_tile_t *  ctx,
 
   /* Indicate to pack tile we are done processing the transactions so
      it can pack new microblocks using these accounts. */
-  fd_fseq_update( ctx->busy_fseq, seq );
+  fd_fseq_update( ctx->busy_fseq, execle_busy_val( seq, txns, txn_cnt ) );
 
   /* We need to publish each transaction separately into its own
      microblock, so make a temporary copy on the stack so we can move

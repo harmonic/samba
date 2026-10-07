@@ -1,4 +1,5 @@
 #include "fd_bundle_crank.h"
+#include "../keyguard/fd_keyguard.h"
 #include "../pack/fd_chkdup.h"
 #include "../../ballet/base64/fd_base64.h"
 
@@ -335,7 +336,7 @@ test_masks( void ) {
     .change_block_builder = {
         .prog_id = 17,
         .acct_cnt = 13,
-        .acct_idx = { 10, 13, 0, 14, 1, 2, 3, 4, 5, 6, 7, 8, 0},
+        .acct_idx = { 10, 13, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 0},
         .data_sz = 16,
         .ix_discriminator = { FD_BUNDLE_CRANK_DISC_CHANGE_BLK_BLD },
     },
@@ -388,7 +389,10 @@ test_masks( void ) {
     .change_block_builder = {
         .prog_id = 0xFF,
         .acct_cnt = 0xFF,
-        .acct_idx = { 0xFF, 0xFF, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+        /* acct_idx[3] (new block builder) is unmasked: harmonic points it
+           at whichever slot already holds that address, e.g. slot 0 when
+           the block builder is the identity. */
+        .acct_idx = { 0xFF, 0xFF, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
         .data_sz = 0xFF,
         .ix_discriminator = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }
     },
@@ -433,7 +437,7 @@ test_masks( void ) {
     .change_block_builder = {
         .prog_id = 17,
         .acct_cnt = 13,
-        .acct_idx = { 10, 13, 0, 14, 1, 2, 3, 4, 5, 6, 7, 8, 0},
+        .acct_idx = { 10, 13, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 0},
         .data_sz = 16,
         .ix_discriminator = { FD_BUNDLE_CRANK_DISC_CHANGE_BLK_BLD },
     },
@@ -476,7 +480,10 @@ test_masks( void ) {
     .change_block_builder = {
         .prog_id = 0xFF,
         .acct_cnt = 0xFF,
-        .acct_idx = { 0xFF, 0xFF, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+        /* acct_idx[3] (new block builder) is unmasked: harmonic points it
+           at whichever slot already holds that address, e.g. slot 0 when
+           the block builder is the identity. */
+        .acct_idx = { 0xFF, 0xFF, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
         .data_sz = 0xFF,
         .ix_discriminator = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }
     },
@@ -533,6 +540,76 @@ test_masks( void ) {
   FD_TEST( fd_memeq( mask2.b, fd_bundle_crank_2_mask, sizeof(fd_bundle_crank_2_t) ) );
 }
 
+/* When the block builder is the identity, slot 0 names it and slot 14
+   holds a filler.  Anyone can set the on-chain tip receiver or block
+   builder to that filler; the crank must still pass the keyguard, have
+   no duplicate account, and name the filler wherever the old address
+   is used. */
+static void
+test_block_builder_eq_identity_filler_alias( void ) {
+  fd_rng_t _rng[1];
+  fd_rng_t * rng = fd_rng_join( fd_rng_new( _rng, 1U, 7UL ) );
+  fd_chkdup_t chkdup[1];
+  fd_chkdup_join( fd_chkdup_new( chkdup, rng ) );
+
+  fd_acct_addr_t const * identity = _GwHH8ciFhR8vejWCqmg8FWZUCNtubPY2esALvy5tBvji;
+  fd_acct_addr_t filler[1] = {{{ EXPAND_ARR32( identity->b, 0UL ) }}};
+  filler->b[1]++;
+
+  fd_keyguard_authority_t authority[1] = {{ .identity_pubkey = { 0 } }};
+  memcpy( authority->identity_pubkey,          identity,                                      32UL );
+  memcpy( authority->tip_payment_program,      _T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt, 32UL );
+  memcpy( authority->tip_distribution_program, _4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7, 32UL );
+
+  for( ulong swap3=0UL; swap3<2UL; swap3++ ) {
+    for( ulong which=0UL; which<4UL; which++ ) { /* bit 0: old tip receiver, bit 1: old block builder */
+      fd_bundle_crank_gen_t g[1];
+      fd_bundle_crank_gen_init( g, _4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7, _T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt,
+                                   _3iPuTgpWaaC6jYEY7kd993QBthGsQTK3yPCrNJyPMhCD, _GZctHpWXmsZC1YHACTGGcHhYxjdRqQvTpYkb9LMvxDib,
+                                   "NONE",
+                                   0UL );
+
+      fd_bundle_crank_tip_payment_config_t old_cfg[1] = {{
+        .discriminator = 0x82ccfa1ee0aa0c9bUL,
+        .tip_receiver  = {{{ EXPAND_ARR32( _GiLHMES95axFbFX7ogCTwL6QQ1uqspajz9SHMpt5dCGh->b, 0UL ) }}},
+        .block_builder = {{{ EXPAND_ARR32( _feeywn2ffX8DivmRvBJ9i9YZnss7WBouTmujfQcEdeY->b,  0UL ) }}},
+        .commission_pct = 5UL,
+      }};
+      if( which&1UL ) memcpy( old_cfg->tip_receiver,  filler, 32UL );
+      if( which&2UL ) memcpy( old_cfg->block_builder, filler, 32UL );
+
+      fd_acct_addr_t uncreated[1] = {{{ 0 }}};
+      fd_acct_addr_t const * tip_receiver_owner = swap3 ? uncreated : _4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7;
+
+      uchar payload[ FD_TXN_MTU ];
+      uchar _txn[ FD_TXN_MAX_SZ ];
+      fd_txn_t * txn = (fd_txn_t *)_txn;
+      ulong sz = fd_bundle_crank_generate( g, old_cfg, identity, identity, tip_receiver_owner, 740UL, 6UL, payload, txn );
+      FD_TEST( sz==( swap3 ? sizeof(fd_bundle_crank_3_t) : sizeof(fd_bundle_crank_2_t) ) );
+      FD_TEST( fd_keyguard_payload_authorize( authority, payload+65UL, sz-65UL, FD_KEYGUARD_ROLE_BUNDLE_CRANK, FD_KEYGUARD_SIGN_TYPE_ED25519 ) );
+
+      fd_acct_addr_t const * addr = fd_txn_get_acct_addrs( txn, payload );
+      FD_TEST( !fd_chkdup_check( chkdup, addr, fd_txn_account_cnt( txn, FD_TXN_ACCT_CAT_ALL ), NULL, 0UL ) );
+      FD_TEST( fd_memeq( addr+14UL, filler, 32UL ) );
+
+      fd_txn_instr_t const * change_tr = &txn->instr[ 1UL+swap3 ];
+      fd_txn_instr_t const * change_bb = &txn->instr[ 2UL+swap3 ];
+      FD_TEST( fd_memeq( addr+payload[ change_tr->acct_off+1UL ], old_cfg->tip_receiver,  32UL ) );
+      FD_TEST( fd_memeq( addr+payload[ change_tr->acct_off+3UL ], old_cfg->block_builder, 32UL ) );
+      FD_TEST( fd_memeq( addr+payload[ change_bb->acct_off+2UL ], old_cfg->block_builder, 32UL ) );
+      FD_TEST( payload[ change_bb->acct_off+3UL ]==0 );
+
+      if( !which ) { /* once applied, the identity stays the block builder */
+        fd_acct_addr_t owner[1];
+        fd_bundle_crank_apply( g, old_cfg, identity, owner, 740UL, 6UL );
+        FD_TEST( 0UL==fd_bundle_crank_generate( g, old_cfg, identity, identity, owner, 740UL, 6UL, payload, txn ) );
+      }
+    }
+  }
+
+  fd_chkdup_delete( fd_chkdup_leave( chkdup ) );
+  fd_rng_delete( fd_rng_leave( rng ) );
+}
 
 static void
 test_zero_builder( void ) {
@@ -579,6 +656,7 @@ main( int argc,
   test_masks();
   test_zero_builder();
 
+  test_block_builder_eq_identity_filler_alias();
 
   FD_LOG_NOTICE(( "pass" ));
 

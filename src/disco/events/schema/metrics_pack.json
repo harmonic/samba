@@ -229,8 +229,8 @@
             "type": "Tuple",
             "description": "Insert attempts, by result; bundle members are counted individually with the bundle's result",
             "aliases": {
-                "all":      ["instr_too_many_accounts", "nonce_conflict", "account_blocklisted", "bundle_blocklisted", "invalid_nonce", "write_sysvar", "estimation_failed", "duplicate_account", "too_many_accounts", "too_many_cu", "expired", "lut_unsupported", "unaffordable", "duplicate", "nonce_priority_too_low", "priority_too_low", "nonvote_add", "nonvote_replace", "nonce_nonvote_add", "nonce_nonvote_replace"],
-                "rejected": ["instr_too_many_accounts", "nonce_conflict", "account_blocklisted", "bundle_blocklisted", "invalid_nonce", "write_sysvar", "estimation_failed", "duplicate_account", "too_many_accounts", "too_many_cu", "expired", "lut_unsupported", "unaffordable", "duplicate", "nonce_priority_too_low", "priority_too_low"],
+                "all":      ["block_rejected", "instr_too_many_accounts", "nonce_conflict", "account_blocklisted", "bundle_blocklisted", "invalid_nonce", "write_sysvar", "estimation_failed", "duplicate_account", "too_many_accounts", "too_many_cu", "expired", "lut_unsupported", "unaffordable", "duplicate", "nonce_priority_too_low", "priority_too_low", "nonvote_add", "nonvote_replace", "nonce_nonvote_add", "nonce_nonvote_replace"],
+                "rejected": ["block_rejected", "instr_too_many_accounts", "nonce_conflict", "account_blocklisted", "bundle_blocklisted", "invalid_nonce", "write_sysvar", "estimation_failed", "duplicate_account", "too_many_accounts", "too_many_cu", "expired", "lut_unsupported", "unaffordable", "duplicate", "nonce_priority_too_low", "priority_too_low"],
                 "replaced": ["nonvote_replace", "nonce_nonvote_replace"]
             },
             "fields": {
@@ -256,7 +256,8 @@
                 "vote_replace":            { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Simple vote transaction replaced a lower priority transaction", "deprecated": true },
                 "nonce_nonvote_add":       { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Durable nonce transaction added to pending transactions" },
                 "unused":                  { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Never produced", "deprecated": true },
-                "nonce_nonvote_replace":   { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Durable nonce transaction replaced a lower priority transaction, likely one that uses the same durable nonce" }
+                "nonce_nonvote_replace":   { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Durable nonce transaction replaced a lower priority transaction, likely one that uses the same durable nonce" },
+                "block_rejected":          { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Harmonic block bundle refused (wrong mode or slot, a gap in the block, or arrived after the slot ended)", "field_number": 421176758 }
             }
         },
         "schedule_regime_duration_nanos": {
@@ -291,12 +292,13 @@
             "type": "Tuple",
             "description": "Transactions dropped from pack after insertion, by reason",
             "aliases": {
-                "all": ["expired", "already_executed", "partial_bundle"]
+                "all": ["expired", "already_executed", "partial_bundle", "block_abandoned"]
             },
             "fields": {
                 "expired":          { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "TTL expired" },
                 "already_executed": { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Already executed in the replay or leader pipeline" },
-                "partial_bundle":   { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Part of a partial bundle" }
+                "partial_bundle":   { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Part of a partial bundle" },
+                "block_abandoned":  { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Harmonic block transaction deleted unscheduled because its block was abandoned (a bundle reverted, the block did not start in time, or the slot ended)", "field_number": 339542754 }
             }
         },
         "txn_evicted":                    { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Transactions evicted from pack to make room for others, including the bundle initializer transaction removed when a leader slot ends" },

@@ -721,7 +721,7 @@ test_execle_run( test_env_t *     env,
   env->begin_tspub = (ulong)fd_frag_meta_ts_comp( fd_tickcount() );
   after_frag( env->execle, 0UL, seq, sig, sz, 0UL, env->begin_tspub, test_stem( env->execle, stem ) );
   /* Pack sees the microblock done and has its credit back */
-  FD_TEST( fd_fseq_query( env->execle->busy_fseq )==seq );
+  FD_TEST( (fd_fseq_query( env->execle->busy_fseq ) & ~FD_PACK_EXECLE_BUSY_FAIL_FLAG)==seq );
   FD_TEST( fd_fseq_query( env->pack_in_fseq )==seq+1UL );
 }
 
@@ -1524,6 +1524,112 @@ FD_UNIT_TEST( execle_bundle_fail ) {
   FD_TEST( fd_metrics_tl[ MIDX( COUNTER, EXECLE, TXN_PROCESSED )+FD_METRICS_ENUM_TXN_RESULT_V_BUNDLE_PEER_IDX ]==1UL );
 
   test_env_destroy( env );
+}
+
+/* Harmonic block bundles are admitted by actual cost before they
+   commit.  Runs a two-transfer block bundle with the bank's block cost
+   limit set to base+limit_add (0: unchanged); returns the cost each
+   transaction adds in *cost and the block cost before in *base. */
+static fd_cost_tracker_t *
+test_harmonic_bundle( test_env_t * env,
+                      ulong        limit_add,
+                      ulong *      base,
+                      ulong        cost[2] ) {
+  fd_bank_t * bank = fd_svm_mini_bank( env->mini, env->bank_idx );
+  fd_cost_tracker_t * ct = fd_cost_tracker_store_peek( fd_bank_cost_tracker( bank ), bank->cost_tracker_fork_id );
+  *base = ct->block_cost;
+  if( limit_add ) ct->block_cost_limit = *base + limit_add;
+
+  fd_pubkey_t fee_payer  = { .ul = { 0xA555UL } };
+  fd_pubkey_t recipient0 = { .ul = { 0xA666UL } };
+  fd_pubkey_t recipient1 = { .ul = { 0xA667UL } };
+  test_fund_account( env, &fee_payer,  1000000000UL );
+  test_fund_account( env, &recipient0, 111UL );
+  test_fund_account( env, &recipient1, 222UL );
+
+  fd_txn_p_t txns[2];
+  test_build_system_transfer_txn( &txns[0], bank, fee_payer, recipient0, 1234567UL );
+  test_build_system_transfer_txn( &txns[1], bank, fee_payer, recipient1, 7654321UL );
+  for( ulong i=0UL; i<2UL; i++ ) txns[ i ].source_tpu = FD_TXN_M_TPU_SOURCE_HARMONIC;
+  test_execle_run( env, txns, 2UL, 8U, 21UL, 1 );
+
+  for( ulong i=0UL; i<2UL; i++ ) {
+    fd_usage_cost_details_t const * c = &env->execle->txn_out[ i ].details.txn_cost.transaction;
+    cost[ i ] = (ulong)c->signature_cost + c->write_lock_cost + c->data_bytes_cost + c->programs_execution_cost + c->loaded_accounts_data_size_cost;
+  }
+  return ct;
+}
+
+FD_UNIT_TEST( execle_harmonic_bundle_cost_limit ) {
+  /* It fits: added once, not again at commit */
+  test_env_t * env = test_env_create();
+  ulong base, cost[2];
+  fd_cost_tracker_t * ct = test_harmonic_bundle( env, 0UL, &base, cost );
+  FD_TEST( env->execle->txn_out[0].err.is_committable && env->execle->txn_out[1].err.is_committable );
+  FD_TEST( ct->block_cost==base+cost[0]+cost[1] );
+  FD_TEST( !(fd_fseq_query( env->execle->busy_fseq ) & FD_PACK_EXECLE_BUSY_FAIL_FLAG) );
+  test_env_destroy( env );
+
+  /* The second does not fit: the bundle fails whole and nothing is
+     added, so pack ends the block */
+  env = test_env_create();
+  ulong base2, cost2[2];
+  ct = test_harmonic_bundle( env, cost[0]+cost[1]-1UL, &base2, cost2 );
+  FD_TEST( ct->block_cost==base2 );
+  FD_TEST( env->execle->txn_out[1].err.txn_err==FD_RUNTIME_TXN_ERR_WOULD_EXCEED_MAX_BLOCK_COST_LIMIT );
+  FD_TEST( fd_fseq_query( env->execle->busy_fseq ) & FD_PACK_EXECLE_BUSY_FAIL_FLAG );
+  for( ulong i=0UL; i<2UL; i++ ) {
+    fd_txn_p_t const * out_txn = fd_chunk_to_laddr( env->execle->out_poh->mem, test_out_poh_meta( i )->chunk );
+    FD_TEST( !env->execle->txn_out[i].err.is_committable );
+    FD_TEST( !(out_txn->flags & FD_TXN_P_FLAGS_EXECUTE_SUCCESS) );
+    FD_TEST( out_txn->execle_cu.actual_consumed_cus==0U );
+  }
+  fd_txn_p_t const * out_txn1 = fd_chunk_to_laddr( env->execle->out_poh->mem, test_out_poh_meta( 1UL )->chunk );
+  FD_TEST( (out_txn1->flags & FD_TXN_P_FLAGS_RESULT_MASK)==((uint)(-FD_RUNTIME_TXN_ERR_WOULD_EXCEED_MAX_BLOCK_COST_LIMIT)<<24) );
+  FD_TEST( fd_metrics_tl[ MIDX( COUNTER, EXECLE, TXN_PROCESSED )+FD_METRICS_ENUM_TXN_RESULT_V_COST_LIMIT_IDX  ]==1UL );
+  FD_TEST( fd_metrics_tl[ MIDX( COUNTER, EXECLE, TXN_PROCESSED )+FD_METRICS_ENUM_TXN_RESULT_V_BUNDLE_PEER_IDX ]==1UL );
+  test_env_destroy( env );
+}
+
+/* A standalone block transaction (no bundle flag) is admitted by actual
+   cost too: one that does not fit is dropped, not a fatal commit. */
+FD_UNIT_TEST( execle_harmonic_standalone_cost_limit ) {
+  for( int fits=1; fits>=0; fits-- ) {
+    test_env_t * env  = test_env_create();
+    fd_bank_t *  bank = fd_svm_mini_bank( env->mini, env->bank_idx );
+    fd_cost_tracker_t * ct = fd_cost_tracker_store_peek( fd_bank_cost_tracker( bank ), bank->cost_tracker_fork_id );
+    ulong base = ct->block_cost;
+
+    fd_pubkey_t fee_payer = { .ul = { 0xA855UL } };
+    fd_pubkey_t recipient = { .ul = { 0xA866UL } };
+    test_fund_account( env, &fee_payer, 1000000000UL );
+    test_fund_account( env, &recipient, 111UL );
+
+    fd_txn_p_t txn[1];
+    test_build_system_transfer_txn( txn, bank, fee_payer, recipient, 1234567UL );
+    txn->source_tpu = FD_TXN_M_TPU_SOURCE_HARMONIC;
+    if( !fits ) ct->block_cost_limit = base; /* any cost crosses it */
+    test_execle_run( env, txn, 1UL, 8U, 21UL, 0 );
+
+    fd_txn_out_t const * out     = &env->execle->txn_out[ 0 ];
+    fd_txn_p_t const *   out_txn = fd_chunk_to_laddr( env->execle->out_poh->mem, test_out_poh_meta( 0UL )->chunk );
+    fd_usage_cost_details_t const * c = &out->details.txn_cost.transaction;
+    ulong cost = (ulong)c->signature_cost + c->write_lock_cost + c->data_bytes_cost + c->programs_execution_cost + c->loaded_accounts_data_size_cost;
+    if( fits ) {
+      FD_TEST( out->err.is_committable );
+      FD_TEST( ct->block_cost==base+cost ); /* added once, not again at commit */
+      FD_TEST( out_txn->flags & FD_TXN_P_FLAGS_EXECUTE_SUCCESS );
+      FD_TEST( !(fd_fseq_query( env->execle->busy_fseq ) & FD_PACK_EXECLE_BUSY_FAIL_FLAG) );
+    } else {
+      FD_TEST( !out->err.is_committable );
+      FD_TEST( ct->block_cost==base );
+      FD_TEST( !(out_txn->flags & FD_TXN_P_FLAGS_EXECUTE_SUCCESS) );
+      FD_TEST( (out_txn->flags & FD_TXN_P_FLAGS_RESULT_MASK)==((uint)(-FD_RUNTIME_TXN_ERR_WOULD_EXCEED_MAX_BLOCK_COST_LIMIT)<<24) );
+      FD_TEST( fd_fseq_query( env->execle->busy_fseq ) & FD_PACK_EXECLE_BUSY_FAIL_FLAG );
+      FD_TEST( fd_metrics_tl[ MIDX( COUNTER, EXECLE, TXN_PROCESSED )+FD_METRICS_ENUM_TXN_RESULT_V_COST_LIMIT_IDX ]==1UL );
+    }
+    test_env_destroy( env );
+  }
 }
 
 FD_UNIT_TEST( execle_bundle_peer_fail ) {

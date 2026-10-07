@@ -11,6 +11,22 @@
 #define FD_TXN_M_TPU_SOURCE_GOSSIP (3UL)
 #define FD_TXN_M_TPU_SOURCE_BUNDLE (4UL)
 #define FD_TXN_M_TPU_SOURCE_TXSEND (5UL)
+#define FD_TXN_M_TPU_SOURCE_HARMONIC (6UL)
+#define FD_TXN_M_TPU_SOURCE_HTPU    (7UL)
+
+/* Harmonic block streams arrive as a sequence of bundles, each at most
+   FD_PACK_MAX_TXN_PER_BUNDLE transactions.  They flow through the same
+   bundle path as regular bundles, keyed by bundle_id, so the id must
+   identify both the slot the block is for and the bundle's position in
+   the block.  The slot occupies the high 32 bits (about 24 years of
+   200ms slots from today's slot numbers) and a per-block sequence
+   number starting at 1 occupies the low 32 bits, so the id is never
+   zero and never collides with regular bundle ids in practice. */
+#define FD_TXN_M_HARMONIC_SEQ_BITS      (32)
+#define FD_TXN_M_HARMONIC_SEQ_MASK      ((1UL<<FD_TXN_M_HARMONIC_SEQ_BITS)-1UL)
+#define FD_TXN_M_HARMONIC_BUNDLE_ID( slot, seq ) (((ulong)(slot)<<FD_TXN_M_HARMONIC_SEQ_BITS) | ((ulong)(seq) & FD_TXN_M_HARMONIC_SEQ_MASK))
+#define FD_TXN_M_HARMONIC_BUNDLE_SLOT( id )      ((ulong)(id)>>FD_TXN_M_HARMONIC_SEQ_BITS)
+#define FD_TXN_M_HARMONIC_BUNDLE_SEQ( id )       ((ulong)(id) & FD_TXN_M_HARMONIC_SEQ_MASK)
 
 struct fd_txn_m {
   /* The block height of the computed slot that this transaction is
@@ -61,7 +77,12 @@ struct fd_txn_m {
     uchar commission;
     uchar commission_pubkey[ 32 ];
 
-    /* alignof is 8, so 7 bytes of padding here */
+    /* Harmonic: 1 for a block stream bundle, 0 for a standalone block
+       transaction.  Travels with every txn of the bundle; only pack
+       reads it, to decide revert protection. */
+    uchar revert_protected;
+
+    /* alignof is 8, so 6 bytes of padding here */
 
   } block_engine;
 

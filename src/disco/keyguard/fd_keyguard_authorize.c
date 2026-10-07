@@ -156,7 +156,7 @@ fd_keyguard_authorize_gossip( fd_keyguard_authority_t const * authority,
       uchar client_id   = data[ off ];
       (void)commit; /* Checking commit introduces a circular dependency between disco and app :'( */
       if( feature_set!=FD_FEATURE_SET_ID ) return 0;
-      if( client_id  !=5                 ) return 0; /* FD_GOSSIP_CONTACT_INFO_CLIENT_FIREDANCER */
+      if( client_id!=5 && client_id!=9  ) return 0; /* FD_GOSSIP_CONTACT_INFO_CLIENT_FIREDANCER or HARMONIC_FD */
 
       break;
     case FD_GOSSIP_VALUE_DUPLICATE_SHRED:

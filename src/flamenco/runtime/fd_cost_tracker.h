@@ -148,6 +148,19 @@ int
 fd_cost_tracker_try_add_cost( fd_cost_tracker_t * cost_tracker,
                               fd_txn_out_t *      txn_out );
 
+/* fd_cost_tracker_try_add_costs adds the costs of txn_cnt transactions
+   (txn_outs[0..txn_cnt)) all or none, for transactions admitted by
+   actual cost before they commit.  On success each gets
+   details.cost_added, so fd_runtime_commit_txn does not add it again.
+   On failure nothing is added, *failed_idx is the transaction that did
+   not fit, and its FD_COST_TRACKER_ERROR_* is returned. */
+
+int
+fd_cost_tracker_try_add_costs( fd_cost_tracker_t * cost_tracker,
+                               fd_txn_out_t *      txn_outs,
+                               ulong               txn_cnt,
+                               ulong *             failed_idx );
+
 FD_PROTOTYPES_END
 
 #endif /* HEADER_fd_src_flamenco_runtime_fd_cost_tracker_h */
