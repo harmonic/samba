@@ -1037,7 +1037,7 @@ telemetry = true
     # `mainnet`, except when using unique scheduling strategies.  For
     # development and benchmarking, it can be useful to increase this
     # number further.
-    execle_tile_count = 2
+    execle_tile_count = 4
 
     # How many execrp tiles to run.  These tiles execute transactions
     # that are being replayed when our validator is not leader, and is
@@ -1590,6 +1590,15 @@ telemetry = true
         # it is being accessed.
         tls_domain_name = ""
 
+        # The URL for a second subscribePackets stream from the remote
+        # TPU.  If empty, no second connection is established.
+        tpu_url = ""
+
+        # The domain name of the TLS certificate to use when verifying
+        # the remote tpu.  If none is provided, the domain from tpu_url above
+        # will be used by default.
+        tpu_tls_domain_name = ""
+
         # The tip distribution program is used to control the
         # distribution of tips that transactions from bundles may pay.
         # This should be set to the public key of the tip distribution
@@ -1632,6 +1641,11 @@ telemetry = true
         # specifies https.  To disable certificate verification, set
         # this option to 'false'.
         tls_cert_verify = true
+
+        # If set to true, enables a third stream (SubscribeBlocks2) on the same
+        # bundle connection for harmonic blocks.  Normal bundle subscriptions
+        # remain active.
+        harmonic_block_mode = false
 
     # The pack tile takes incoming transactions that have been verified
     # by the verify tile and then deduplicated, and attempts to order

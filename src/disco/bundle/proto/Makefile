@@ -2,9 +2,11 @@ NANOPB_GEN?=nanopb_generator.py
 
 PROTOS:=
 PROTOS+=auth
+PROTOS+=block
 PROTOS+=block_engine
 PROTOS+=bundle
 PROTOS+=packet
+PROTOS+=tpu
 PROTOS+=shared
 PROTOS+=timestamp
 

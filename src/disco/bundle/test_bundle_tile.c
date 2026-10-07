@@ -74,8 +74,8 @@ test_replay_frag_ingest( void ) {
   /* A non-reset signal should be ignored */
   ulong prev_next = ctx->next_leader_slot;
   ulong prev_rst  = ctx->reset_slot;
-  during_frag( ctx, in_idx, 0UL, REPLAY_SIG_RESET+1, 0UL, sizeof(fd_poh_reset_t), 0UL );
-  after_frag( ctx, in_idx, 0UL, REPLAY_SIG_RESET+1, sizeof(fd_poh_reset_t), 0UL, 0UL, NULL );
+  during_frag( ctx, in_idx, 0UL, REPLAY_SIG_SLOT_COMPLETED, 0UL, sizeof(fd_poh_reset_t), 0UL );
+  after_frag( ctx, in_idx, 0UL, REPLAY_SIG_SLOT_COMPLETED, sizeof(fd_poh_reset_t), 0UL, 0UL, NULL );
   FD_TEST( ctx->next_leader_slot==prev_next );
   FD_TEST( ctx->reset_slot==prev_rst );
 
@@ -85,6 +85,102 @@ test_replay_frag_ingest( void ) {
   after_frag( ctx, 1UL, 0UL, REPLAY_SIG_RESET, sizeof(fd_poh_reset_t), 0UL, 0UL, NULL );
   FD_TEST( ctx->next_leader_slot==prev_next );
   FD_TEST( ctx->reset_slot==prev_rst );
+
+  free( wksp );
+}
+
+/* ---- test: became_leader on replay_slot ------------------------------ */
+
+/* The leader notice shares the replay link with resets.  In harmonic
+   block mode it must queue SubmitLeaderWindowInfo and kick a client step
+   so it goes out without waiting for the next deadline.  Jito engines
+   have no such RPC. */
+
+static void
+test_replay_became_leader( void ) {
+  FD_LOG_NOTICE(( "TEST replay became_leader" ));
+
+  fd_bundle_tile_t * ctx = test_ctx;
+  memset( ctx, 0, sizeof(fd_bundle_tile_t) );
+
+  ulong alloc_sz = fd_ulong_align_up( FD_CHUNK_FOOTPRINT + sizeof(fd_became_leader_t), FD_CHUNK_ALIGN );
+  void * wksp = aligned_alloc( FD_CHUNK_ALIGN, alloc_sz );
+  FD_TEST( wksp );
+  memset( wksp, 0, alloc_sz );
+
+  ulong const in_idx = 0UL;
+  ctx->in_kind[ in_idx ] = IN_KIND_REPLAY_OUT;
+  ctx->replay_in.mem    = wksp;
+  ctx->replay_in.chunk0 = 0UL;
+  ctx->replay_in.wmark  = 0UL;
+
+  ctx->next_leader_slot     = 500UL;
+  ctx->reset_slot           = 100UL;
+  ctx->harmonic_seq_tainted = 1;
+  ctx->next_step_deadline   = LONG_MAX;
+
+  fd_became_leader_t * msg = (fd_became_leader_t *)fd_chunk_to_laddr( wksp, 0UL );
+  msg->slot        = 500UL;
+  msg->slot_end_ns = 123456789L;
+
+  during_frag( ctx, in_idx, 0UL, REPLAY_SIG_BECAME_LEADER, 0UL, sizeof(fd_became_leader_t), 0UL );
+  after_frag( ctx, in_idx, 0UL, REPLAY_SIG_BECAME_LEADER, sizeof(fd_became_leader_t), 0UL, 0UL, NULL );
+  FD_TEST( !ctx->leader_window_pending );
+  FD_TEST( ctx->next_step_deadline==LONG_MAX );
+
+  ctx->harmonic_block_mode = 1;
+  during_frag( ctx, in_idx, 0UL, REPLAY_SIG_BECAME_LEADER, 0UL, sizeof(fd_became_leader_t), 0UL );
+  after_frag( ctx, in_idx, 0UL, REPLAY_SIG_BECAME_LEADER, sizeof(fd_became_leader_t), 0UL, 0UL, NULL );
+
+  FD_TEST( ctx->_became_leader->slot==500UL );
+  FD_TEST( ctx->_became_leader->slot_end_ns==123456789L );
+  FD_TEST( ctx->harmonic_seq_tainted==0 );
+  FD_TEST( ctx->leader_window_pending );
+  FD_TEST( ctx->leader_window_slot==500UL );
+  FD_TEST( ctx->leader_window_slot_end_ns==123456789L );
+  FD_TEST( ctx->next_step_deadline==0L );
+
+  /* Not a reset */
+  FD_TEST( ctx->next_leader_slot==500UL );
+  FD_TEST( ctx->reset_slot==100UL );
+
+  free( wksp );
+}
+
+/* ---- test: harmonic never sleeps ------------------------------------- */
+
+/* Covers the guard keeping the block engine connection up outside leader
+   windows.  Without it a rebase could silently restore sleeping. */
+
+static void
+test_maybe_sleep_harmonic( void ) {
+  FD_LOG_NOTICE(( "TEST maybe_sleep never sleeps in harmonic mode" ));
+
+  void * wksp = mock_replay_wksp_new();
+
+  fd_bundle_tile_t ctx[1];
+  memset( ctx, 0, sizeof(fd_bundle_tile_t) );
+  ctx->harmonic_block_mode = 1;
+  ctx->replay_in.mem       = wksp;
+  ctx->sleep_mode          = 0;
+
+  /* Leader schedule unknown: would sleep without harmonic. */
+  ctx->sleep_check_ns   = 0;
+  ctx->next_leader_slot = ULONG_MAX;
+  ctx->reset_slot       = ULONG_MAX;
+  fd_bundle_tile_maybe_sleep( ctx, 1 );
+  FD_TEST( ctx->sleep_mode==0 );
+
+  /* Leader far past the sleep threshold: would sleep without harmonic. */
+  ctx->sleep_check_ns   = 0;
+  ctx->reset_slot       = 0UL;
+  ctx->next_leader_slot = FD_BUNDLE_SLEEP_THRESHOLD_SLOTS + 1UL;
+  fd_bundle_tile_maybe_sleep( ctx, 2 );
+  FD_TEST( ctx->sleep_mode==0 );
+
+  /* The guard returns before touching sleep_check_ns, so the tile never
+     starts accounting for a wake-up it does not need. */
+  FD_TEST( ctx->sleep_check_ns==0 );
 
   free( wksp );
 }
@@ -447,6 +543,8 @@ main( int     argc,
   fd_boot( &argc, &argv );
 
   test_replay_frag_ingest();
+  test_replay_became_leader();
+  test_maybe_sleep_harmonic();
   test_maybe_sleep_no_replay();
   test_maybe_sleep_unknown_schedule();
   test_maybe_sleep_far_leader();

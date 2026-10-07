@@ -258,6 +258,10 @@ fd_pack_avail_txn_cnt( fd_pack_t const * pack ) {
   return *((ulong const *)((uchar const *)pack + FD_PACK_PENDING_TXN_CNT_OFF));
 }
 
+/* fd_pack_avail_vote_cnt returns the number of pending vote transactions
+   available to schedule. */
+ulong fd_pack_avail_vote_cnt( fd_pack_t const * pack );
+
 /* fd_pack_current_block_cost returns the number of CUs that have been
    scheduled in the current block, net of any rebates.  It should be
    between 0 and the specified value of max_cost_per_block, but it can
@@ -415,14 +419,15 @@ void fd_pack_get_pending_smallest( fd_pack_t * pack, fd_pack_smallest_t * opt_pe
 #define FD_PACK_INSERT_REJECT_ACCT_BLOCKLIST        (-14)
 #define FD_PACK_INSERT_REJECT_NONCE_CONFLICT        (-15)
 #define FD_PACK_INSERT_REJECT_INSTR_ACCT_CNT        (-16)
+#define FD_PACK_INSERT_REJECT_BLOCK_FAILED          (-17) /* harmonic: block already failed or wrong mode */
 
 /* The FD_PACK_INSERT_{ACCEPT, REJECT}_* values defined above are in the
    range [-FD_PACK_INSERT_RETVAL_OFF,
    -FD_PACK_INSERT_RETVAL_OFF+FD_PACK_INSERT_RETVAL_CNT ) */
-#define FD_PACK_INSERT_RETVAL_OFF 16
-#define FD_PACK_INSERT_RETVAL_CNT 23
+#define FD_PACK_INSERT_RETVAL_OFF 17
+#define FD_PACK_INSERT_RETVAL_CNT 24
 
-FD_STATIC_ASSERT( FD_PACK_INSERT_REJECT_INSTR_ACCT_CNT>=-FD_PACK_INSERT_RETVAL_OFF, pack_retval );
+FD_STATIC_ASSERT( FD_PACK_INSERT_REJECT_BLOCK_FAILED>=-FD_PACK_INSERT_RETVAL_OFF, pack_retval );
 FD_STATIC_ASSERT( FD_PACK_INSERT_ACCEPT_NONCE_NONVOTE_REPLACE<FD_PACK_INSERT_RETVAL_CNT-FD_PACK_INSERT_RETVAL_OFF, pack_retval );
 
 /* fd_pack_insert_txn_{init,fini,cancel} execute the process of
@@ -660,6 +665,36 @@ void fd_pack_set_initializer_bundles_ready( fd_pack_t * pack );
 #define FD_PACK_SCHEDULE_BUNDLE 2
 #define FD_PACK_SCHEDULE_TXN    4
 
+/* FD_PACK_HARMONIC_VOTE_TAIL_NS: last portion of the leader slot in
+   which votes interleave with harmonic block bundles.  Block bundles are
+   accepted until slot_end_ns. */
+#define FD_PACK_HARMONIC_VOTE_TAIL_NS ( 20000000L )
+
+/* FD_PACK_HARMONIC_TAIL_MICROBLOCKS: microblocks (one transaction each)
+   kept in reserve past the time-based bound for the block bundles and
+   votes that drain after slot_end_ns.  About two whole blocks; PoH
+   hashes whatever is left unused after done_packing. */
+#define FD_PACK_HARMONIC_TAIL_MICROBLOCKS ( 4096UL )
+
+#define HARMONIC_MODE_UNDECIDED   (0)
+#define HARMONIC_MODE_HARMONIC   (1)
+#define HARMONIC_MODE_FALLBACK   (-1)
+#define HARMONIC_MODE_DONE       (-2)
+
+#define FD_PACK_END_FLAG_HARMONIC_TIMEOUT  (1<<0) /* block never arrived, arrived late, or was cut off */
+#define FD_PACK_END_FLAG_VOTE_DRAIN        (1<<1) /* votes remained at slot end */
+#define FD_PACK_END_FLAG_HARMONIC_FAILED   (1<<2) /* a block bundle was dropped, rejected, or could not fit */
+#define FD_PACK_END_FLAG_HARMONIC_REVERTED (1<<3) /* a block bundle reverted at execution */
+
+/* FD_PACK_EXECLE_BUSY_FAIL_FLAG is OR'd into the execle busy fseq value
+   by the execle tile when the microblock it just finished came from the
+   harmonic block stream and produced no entries (a bundle reverted, or
+   a single transaction was excluded).  Pack masks it off when comparing
+   against the expected sequence number and, if set, calls
+   fd_pack_harmonic_bank_failed instead of fd_pack_microblock_complete.
+   Frag sequence numbers never reach bit 63. */
+#define FD_PACK_EXECLE_BUSY_FAIL_FLAG (1UL<<63)
+
 /* fd_pack_schedule_next_microblock schedules pending transactions.
    These transaction either form a microblock, which is a set of
    non-conflicting transactions, or a bundle.  The semantics of this
@@ -724,7 +759,69 @@ fd_pack_schedule_next_microblock( fd_pack_t  * pack,
                                   float        vote_fraction,
                                   ulong        bank_tile,
                                   int          schedule_flags,
+                                  int          harmonic,
                                   fd_txn_e_t * out );
+
+/* Harmonic block mode.  Block bundles are inserted with the regular
+   fd_pack_insert_bundle_init and fd_pack_harmonic_insert_bundle_fini,
+   which applies the block admission rules once per bundle (see the
+   comment above the implementation) and otherwise behaves like
+   fd_pack_insert_bundle_fini.  bundle_id is the FD_TXN_M_HARMONIC_BUNDLE_ID
+   of the bundle (ignored for the crank), revert_protected is 0 for a
+   standalone block transaction, which may fail, now_ns is the pack tile's
+   wallclock, and the threshold/cutoff are the slot's admission bounds.
+   Returns an FD_PACK_INSERT_* code; a negative code means the bundle was
+   cancelled.  FD_PACK_INSERT_REJECT_BLOCK_FAILED means the bundle was
+   not admitted (wrong slot or mode, gap in the sequence, too late). */
+
+void fd_pack_harmonic_reset( fd_pack_t * pack, ulong leader_slot );
+
+int fd_pack_harmonic_insert_bundle_fini( fd_pack_t          * pack,
+                                         fd_txn_e_t * const * bundle,
+                                         ulong                txn_cnt,
+                                         ulong                bundle_id,
+                                         int                  revert_protected,
+                                         ulong                expires_at,
+                                         int                  initializer_bundle,
+                                         void         const * bundle_meta,
+                                         long                 now_ns,
+                                         long                 harmonic_threshold_ns,
+                                         long                 harmonic_cutoff_ns,
+                                         ulong              * delete_cnt );
+
+/* fd_pack_harmonic_stop stops admitting block bundles for the rest of
+   the slot.  Bundles already accepted still execute, unless the block
+   has not started, in which case they are dropped and pack falls back.
+   fd_pack_harmonic_abort additionally drops every block bundle still
+   pending.  flag is OR'd into the end-of-slot flags.
+   fd_pack_harmonic_bank_failed handles a block bundle microblock on
+   bank_tile that produced no entries: it completes the microblock and
+   aborts, unless the bundle was dispatched while votes were
+   interleaved, in which case the block continues.  Call it in place of
+   fd_pack_microblock_complete for that bank. */
+
+void fd_pack_harmonic_stop       ( fd_pack_t * pack, int flag );
+void fd_pack_harmonic_abort      ( fd_pack_t * pack, int flag );
+void fd_pack_harmonic_bank_failed( fd_pack_t * pack, ulong bank_tile );
+
+FD_FN_PURE int   fd_pack_harmonic_state          ( fd_pack_t const * pack );
+FD_FN_PURE int   fd_pack_harmonic_done           ( fd_pack_t const * pack );
+FD_FN_PURE int   fd_pack_harmonic_stopped        ( fd_pack_t const * pack );
+FD_FN_PURE ulong fd_pack_harmonic_pending_cnt    ( fd_pack_t const * pack );
+FD_FN_PURE ulong fd_pack_harmonic_inflight_cnt   ( fd_pack_t const * pack );
+FD_FN_PURE int   fd_pack_harmonic_pool_full      ( fd_pack_t const * pack );
+FD_FN_PURE int   fd_pack_harmonic_end_flags      ( fd_pack_t const * pack );
+
+void fd_pack_harmonic_state_crank( fd_pack_t * pack,
+                                   long        approx_wallclock_ns,
+                                   long        harmonic_threshold_ns,
+                                   long        harmonic_cutoff_ns,
+                                   int         past_end_time,
+                                   ulong       pending_votes,
+                                   ulong       schedule_cnt,
+                                   int         tried_votes );
+
+void const * fd_pack_peek_harmonic_meta( fd_pack_t const * pack );
 
 
 /* fd_pack_rebate_cus adjusts the compute unit accounting for the
@@ -760,7 +857,9 @@ void fd_pack_rebate_cus( fd_pack_t * pack, fd_pack_rebate_t const * rebate );
    times after a microblock or even if bank_tile does not have a
    previously scheduled; in this case, the function will return 0 and
    act as a no-op.  Returns 1 if the bank_tile had an outstanding,
-   previously scheduled microblock to mark as completed. */
+   previously scheduled microblock to mark as completed.  When that
+   microblock was a harmonic block txn (pending_blocks), decrements
+   harmonic_inflight for this bank only. */
 int fd_pack_microblock_complete( fd_pack_t * pack, ulong bank_tile );
 
 /* fd_pack_expire_before deletes all available transactions with
