@@ -375,7 +375,18 @@ fd_bundle_crank_generate( fd_bundle_crank_gen_t                       * gen,
   }
   new_tr_pidx->idx = 13UL;
 
-  fd_bundle_crank_gen_pidx_t * new_bb_pidx = pidx_map_insert( gen->map, *(fd_acct_addr_t *)new_block_builder );
+  /* A validator can be its own block builder.  The identity is already
+     in slot 0, so change_block_builder names slot 0 and slot 14 gets a
+     filler address.  The filler goes in the map like any other address,
+     so an old tip receiver or old block builder equal to it is handled
+     below. */
+  uchar * new_bb_addr = swap3 ? gen->crank3->new_block_builder : gen->crank2->new_block_builder;
+  ulong   new_bb_idx  = 14UL;
+  if( FD_UNLIKELY( fd_memeq( new_block_builder, identity, 32UL ) ) ) {
+    new_bb_addr[1]++;
+    new_bb_idx = 0UL;
+  }
+  fd_bundle_crank_gen_pidx_t * new_bb_pidx = pidx_map_insert( gen->map, *(fd_acct_addr_t *)new_bb_addr );
   if( FD_UNLIKELY( !new_bb_pidx ) ) {
     pidx_map_remove( gen->map, new_tr_pidx   );
     pidx_map_remove( gen->map, identity_pidx );
@@ -437,6 +448,8 @@ fd_bundle_crank_generate( fd_bundle_crank_gen_t                       * gen,
   gen->crank3->change_block_builder.acct_idx[2] = (uchar)(old_bb_pidx->idx);
   gen->crank2->change_tip_receiver.acct_idx [3] = (uchar)(old_bb_pidx->idx);
   gen->crank2->change_block_builder.acct_idx[2] = (uchar)(old_bb_pidx->idx);
+  gen->crank3->change_block_builder.acct_idx[3] = (uchar)new_bb_idx;
+  gen->crank2->change_block_builder.acct_idx[3] = (uchar)new_bb_idx;
 
   if( FD_UNLIKELY( inserted2 ) ) pidx_map_remove( gen->map, old_bb_pidx );
   if( FD_LIKELY  ( inserted1 ) ) pidx_map_remove( gen->map, old_tr_pidx );
