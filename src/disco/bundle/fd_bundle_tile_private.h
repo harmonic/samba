@@ -248,9 +248,10 @@ fd_bundle_client_step_reconnect( fd_bundle_tile_t * ctx,
    next needs to run absent any fd event.  While TCP is connecting,
    returns the connection setup deadline; while disconnected, returns
    the reconnect time (at least now).  Once connected, considers gRPC
-   deadlines, keepalive, builder info expiry and connection setup.
-   Returns now if decrypted bytes are buffered in the native TLS/gRPC
-   client and TLS TX is not blocked; blocked TX waits for EPOLLOUT. */
+   deadlines, keepalive, builder info expiry, auth token refresh and
+   connection setup.  Returns now if decrypted bytes are buffered in
+   the native TLS/gRPC client and TLS TX is not blocked; blocked TX
+   waits for EPOLLOUT. */
 
 long
 fd_bundle_client_next_deadline( fd_bundle_tile_t const * ctx,
