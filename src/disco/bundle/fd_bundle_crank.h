@@ -65,6 +65,17 @@ fd_bundle_crank_gen_init( void                 * mem,
                           ulong                  commission_bps );
 
 
+/* fd_bundle_crank_gen_set_memo sets the 3-byte memo instruction payload
+   on both crank transaction templates, replacing the schedule_mode set
+   at init.  memo must point to at least 3 bytes (typically a harmonic
+   strategy tag such as FBA, MRV, or FIF, or a pack schedule tag such as
+   PRF or BAL on harmonic fallback). */
+
+void
+fd_bundle_crank_gen_set_memo( fd_bundle_crank_gen_t * gen,
+                              char const            * memo );
+
+
 /* fd_bundle_crank_get_addresses returns the account addresses that need
    to be queried at the start of each slot.  gen must be a valid
    initialized bundle crank generator.  epoch is the epoch number of the

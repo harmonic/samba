@@ -14,6 +14,7 @@
 #include "../../util/hist/fd_histf.h"
 #include "../metrics/generated/fd_metrics_enums.h"
 #include "../tiles.h"
+#include "proto/block_engine.pb.h"
 
 #define FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE (5UL)
 
@@ -216,6 +217,13 @@ struct fd_bundle_tile {
   long  leader_window_slot_end_ns;  /* End of the queued slot */
   ulong leader_window_inflight_slot; /* Slot of the request in flight */
 
+  /* Scheduling strategy selection */
+  int   strategy;               /* block_engine_SchedulingStrategy value */
+  ulong strategy_seq;           /* bumped by the set-strategy command */
+  ulong strategy_seq_applied;   /* last strategy_seq acted on */
+  uchar set_strategy_done : 1;  /* SetStrategy RPC succeeded for this connection */
+  uchar set_strategy_wait : 1;  /* Request already in-flight? */
+
   /* Bundle subscriptions */
   uchar packet_subscription_live : 1;  /* Want to subscribe to a stream? */
   uchar packet_subscription_wait : 1;  /* Request already in-flight? */
@@ -383,7 +391,32 @@ typedef struct fd_bundle_tile fd_bundle_tile_t;
 #define FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU                9
 #define FD_BUNDLE_CLIENT_REQ_GetTpuConfigs                      10
 
+/* Scheduling strategy selection */
+#define FD_BUNDLE_CLIENT_REQ_SetStrategy                        11
+
 FD_PROTOTYPES_BEGIN
+
+/* fd_bundle_strategy_parse returns the block_engine_SchedulingStrategy
+   named by s ("fifo", "fba" or "mrev"), or -1.
+   fd_bundle_strategy_cstr is the inverse, NULL if not one of those. */
+
+static inline int
+fd_bundle_strategy_parse( char const * s ) {
+  if( !strcmp( s, "fifo" ) ) return block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_FIFO;
+  if( !strcmp( s, "fba"  ) ) return block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_FBA;
+  if( !strcmp( s, "mrev" ) ) return block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_MREV;
+  return -1;
+}
+
+static inline char const *
+fd_bundle_strategy_cstr( int strategy ) {
+  switch( strategy ) {
+  case block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_FIFO: return "fifo";
+  case block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_FBA:  return "fba";
+  case block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_MREV: return "mrev";
+  default:                                                       return NULL;
+  }
+}
 
 /* fd_bundle_now returns wallclock nanoseconds from the tile's
    fd_clock.  Backed by a weak symbol, allowing tests to override the
