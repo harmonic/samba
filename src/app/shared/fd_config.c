@@ -19,6 +19,7 @@
 #include "../../discof/restore/utils/fd_ssarchive.h"
 #include "../../discof/restore/utils/fd_wfs.h"
 #include "../../util/fd_boolau.h"
+#include "../../disco/bundle/fd_bundle_tile_private.h"
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -416,6 +417,9 @@ fd_config_fill( fd_config_t * config,
   }
   else if( FD_LIKELY( !strcmp( config->tiles.pack.schedule_strategy, "auction"  ) ) ) config->tiles.pack.schedule_strategy_enum = 2;
   else FD_LOG_ERR(( "[tiles.pack.schedule_strategy] %s not recognized", config->tiles.pack.schedule_strategy ));
+
+  config->tiles.bundle.strategy_enum = fd_bundle_strategy_parse( config->tiles.bundle.strategy );
+  if( FD_UNLIKELY( config->tiles.bundle.strategy_enum<0 ) ) FD_LOG_ERR(( "[tiles.bundle.strategy] %s not recognized", config->tiles.bundle.strategy ));
 
   fd_config_fill_net( config );
   fd_config_fillf( config );

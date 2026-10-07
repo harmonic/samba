@@ -261,6 +261,18 @@ fd_bundle_crank_gen_init( void                 * mem,
 }
 
 
+void
+fd_bundle_crank_gen_set_memo( fd_bundle_crank_gen_t * gen,
+                              char const            * memo ) {
+  gen->crank3->memo.memo[0] = memo[0];
+  gen->crank3->memo.memo[1] = memo[1];
+  gen->crank3->memo.memo[2] = memo[2];
+  gen->crank2->memo.memo[0] = memo[0];
+  gen->crank2->memo.memo[1] = memo[1];
+  gen->crank2->memo.memo[2] = memo[2];
+}
+
+
 static inline void
 fd_bundle_crank_update_epoch( fd_bundle_crank_gen_t * g,
                               ulong                   epoch ) {

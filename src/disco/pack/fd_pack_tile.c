@@ -15,6 +15,8 @@
 #include "../pack/fd_pack_cost.h"
 #include "../pack/fd_pack_pacing.h"
 #include "../fd_clock_tile.h"
+#include "../pack/fd_pack_tile_private.h"
+#include "../bundle/proto/block_engine.pb.h"
 
 #include <string.h>
 
@@ -199,6 +201,8 @@ typedef struct {
 } fd_pack_out_ctx_t;
 
 typedef struct {
+  fd_pack_runtime_cfg_t runtime_cfg[1];
+
   fd_pack_t *  pack;
   fd_txn_e_t * cur_spot;
   int          is_bundle; /* is the current transaction a bundle */
@@ -413,6 +417,8 @@ typedef struct {
   union{ fd_pack_rebate_t rebate[1]; uchar footprint[USHORT_MAX]; } rebate[1];
 } fd_pack_ctx_t;
 
+FD_STATIC_ASSERT( offsetof( fd_pack_ctx_t, runtime_cfg )==0UL, runtime_cfg_at_start );
+
 #define BUNDLE_META_SZ 40UL
 FD_STATIC_ASSERT( sizeof(block_builder_info_t)==BUNDLE_META_SZ, blk_engine_cfg );
 
@@ -420,6 +426,16 @@ FD_STATIC_ASSERT( sizeof(block_builder_info_t)==BUNDLE_META_SZ, blk_engine_cfg )
 #define FD_PACK_METRIC_STATE_EXECLES      1
 #define FD_PACK_METRIC_STATE_LEADER       2
 #define FD_PACK_METRIC_STATE_MICROBLOCKS  3
+
+static char const *
+pack_crank_strategy_memo( int bundle_strategy ) {
+  switch( bundle_strategy ) {
+  case block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_FBA:  return "FBA";
+  case block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_MREV: return "MRV";
+  case block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_FIFO: return "FIF";
+  default:                                                       return "???";
+  }
+}
 
 /* Updates one component of the metric state.  If the state has changed,
    records the change.  effective_as_of may be earlier than the last
@@ -866,6 +882,13 @@ after_credit( fd_pack_ctx_t *     ctx,
     block_builder_info_t const * top_meta = harmonic_crank ? fd_pack_peek_harmonic_meta( ctx->pack ) : fd_pack_peek_bundle_meta( ctx->pack );
     if( FD_UNLIKELY( top_meta ) ) {
       /* Have bundles, in a reasonable state to crank. */
+
+      /* The memo names whoever schedules the block: the engine, or pack
+         in fallback (and in Jito mode, as set at init) */
+      if( FD_UNLIKELY( ctx->harmonic ) ) {
+        fd_bundle_crank_gen_set_memo( ctx->crank->gen, harmonic_crank ? pack_crank_strategy_memo( ctx->runtime_cfg->harmonic_strategy )
+                                                                      : schedule_strategy_strings[ ctx->strategy ] );
+      }
 
       fd_txn_e_t * _bundle[ 1UL ];
       fd_txn_e_t * const * bundle = fd_pack_insert_bundle_init( ctx->pack, _bundle, 1UL );
@@ -1542,6 +1565,8 @@ unprivileged_init( fd_topo_t const *      topo,
     FD_TEST( ctx->harmonic_lost_slot );
   }
   if( FD_UNLIKELY( tile->pack.bundle.enabled ) ) {
+    ctx->runtime_cfg->harmonic_strategy = tile->pack.bundle.strategy;
+
     if( FD_UNLIKELY( !fd_bundle_crank_gen_init( ctx->crank->gen, (fd_acct_addr_t const *)tile->pack.bundle.tip_distribution_program_addr,
             (fd_acct_addr_t const *)tile->pack.bundle.tip_payment_program_addr,
             (fd_acct_addr_t const *)ctx->crank->vote_pubkey->b,

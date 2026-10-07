@@ -216,6 +216,10 @@ union fdctl_args {
     int   silent;
     char  name[ 64UL ];
   } wait;
+
+  struct {
+    int strategy_enum;
+  } set_strategy;
 };
 
 typedef union fdctl_args args_t;
