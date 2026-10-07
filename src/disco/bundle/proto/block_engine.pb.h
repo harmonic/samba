@@ -14,6 +14,18 @@
 #error Regenerate this file with the current version of nanopb generator.
 #endif
 
+/* Enum definitions */
+/* Scheduling strategy the block engine runs for this validator session. */
+typedef enum _block_engine_SchedulingStrategy {
+    block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_UNSPECIFIED = 0,
+    /* First-in, first-out continuous availability sequencing. */
+    block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_FIFO = 1,
+    /* Frequent batch auction: discrete batches ordered by priority fees and tips. */
+    block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_FBA = 2,
+    /* Maximum revenue strategy: continuous streaming with revenue-prioritizing selection. */
+    block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_MREV = 3
+} block_engine_SchedulingStrategy;
+
 /* Struct definitions */
 typedef struct _block_engine_SubscribePacketsRequest {
     char dummy_field;
@@ -66,10 +78,37 @@ typedef struct _block_engine_SubmitLeaderWindowInfoResponse {
     char dummy_field;
 } block_engine_SubmitLeaderWindowInfoResponse;
 
+/* Selects the scheduling strategy for this validator session. */
+typedef struct _block_engine_SetStrategyRequest {
+    block_engine_SchedulingStrategy strategy;
+} block_engine_SetStrategyRequest;
+
+typedef struct _block_engine_SetStrategyResponse {
+    char dummy_field;
+} block_engine_SetStrategyResponse;
+
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Helper constants for enums */
+#define _block_engine_SchedulingStrategy_MIN block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_UNSPECIFIED
+#define _block_engine_SchedulingStrategy_MAX block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_MREV
+#define _block_engine_SchedulingStrategy_ARRAYSIZE ((block_engine_SchedulingStrategy)(block_engine_SchedulingStrategy_SCHEDULING_STRATEGY_MREV+1))
+
+
+
+
+
+
+
+
+
+
+#define block_engine_SetStrategyRequest_strategy_ENUMTYPE block_engine_SchedulingStrategy
+
+
 
 /* Initializer values for message structs */
 #define block_engine_SubscribePacketsRequest_init_default {0}
@@ -81,6 +120,8 @@ extern "C" {
 #define block_engine_BlockBuilderFeeInfoResponse_init_default {"", 0}
 #define block_engine_SubmitLeaderWindowInfoRequest_init_default {false, google_protobuf_Timestamp_init_default, 0, false, google_protobuf_Timestamp_init_default}
 #define block_engine_SubmitLeaderWindowInfoResponse_init_default {0}
+#define block_engine_SetStrategyRequest_init_default {_block_engine_SchedulingStrategy_MIN}
+#define block_engine_SetStrategyResponse_init_default {0}
 #define block_engine_SubscribePacketsRequest_init_zero {0}
 #define block_engine_SubscribePacketsResponse_init_zero {false, shared_Header_init_zero, false, packet_PacketBatch_init_zero}
 #define block_engine_SubscribeBundlesRequest_init_zero {0}
@@ -90,6 +131,8 @@ extern "C" {
 #define block_engine_BlockBuilderFeeInfoResponse_init_zero {"", 0}
 #define block_engine_SubmitLeaderWindowInfoRequest_init_zero {false, google_protobuf_Timestamp_init_zero, 0, false, google_protobuf_Timestamp_init_zero}
 #define block_engine_SubmitLeaderWindowInfoResponse_init_zero {0}
+#define block_engine_SetStrategyRequest_init_zero {_block_engine_SchedulingStrategy_MIN}
+#define block_engine_SetStrategyResponse_init_zero {0}
 
 /* Field tags (for use in manual encoding/decoding) */
 #define block_engine_SubscribePacketsResponse_header_tag 1
@@ -102,6 +145,7 @@ extern "C" {
 #define block_engine_SubmitLeaderWindowInfoRequest_start_timestamp_tag 1
 #define block_engine_SubmitLeaderWindowInfoRequest_slot_tag 2
 #define block_engine_SubmitLeaderWindowInfoRequest_end_timestamp_tag 3
+#define block_engine_SetStrategyRequest_strategy_tag 1
 
 /* Struct field encoding specification for nanopb */
 #define block_engine_SubscribePacketsRequest_FIELDLIST(X, a) \
@@ -159,6 +203,16 @@ X(a, STATIC,   OPTIONAL, MESSAGE,  end_timestamp,     3)
 #define block_engine_SubmitLeaderWindowInfoResponse_CALLBACK NULL
 #define block_engine_SubmitLeaderWindowInfoResponse_DEFAULT NULL
 
+#define block_engine_SetStrategyRequest_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, UENUM,    strategy,          1)
+#define block_engine_SetStrategyRequest_CALLBACK NULL
+#define block_engine_SetStrategyRequest_DEFAULT NULL
+
+#define block_engine_SetStrategyResponse_FIELDLIST(X, a) \
+
+#define block_engine_SetStrategyResponse_CALLBACK NULL
+#define block_engine_SetStrategyResponse_DEFAULT NULL
+
 extern const pb_msgdesc_t block_engine_SubscribePacketsRequest_msg;
 extern const pb_msgdesc_t block_engine_SubscribePacketsResponse_msg;
 extern const pb_msgdesc_t block_engine_SubscribeBundlesRequest_msg;
@@ -168,6 +222,8 @@ extern const pb_msgdesc_t block_engine_BlockBuilderFeeInfoRequest_msg;
 extern const pb_msgdesc_t block_engine_BlockBuilderFeeInfoResponse_msg;
 extern const pb_msgdesc_t block_engine_SubmitLeaderWindowInfoRequest_msg;
 extern const pb_msgdesc_t block_engine_SubmitLeaderWindowInfoResponse_msg;
+extern const pb_msgdesc_t block_engine_SetStrategyRequest_msg;
+extern const pb_msgdesc_t block_engine_SetStrategyResponse_msg;
 
 /* Defines for backwards compatibility with code written before nanopb-0.4.0 */
 #define block_engine_SubscribePacketsRequest_fields &block_engine_SubscribePacketsRequest_msg
@@ -179,12 +235,16 @@ extern const pb_msgdesc_t block_engine_SubmitLeaderWindowInfoResponse_msg;
 #define block_engine_BlockBuilderFeeInfoResponse_fields &block_engine_BlockBuilderFeeInfoResponse_msg
 #define block_engine_SubmitLeaderWindowInfoRequest_fields &block_engine_SubmitLeaderWindowInfoRequest_msg
 #define block_engine_SubmitLeaderWindowInfoResponse_fields &block_engine_SubmitLeaderWindowInfoResponse_msg
+#define block_engine_SetStrategyRequest_fields &block_engine_SetStrategyRequest_msg
+#define block_engine_SetStrategyResponse_fields &block_engine_SetStrategyResponse_msg
 
 /* Maximum encoded size of messages (where known) */
 /* block_engine_SubscribeBundlesResponse_size depends on runtime parameters */
 #define BLOCK_ENGINE_BLOCK_ENGINE_PB_H_MAX_SIZE  block_engine_SubscribeBlocksRequest_size
 #define block_engine_BlockBuilderFeeInfoRequest_size 0
 #define block_engine_BlockBuilderFeeInfoResponse_size 57
+#define block_engine_SetStrategyRequest_size     2
+#define block_engine_SetStrategyResponse_size    0
 #define block_engine_SubmitLeaderWindowInfoRequest_size 59
 #define block_engine_SubmitLeaderWindowInfoResponse_size 0
 #define block_engine_SubscribeBlocksRequest_size 76
