@@ -197,6 +197,13 @@ struct fd_bundle_tile {
   long  leader_window_slot_end_ns;           /* End of the queued slot */
   ulong leader_window_inflight_slot;         /* Slot of the request in flight */
 
+  /* Scheduling strategy selection */
+  int   strategy;               /* block_engine_SchedulingStrategy value */
+  ulong strategy_seq;           /* bumped by the set-strategy command */
+  ulong strategy_seq_applied;   /* last strategy_seq acted on */
+  uchar set_strategy_done : 1;  /* SetStrategy RPC succeeded for this connection */
+  uchar set_strategy_wait : 1;  /* Request already in-flight? */
+
   /* Bundle subscriptions */
   uchar packet_subscription_live : 1;  /* Want to subscribe to a stream? */
   uchar packet_subscription_wait : 1;  /* Request already in-flight? */
@@ -370,6 +377,9 @@ typedef struct fd_bundle_tile fd_bundle_tile_t;
 /* TPU endpoint request context IDs */
 #define FD_BUNDLE_CLIENT_REQ_SubscribePacketsTPU                9
 #define FD_BUNDLE_CLIENT_REQ_GetTpuConfigs                      10
+
+/* Scheduling strategy selection */
+#define FD_BUNDLE_CLIENT_REQ_SetStrategy                        11
 
 FD_PROTOTYPES_BEGIN
 

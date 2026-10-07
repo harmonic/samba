@@ -664,6 +664,21 @@ test_zero_builder( void ) {
   }
 }
 
+static inline void
+test_memo( void ) {
+  fd_bundle_crank_gen_t g[1];
+  fd_bundle_crank_gen_init( g, _4R3gSG8BpU4t19KYj8CfnbtRpnT8gtk4dvTHxVRwc2r7, _T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt,
+                               _3iPuTgpWaaC6jYEY7kd993QBthGsQTK3yPCrNJyPMhCD, _GZctHpWXmsZC1YHACTGGcHhYxjdRqQvTpYkb9LMvxDib,
+                               "NONE",
+                               0UL );
+  fd_bundle_crank_gen_set_memo( g, "FBA" );
+  FD_TEST( !memcmp( g->crank3->memo.memo, "FBA", 3UL ) );
+  FD_TEST( !memcmp( g->crank2->memo.memo, "FBA", 3UL ) );
+  fd_bundle_crank_gen_set_memo( g, "PRF" );
+  FD_TEST( !memcmp( g->crank3->memo.memo, "PRF", 3UL ) );
+  FD_TEST( !memcmp( g->crank2->memo.memo, "PRF", 3UL ) );
+}
+
 int
 main( int argc,
     char ** argv ) {
@@ -676,6 +691,7 @@ main( int argc,
   test_zero_builder();
 
   test_block_builder_eq_identity();
+  test_memo();
 
   FD_LOG_NOTICE(( "pass" ));
 
