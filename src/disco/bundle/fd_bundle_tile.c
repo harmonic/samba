@@ -340,6 +340,14 @@ before_credit( fd_bundle_tile_t *  ctx,
     return;
   }
 
+  /* set-strategy changed the strategy; reconnect to resend it */
+  ulong strategy_seq = FD_VOLATILE_CONST( ctx->strategy_seq );
+  if( FD_UNLIKELY( strategy_seq!=ctx->strategy_seq_applied ) ) {
+    ctx->strategy_seq_applied = strategy_seq;
+    ctx->defer_reset          = 1;
+    ctx->next_step_deadline   = 0L;
+  }
+
   /* Defer gRPC while harmonic staging waits for after_credit so block
      stream order cannot run ahead of verify_out publishes. */
   if( FD_UNLIKELY( ctx->harmonic_pending_len ) ) return;
@@ -762,6 +770,9 @@ privileged_init( fd_topo_t const *      topo,
 
   /* Initialize harmonic block mode state */
   ctx->harmonic_block_mode = tile->bundle.harmonic_block_mode;
+
+  /* Scheduling strategy (block_engine_SchedulingStrategy; validated by fd_config) */
+  ctx->strategy = tile->bundle.strategy;
 
   if( FD_UNLIKELY( tile->bundle.key_log_path[0] ) ) {
     ctx->keylog_fd = open( tile->bundle.key_log_path, O_WRONLY|O_APPEND|O_CREAT, 0600 );
