@@ -469,6 +469,13 @@ deliberate exception with lint-allow="<rule id>")
     <int value="3" name="Sleeping" label="Sleeping" />
 </enum>
 
+<enum name="BlockTxnDropReason">
+    <int value="0" name="WrongSlot" label="Block is for a slot other than our current leader slot" />
+    <int value="1" name="ConnReset" label="Block engine connection was reset during our leader slot, so the rest of its block is dropped" />
+    <int value="2" name="InvalidBundle" label="Bundle has more transactions than a bundle allows, or an empty transaction" />
+    <int value="3" name="Malformed" label="Block message failed to decode" />
+</enum>
+
 <tile name="bundle">
     <counter name="TxnRx" summary="Transactions received, including transactions within bundles" />
     <counter name="StandaloneTxnRx" summary="Transactions received outside of a bundle" />
@@ -482,6 +489,15 @@ deliberate exception with lint-allow="<rule id>")
     <gauge name="LastRttNanos" summary="Latest block engine HTTP/2 PING round trip, 0 if none since connect" />
     <gauge name="RttSmoothedNanos" summary="Smoothed block engine HTTP/2 PING round trip (RFC 9002), 0 if none since connect" />
     <gauge name="RttDeviationNanos" summary="Mean deviation of block engine HTTP/2 PING round trips (RFC 9002 rttvar), 0 if none since connect" />
+    <gauge name="TpuConnState" states="BundleConnState" summary="TPU endpoint connection state; Sleeping means the block engine connection is closed on purpose and the TPU connection is not serviced" />
+    <counter name="TpuTxnRx" summary="Transactions received from the TPU endpoint" />
+    <counter name="BlockRx" summary="Block messages received from the block engine" />
+    <counter name="BlockBundleRx" summary="Bundles received in Block messages for our leader slot, counting a standalone transaction as a bundle of one" />
+    <counter name="BlockTxnRx" summary="Transactions received in Block messages; each is either published to verify or counted in BlockTxnDropped" />
+    <counter name="BlockTxnDropped" enum="BlockTxnDropReason" summary="Transactions from blocks dropped before publishing, by reason" />
+    <counter name="LeaderWindowTx" summary="Leader window info requests sent to the block engine" />
+    <counter name="LeaderWindowFailed" summary="Leader window info requests that the block engine rejected, that timed out, or whose connection failed" />
+    <counter name="LeaderWindowDropped" summary="Leader window info requests never sent because the slot ended or the next leader slot superseded them" />
     <histogram name="MessageRxDelayNanos" min="100000" max="1000000000">
         <summary>Local wall clock minus server timestamp per block engine message; includes clock skew, negative clamped to 0</summary>
     </histogram>
@@ -553,6 +569,7 @@ deliberate exception with lint-allow="<rule id>")
 
 <enum name="PackTxnInsertResult">
     <!-- Keep in sync with FD_PACK_INSERT_* in fd_pack.h -->
+    <int value="-17" name="BlockRejected" label="Harmonic block bundle refused (wrong mode or slot, a gap in the block, or arrived after the slot ended)" />
     <int value="-16" name="InstrTooManyAccounts" label="Transaction has an instruction that references too many accounts" />
     <int value="-15" name="NonceConflict" label="Bundle with two conflicting durable nonce transactions" />
     <int value="-14" name="AccountBlocklisted" label="Transaction uses an account on the account blocklist" />
@@ -576,7 +593,7 @@ deliberate exception with lint-allow="<rule id>")
     <int value="4" name="NonceNonvoteAdd" label="Durable nonce transaction added to pending transactions" />
     <int value="5" name="Unused" deprecated="true" label="Never produced" />
     <int value="6" name="NonceNonvoteReplace" label="Durable nonce transaction replaced a lower priority transaction, likely one that uses the same durable nonce" />
-    <group name="Rejected" values="InstrTooManyAccounts NonceConflict AccountBlocklisted BundleBlocklisted InvalidNonce WriteSysvar EstimationFailed DuplicateAccount TooManyAccounts TooManyCu Expired LutUnsupported Unaffordable Duplicate NoncePriorityTooLow PriorityTooLow" />
+    <group name="Rejected" values="BlockRejected InstrTooManyAccounts NonceConflict AccountBlocklisted BundleBlocklisted InvalidNonce WriteSysvar EstimationFailed DuplicateAccount TooManyAccounts TooManyCu Expired LutUnsupported Unaffordable Duplicate NoncePriorityTooLow PriorityTooLow" />
     <group name="Replaced" values="NonvoteReplace NonceNonvoteReplace" />
 </enum>
 
@@ -595,6 +612,7 @@ deliberate exception with lint-allow="<rule id>")
     <int value="0" name="Expired" label="TTL expired" />
     <int value="1" name="AlreadyExecuted" label="Already executed in the replay or leader pipeline" />
     <int value="2" name="PartialBundle" label="Part of a partial bundle" />
+    <int value="3" name="BlockAbandoned" label="Harmonic block transaction deleted unscheduled because its block was abandoned (a bundle reverted, the block did not start in time, or the slot ended)" />
 </enum>
 
 <enum name="FecPollSkipReason">

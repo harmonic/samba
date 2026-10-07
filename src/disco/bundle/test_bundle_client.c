@@ -2,6 +2,7 @@
 #include "proto/auth.pb.h"
 #include "proto/block_engine.pb.h"
 #include "../../ballet/base58/fd_base58.h"
+#include "../../third_party/nanopb/pb_decode.h"
 #include "../../third_party/nanopb/pb_encode.h"
 #include "../../util/tmpl/fd_unit_test.c"
 
@@ -79,6 +80,19 @@ FD_UNIT_TEST( bundle_rx ) {
   test_bundle_env_destroy( env );
 }
 
+/* Bundle with 6 transactions (one over the limit).  Shared with the
+   source-mixing tests further down. */
+static uchar subscribe_bundles_msg_x5[] = {
+  0x0a, 0x52, 0x0a, 0x4b, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12, 0x08,
+  0x08, 0x01, 0x12, 0x00, 0x18, 0x00, 0x28, 0x00, 0x1a, 0x0d, 0x0a,
+  0x01, 0x48, 0x12, 0x08, 0x08, 0x01, 0x12, 0x00, 0x18, 0x00, 0x28,
+  0x00, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12, 0x08, 0x08, 0x01, 0x12,
+  0x00, 0x18, 0x00, 0x28, 0x00, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12,
+  0x08, 0x08, 0x01, 0x12, 0x00, 0x18, 0x00, 0x28, 0x00, 0x1a, 0x0d,
+  0x0a, 0x01, 0x48, 0x12, 0x08, 0x08, 0x01, 0x12, 0x00, 0x18, 0x00,
+  0x28, 0x00, 0x12, 0x03, 0x00, 0x00, 0x00
+};
+
 FD_UNIT_TEST( bundle_rx_too_many_txns ) {
   test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
   fd_bundle_tile_t * state = env->state;
@@ -111,16 +125,6 @@ FD_UNIT_TEST( bundle_rx_too_many_txns ) {
     ]
   }
   */
-  static uchar subscribe_bundles_msg_x5[] = {
-    0x0a, 0x52, 0x0a, 0x4b, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12, 0x08,
-    0x08, 0x01, 0x12, 0x00, 0x18, 0x00, 0x28, 0x00, 0x1a, 0x0d, 0x0a,
-    0x01, 0x48, 0x12, 0x08, 0x08, 0x01, 0x12, 0x00, 0x18, 0x00, 0x28,
-    0x00, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12, 0x08, 0x08, 0x01, 0x12,
-    0x00, 0x18, 0x00, 0x28, 0x00, 0x1a, 0x0d, 0x0a, 0x01, 0x48, 0x12,
-    0x08, 0x08, 0x01, 0x12, 0x00, 0x18, 0x00, 0x28, 0x00, 0x1a, 0x0d,
-    0x0a, 0x01, 0x48, 0x12, 0x08, 0x08, 0x01, 0x12, 0x00, 0x18, 0x00,
-    0x28, 0x00, 0x12, 0x03, 0x00, 0x00, 0x00
-  };
 
   state->builder_info_avail = 1;
   fd_bundle_client_grpc_rx_msg(
@@ -1232,7 +1236,7 @@ publish_after_credit( fd_bundle_tile_t * state ) {
       .payload_sz             = txn->payload_sz,
       .txn_t_sz               = 0U,
       .source_ipv4            = txn->source_ipv4,
-      .source_tpu             = FD_TXN_M_TPU_SOURCE_BUNDLE,
+      .source_tpu             = txn->source_tpu,
       .block_engine           = {
         .bundle_id      = txn->bundle_seq,
         .bundle_txn_cnt = txn->bundle_txn_cnt,
@@ -1252,6 +1256,11 @@ publish_after_credit( fd_bundle_tile_t * state ) {
   } while( fd_bundle_drain_continue( state->pending_txns, drain_sig, drain_seq, drain_cnt, TEST_STEM_BURST ) );
 
   return drain_cnt;
+}
+
+static ulong
+flush_harmonic_staging( fd_bundle_tile_t * state ) {
+  return fd_bundle_client_harmonic_publish( state, state->stem, ULONG_MAX );
 }
 
 /* Simulate after_credit drain using the same continuation logic as
@@ -1727,6 +1736,583 @@ FD_UNIT_TEST( request_failed_clears_wait ) {
   test_bundle_env_destroy( env );
 }
 
+/* ========== Harmonic block tests ========== */
+
+typedef struct {
+  ulong const * bundle_ids;
+  ulong         txn_cnt;
+  ulong         txn_sz;
+} block_enc_t;
+
+static bool
+encode_block_txns( pb_ostream_t *     stream,
+                   pb_field_t const * field,
+                   void * const *     arg ) {
+  block_enc_t const * e = *arg;
+  for( ulong i=0UL; i<e->txn_cnt; i++ ) {
+    block_Transaction txn = block_Transaction_init_default;
+    txn.transaction.size = (pb_size_t)e->txn_sz;
+    memset( txn.transaction.bytes, 0x42, e->txn_sz );
+    txn.bundle_id = e->bundle_ids[ i ];
+    if( !pb_encode_tag_for_field( stream, field ) ) return false;
+    if( !pb_encode_submessage( stream, &block_Transaction_msg, &txn ) ) return false;
+  }
+  return true;
+}
+
+/* Encodes a block.Block for slot whose i-th transaction carries
+   bundle_ids[i] and is txn_sz bytes of 0x42.  Returns the encoded size,
+   or 0 on failure. */
+static ulong
+encode_block_ids( uchar * buf, ulong buf_sz, ulong slot, ulong const * bundle_ids, ulong txn_cnt, ulong txn_sz ) {
+  block_enc_t enc = { .bundle_ids = bundle_ids, .txn_cnt = txn_cnt, .txn_sz = txn_sz };
+  block_Block block = block_Block_init_default;
+  block.slot = slot;
+  block.transactions = (pb_callback_t) { .funcs.encode = encode_block_txns, .arg = &enc };
+  pb_ostream_t stream = pb_ostream_from_buffer( buf, buf_sz );
+  if( !pb_encode( &stream, &block_Block_msg, &block ) ) {
+    FD_LOG_WARNING(( "pb_encode failed: %s", PB_GET_ERROR( &stream ) ));
+    return 0UL;
+  }
+  return stream.bytes_written;
+}
+
+/* Encodes a block of bundle_cnt revert protected bundles, each of
+   txns_per_bundle transactions. */
+static ulong
+encode_block_stream_msg( uchar * buf, ulong buf_sz, ulong slot, ulong bundle_cnt, ulong txns_per_bundle, ulong txn_sz ) {
+  ulong ids[ 64 ];
+  FD_TEST( bundle_cnt*txns_per_bundle<=64UL );
+  for( ulong i=0UL; i<bundle_cnt*txns_per_bundle; i++ ) ids[ i ] = 1UL + i/txns_per_bundle;
+  return encode_block_ids( buf, buf_sz, slot, ids, bundle_cnt*txns_per_bundle, txn_sz );
+}
+
+/* Static buffer for block message with slot 12345678: 1 bundle of 2 txns */
+static uchar subscribe_blocks_msg_slot_12345678[256];
+static ulong subscribe_blocks_msg_slot_12345678_sz = 0;
+
+/* Static buffer for block message with slot 99999999: 3 bundles of 2 txns */
+static uchar subscribe_blocks_msg_slot_99999999[512];
+static ulong subscribe_blocks_msg_slot_99999999_sz = 0;
+
+/* Static buffer for block message with slot 55555555: 4 bundles of 2 txns */
+static uchar subscribe_blocks_msg_8txns[512];
+static ulong subscribe_blocks_msg_8txns_sz = 0;
+
+/* Initialize the block test messages (call once at start of tests) */
+static void
+init_block_test_messages( void ) {
+  subscribe_blocks_msg_slot_12345678_sz = encode_block_stream_msg(
+      subscribe_blocks_msg_slot_12345678, sizeof(subscribe_blocks_msg_slot_12345678),
+      12345678UL, 1UL, 2UL, 1UL );
+  FD_TEST( subscribe_blocks_msg_slot_12345678_sz > 0 );
+
+  subscribe_blocks_msg_slot_99999999_sz = encode_block_stream_msg(
+      subscribe_blocks_msg_slot_99999999, sizeof(subscribe_blocks_msg_slot_99999999),
+      99999999UL, 3UL, 2UL, 1UL );
+  FD_TEST( subscribe_blocks_msg_slot_99999999_sz > 0 );
+
+  subscribe_blocks_msg_8txns_sz = encode_block_stream_msg(
+      subscribe_blocks_msg_8txns, sizeof(subscribe_blocks_msg_8txns),
+      55555555UL, 4UL, 2UL, 1UL );
+  FD_TEST( subscribe_blocks_msg_8txns_sz > 0 );
+}
+
+/* A Block's bundles are numbered by their 1-based position in the
+   block and published as bundles tagged with the builder's
+   commission. */
+FD_UNIT_TEST( harmonic_block_multi_bundle ) {
+  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
+  test_bundle_env_enable_harmonic( env );
+  fd_bundle_tile_t * state = env->state;
+
+  state->builder_info_avail = 1;
+  state->builder_commission = 10U;
+  for( ulong i=0UL; i<32UL; i++ ) state->builder_pubkey[ i ] = (uchar)( i+0xA0U );
+  fd_bundle_client_became_leader( state, 99999999UL, LONG_MAX );
+
+  /* 3 bundles of 2 txns */
+  fd_bundle_client_grpc_callbacks.rx_msg(
+      state,
+      subscribe_blocks_msg_slot_99999999, subscribe_blocks_msg_slot_99999999_sz,
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2
+  );
+
+  FD_TEST( state->harmonic_block_seq==3UL );
+  FD_TEST( state->metrics.block_rx_cnt==1UL );
+  FD_TEST( state->metrics.block_bundle_rx_cnt==3UL );
+  FD_TEST( state->metrics.block_txn_rx_cnt==6UL );
+  FD_TEST( state->harmonic_pending_len==6UL );
+  FD_TEST( published_txn_cnt( env )==0UL );
+
+  FD_TEST( flush_harmonic_staging( state )==6UL );
+  FD_TEST( published_txn_cnt( env )==6UL );
+
+  for( ulong i=0UL; i<6UL; i++ ) {
+    fd_frag_meta_t const * meta = NULL;
+    fd_txn_m_t const * txnm = published_txn( env, i, &meta );
+    FD_TEST( meta->sig==1UL );
+    FD_TEST( txnm->source_tpu==FD_TXN_M_TPU_SOURCE_HARMONIC );
+    FD_TEST( txnm->block_engine.bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 99999999UL, 1UL+i/2UL ) );
+    FD_TEST( txnm->block_engine.bundle_txn_cnt==2UL );
+    FD_TEST( txnm->block_engine.commission==10U );
+    FD_TEST( 0==memcmp( txnm->block_engine.commission_pubkey, state->builder_pubkey, 32UL ) );
+    FD_TEST( txnm->payload_sz==1U && fd_txn_m_payload_const( txnm )[ 0 ]==0x42 );
+  }
+
+  test_bundle_env_destroy( env );
+}
+
+/* A block bundle larger than a regular bundle cannot execute atomically
+   and is dropped whole.  It still consumes a sequence number so pack
+   sees the gap and stops the block. */
+FD_UNIT_TEST( harmonic_block_oversize_bundle_rejected ) {
+  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
+  test_bundle_env_enable_harmonic( env );
+  fd_bundle_tile_t * state = env->state;
+
+  state->builder_info_avail = 1;
+  fd_bundle_client_became_leader( state, 77777777UL, LONG_MAX );
+
+  uchar msg[ 256 ];
+  ulong msg_sz = encode_block_stream_msg( msg, sizeof(msg), 77777777UL, 1UL, FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE+1UL, 1UL );
+  FD_TEST( msg_sz>0UL );
+  fd_bundle_client_grpc_callbacks.rx_msg( state, msg, msg_sz, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2 );
+  FD_TEST( state->harmonic_block_seq==1UL );
+  FD_TEST( state->metrics.block_bundle_rx_cnt==1UL );
+  FD_TEST( state->harmonic_pending_len==0UL );
+  FD_TEST( state->metrics.harmonic_block_txn_drop_cnt[ FD_METRICS_ENUM_BLOCK_TXN_DROP_REASON_V_INVALID_BUNDLE_IDX ]==FD_BUNDLE_CLIENT_MAX_TXN_PER_BUNDLE+1UL );
+
+  /* A following valid bundle for the same block gets seq 2 */
+  msg_sz = encode_block_stream_msg( msg, sizeof(msg), 77777777UL, 1UL, 2UL, 1UL );
+  FD_TEST( msg_sz>0UL );
+  fd_bundle_client_grpc_callbacks.rx_msg( state, msg, msg_sz, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2 );
+  FD_TEST( state->harmonic_block_seq==2UL );
+  FD_TEST( state->metrics.block_bundle_rx_cnt==2UL );
+  FD_TEST( state->harmonic_pending_len==2UL );
+  FD_TEST( state->harmonic_staging[0].bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 77777777UL, 2UL ) );
+  FD_TEST( state->harmonic_staging[0].bundle_txn_cnt==2UL );
+
+  test_bundle_env_destroy( env );
+}
+
+/* bundle_id 0 marks a standalone transaction; any other run of equal
+   bundle_id is a revert protected bundle, including a bundle of one. */
+FD_UNIT_TEST( harmonic_block_standalone_and_bundle_of_one ) {
+  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
+  test_bundle_env_enable_harmonic( env );
+  fd_bundle_tile_t * state = env->state;
+
+  state->builder_info_avail = 1;
+  fd_bundle_client_became_leader( state, 4242UL, LONG_MAX );
+
+  ulong const ids[ 6 ] = { 0UL, 7UL, 0UL, 0UL, 9UL, 9UL };
+  uchar msg[ 512 ];
+  ulong msg_sz = encode_block_ids( msg, sizeof(msg), 4242UL, ids, 6UL, 1UL );
+  FD_TEST( msg_sz>0UL );
+  fd_bundle_client_grpc_callbacks.rx_msg( state, msg, msg_sz, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2 );
+
+  ulong const seq[ 6 ] = { 1UL, 2UL, 3UL, 4UL, 5UL, 5UL };
+  ulong const cnt[ 6 ] = { 1UL, 1UL, 1UL, 1UL, 2UL, 2UL };
+  uchar const rp [ 6 ] = { 0,   1,   0,   0,   1,   1   };
+  FD_TEST( state->harmonic_pending_len==6UL );
+  FD_TEST( state->harmonic_block_seq==5UL );
+  FD_TEST( state->metrics.block_bundle_rx_cnt==5UL );
+  for( ulong i=0UL; i<6UL; i++ ) {
+    FD_TEST( state->harmonic_staging[ i ].bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 4242UL, seq[ i ] ) );
+    FD_TEST( state->harmonic_staging[ i ].bundle_txn_cnt==cnt[ i ] );
+    FD_TEST( state->harmonic_staging[ i ].revert_protected==rp[ i ] );
+  }
+
+  FD_TEST( flush_harmonic_staging( state )==6UL );
+  for( ulong i=0UL; i<6UL; i++ ) FD_TEST( published_txn( env, i, NULL )->block_engine.revert_protected==rp[ i ] );
+
+  test_bundle_env_destroy( env );
+}
+
+/* An empty transaction drops its whole bundle, leaving a gap in the
+   sequence so pack stops the block. */
+FD_UNIT_TEST( harmonic_block_empty_txn_drops_bundle ) {
+  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
+  test_bundle_env_enable_harmonic( env );
+  fd_bundle_tile_t * state = env->state;
+
+  state->builder_info_avail = 1;
+  fd_bundle_client_became_leader( state, 4242UL, LONG_MAX );
+
+  /* Bundle 5 is [full, empty]; the standalone txn after it survives */
+  static block_Transaction txns[ 3 ];
+  txns[ 0 ] = (block_Transaction){ .transaction = { .size = 1U, .bytes = { 0x42 } }, .bundle_id = 5UL };
+  txns[ 1 ] = (block_Transaction){ .bundle_id = 5UL };
+  txns[ 2 ] = (block_Transaction){ .transaction = { .size = 1U, .bytes = { 0x42 } } };
+  uchar msg[ 512 ];
+  pb_ostream_t stream = pb_ostream_from_buffer( msg, sizeof(msg) );
+  FD_TEST( pb_encode_tag( &stream, PB_WT_VARINT, block_Block_slot_tag ) && pb_encode_varint( &stream, 4242UL ) );
+  for( ulong i=0UL; i<3UL; i++ ) {
+    FD_TEST( pb_encode_tag( &stream, PB_WT_STRING, block_Block_transactions_tag ) );
+    FD_TEST( pb_encode_submessage( &stream, &block_Transaction_msg, &txns[ i ] ) );
+  }
+  fd_bundle_client_grpc_callbacks.rx_msg( state, msg, stream.bytes_written, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2 );
+
+  FD_TEST( state->harmonic_block_seq==2UL );
+  FD_TEST( state->metrics.block_bundle_rx_cnt==2UL );
+  FD_TEST( state->metrics.block_txn_rx_cnt==3UL );
+  FD_TEST( state->harmonic_pending_len==1UL );
+  FD_TEST( state->harmonic_staging[ 0 ].bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 4242UL, 2UL ) );
+  FD_TEST( state->harmonic_staging[ 0 ].revert_protected==0 );
+  FD_TEST( state->metrics.harmonic_block_txn_drop_cnt[ FD_METRICS_ENUM_BLOCK_TXN_DROP_REASON_V_INVALID_BUNDLE_IDX ]==2UL );
+
+  test_bundle_env_destroy( env );
+}
+
+/* Only Blocks for the slot we last became leader for are numbered, so
+   a bundle id is never issued twice, whatever slots the engine sends. */
+FD_UNIT_TEST( harmonic_block_wrong_slot_dropped ) {
+  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
+  test_bundle_env_enable_harmonic( env );
+  fd_bundle_tile_t * state = env->state;
+  ulong const * wrong_slot = &state->metrics.harmonic_block_txn_drop_cnt[ FD_METRICS_ENUM_BLOCK_TXN_DROP_REASON_V_WRONG_SLOT_IDX ];
+
+  state->builder_info_avail = 1;
+
+  /* Not leader yet */
+  fd_bundle_client_grpc_callbacks.rx_msg( state, subscribe_blocks_msg_slot_12345678, subscribe_blocks_msg_slot_12345678_sz, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2 );
+  FD_TEST( state->harmonic_pending_len==0UL );
+  FD_TEST( *wrong_slot==2UL );
+
+  /* S, then another slot, then S again: S keeps counting */
+  fd_bundle_client_became_leader( state, 12345678UL, LONG_MAX );
+  fd_bundle_client_grpc_callbacks.rx_msg( state, subscribe_blocks_msg_slot_12345678, subscribe_blocks_msg_slot_12345678_sz, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2 );
+  fd_bundle_client_grpc_callbacks.rx_msg( state, subscribe_blocks_msg_slot_99999999, subscribe_blocks_msg_slot_99999999_sz, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2 );
+  fd_bundle_client_grpc_callbacks.rx_msg( state, subscribe_blocks_msg_slot_12345678, subscribe_blocks_msg_slot_12345678_sz, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2 );
+  FD_TEST( *wrong_slot==8UL );
+  FD_TEST( state->harmonic_pending_len==4UL );
+  FD_TEST( state->harmonic_staging[ 0 ].bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 12345678UL, 1UL ) );
+  FD_TEST( state->harmonic_staging[ 2 ].bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 12345678UL, 2UL ) );
+  FD_TEST( flush_harmonic_staging( state )==4UL );
+
+  test_bundle_env_destroy( env );
+}
+
+/* A reset after the engine was asked to stream our block may have lost
+   part of it.  The rest of the block is dropped and pack is told to
+   fall back; becoming leader for the next slot starts clean. */
+FD_UNIT_TEST( harmonic_reset_loses_block ) {
+  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
+  test_bundle_env_enable_harmonic( env );
+  fd_bundle_tile_t * state = env->state;
+  ulong const * reset_drop = &state->metrics.harmonic_block_txn_drop_cnt[ FD_METRICS_ENUM_BLOCK_TXN_DROP_REASON_V_CONN_RESET_IDX ];
+
+  state->builder_info_avail = 1;
+
+  /* Reset before the leader window info went out: nothing streamed yet */
+  fd_bundle_client_became_leader( state, 12345678UL, LONG_MAX );
+  fd_bundle_client_reset( state );
+  test_bundle_env_mock_harmonic_block_stream( state );
+  state->builder_info_avail = 1;
+  FD_TEST( !state->harmonic_block_lost );
+  FD_TEST( fd_fseq_query( state->harmonic_lost_slot )==ULONG_MAX );
+
+  state->leader_window_inflight_slot = 12345678UL; /* as after SubmitLeaderWindowInfo */
+  fd_bundle_client_grpc_callbacks.rx_msg( state, subscribe_blocks_msg_slot_12345678, subscribe_blocks_msg_slot_12345678_sz, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2 );
+  FD_TEST( state->harmonic_pending_len==2UL );
+  FD_TEST( state->harmonic_staging[ 0 ].bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 12345678UL, 1UL ) );
+
+  fd_bundle_client_reset( state );
+  FD_TEST( !state->harmonic_block_subscription_live && !state->harmonic_block_subscription_wait );
+  test_bundle_env_mock_harmonic_block_stream( state );
+  state->builder_info_avail = 1;
+  FD_TEST( state->harmonic_block_lost );
+  FD_TEST( fd_fseq_query( state->harmonic_lost_slot )==12345678UL );
+  FD_TEST( state->harmonic_pending_len==0UL );
+  FD_TEST( *reset_drop==2UL );
+
+  /* The rest of the block is dropped */
+  fd_bundle_client_grpc_callbacks.rx_msg( state, subscribe_blocks_msg_slot_12345678, subscribe_blocks_msg_slot_12345678_sz, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2 );
+  FD_TEST( state->harmonic_pending_len==0UL );
+  FD_TEST( *reset_drop==4UL );
+
+  /* Next leader slot starts clean */
+  fd_bundle_client_became_leader( state, 99999999UL, LONG_MAX );
+  fd_bundle_client_grpc_callbacks.rx_msg( state, subscribe_blocks_msg_slot_99999999, subscribe_blocks_msg_slot_99999999_sz, FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2 );
+  FD_TEST( state->harmonic_pending_len==6UL );
+  FD_TEST( state->harmonic_staging[ 0 ].bundle_id==FD_TXN_M_HARMONIC_BUNDLE_ID( 99999999UL, 1UL ) );
+  FD_TEST( flush_harmonic_staging( state )==6UL );
+
+  /* A reset after the slot ended loses nothing */
+  state->leader_window_inflight_slot = 99999999UL;
+  state->leader_window_slot_end_ns   = g_clock;
+  fd_bundle_client_reset( state );
+  FD_TEST( !state->harmonic_block_lost );
+  FD_TEST( fd_fseq_query( state->harmonic_lost_slot )==12345678UL );
+
+  test_bundle_env_destroy( env );
+}
+
+/* Test ingestion from all 3 sources: packets, bundles, and harmonic blocks */
+FD_UNIT_TEST( all_three_sources ) {
+  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
+  test_bundle_env_enable_harmonic( env );
+  fd_bundle_tile_t * state = env->state;
+
+  state->builder_info_avail = 1;
+
+  /* 1. Receive packets (2 packets → pending deque) */
+  static uchar subscribe_packets_msg[] = {
+    0x12, 0x13, 0x0a, 0x07, 0x0a, 0x01, 0x48, 0x12,
+    0x02, 0x08, 0x01, 0x0a, 0x08, 0x0a, 0x02, 0x48,
+    0x48, 0x12, 0x02, 0x08, 0x02
+  };
+  fd_bundle_client_grpc_rx_msg(
+      state,
+      subscribe_packets_msg, sizeof(subscribe_packets_msg),
+      FD_BUNDLE_CLIENT_REQ_Bundle_SubscribePackets
+  );
+  FD_TEST( state->metrics.packet_received_cnt==2UL );
+  FD_TEST( pending_txn_cnt( state->pending_txns )==2UL );
+
+  /* 2. Receive bundles (5 txns → pending deque) */
+  fd_bundle_client_grpc_rx_msg(
+      state,
+      subscribe_bundles_msg_x5, sizeof(subscribe_bundles_msg_x5),
+      FD_BUNDLE_CLIENT_REQ_Bundle_SubscribeBundles
+  );
+  FD_TEST( state->metrics.bundle_received_cnt==1UL );
+  FD_TEST( pending_txn_cnt( state->pending_txns )==7UL );
+
+  /* 3. Receive harmonic block bundles (3 bundles, 6 txns → staging) */
+  fd_bundle_client_became_leader( state, 99999999UL, LONG_MAX );
+  fd_bundle_client_grpc_callbacks.rx_msg(
+      state,
+      subscribe_blocks_msg_slot_99999999, subscribe_blocks_msg_slot_99999999_sz,
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2
+  );
+  FD_TEST( state->metrics.block_bundle_rx_cnt==3UL );
+  FD_TEST( state->harmonic_pending_len==6UL );
+
+  /* Nothing published yet */
+  FD_TEST( published_txn_cnt( env )==0UL );
+
+  /* Flush harmonic staging (6 published) */
+  FD_TEST( flush_harmonic_staging( state )==6UL );
+
+  /* Drain pending deque: 2 packets then 5 bundle txns */
+  FD_TEST( publish_after_credit( state )==2UL );
+  FD_TEST( publish_after_credit( state )==5UL );
+  FD_TEST( pending_txn_empty( state->pending_txns ) );
+
+  FD_TEST( published_txn_cnt( env )==13UL );
+
+  test_bundle_env_destroy( env );
+}
+
+/* Test budget-limited harmonic staging drain.  Stages 4 bundles of 2
+   txns, drains with budget TEST_STEM_BURST (5): only two whole bundles
+   (4 txns) fit, the third must not be split.  Then drains the rest and
+   checks everything went out in staged order. */
+FD_UNIT_TEST( harmonic_staging_partial_drain ) {
+  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
+  test_bundle_env_enable_harmonic( env );
+  fd_bundle_tile_t * state = env->state;
+
+  state->builder_info_avail = 1;
+  fd_bundle_client_became_leader( state, 55555555UL, LONG_MAX );
+
+  fd_bundle_client_grpc_callbacks.rx_msg(
+      state,
+      subscribe_blocks_msg_8txns, subscribe_blocks_msg_8txns_sz,
+      FD_BUNDLE_CLIENT_REQ_SubscribeBlocks2
+  );
+  FD_TEST( state->harmonic_pending_len==8UL );
+  FD_TEST( state->harmonic_block_slot==55555555UL );
+  FD_TEST( published_txn_cnt( env )==0UL );
+
+  /* Tag each staged payload so the publish order can be checked */
+  for( ulong i=0UL; i<8UL; i++ ) {
+    state->harmonic_payload[ state->harmonic_staging[ i ].payload_off ] = (uchar)i;
+  }
+
+  /* Drain with budget=TEST_STEM_BURST (5).  Two whole bundles (4 txns)
+     fit; the third bundle would need 6 so it waits. */
+  FD_TEST( fd_bundle_client_harmonic_publish( state, state->stem, TEST_STEM_BURST )==4UL );
+  FD_TEST( state->harmonic_publish_idx==4UL );
+  FD_TEST( published_txn_cnt( env )==4UL );
+
+  /* A budget of 1 cannot fit any bundle: nothing is published. */
+  FD_TEST( fd_bundle_client_harmonic_publish( state, state->stem, 1UL )==0UL );
+  FD_TEST( state->harmonic_publish_idx==4UL );
+
+  /* Drain remaining 4; staging restarts empty. */
+  FD_TEST( fd_bundle_client_harmonic_publish( state, state->stem, TEST_STEM_BURST )==4UL );
+  FD_TEST( state->harmonic_pending_len==0UL );
+  FD_TEST( state->harmonic_publish_idx==0UL );
+  FD_TEST( published_txn_cnt( env )==8UL );
+  for( ulong i=0UL; i<8UL; i++ ) FD_TEST( fd_txn_m_payload_const( published_txn( env, i, NULL ) )[0]==(uchar)i );
+
+  test_bundle_env_destroy( env );
+}
+
+/* An undecodable GetTpuConfigs response is a failed request: the client
+   backs off before asking again instead of re-requesting at once. */
+FD_UNIT_TEST( tpu_configs_decode_fail_backs_off ) {
+  test_bundle_env_t env[1]; test_bundle_env_create( env, wksp );
+  fd_bundle_tile_t * state = env->state;
+
+  state->tpu_config_wait = 1;
+  static uchar const truncated[] = { 0x0a, 0xff }; /* length varint cut short */
+  fd_bundle_tpu_client_grpc_callbacks.rx_msg( state, truncated, sizeof(truncated), FD_BUNDLE_CLIENT_REQ_GetTpuConfigs );
+  FD_TEST( !state->tpu_config_avail );
+  FD_TEST( !state->tpu_config_wait );
+  FD_TEST( state->tpu_backoff_iter==1U );
+  FD_TEST( state->metrics.decode_fail_cnt==1UL );
+
+  test_bundle_env_destroy( env );
+}
+
+/* Leader window info waits for the block subscription, and is dropped
+   once its slot ends or the next slot replaces it */
+
+FD_UNIT_TEST( bundle_client_leader_window_info_expiry ) {
+  test_bundle_env_t env[1];
+  test_bundle_env_create( env, wksp );
+  test_bundle_env_mock_conn( env );
+  fd_bundle_tile_t * const state = env->state;
+  long const now = g_clock;
+
+  fd_bundle_client_queue_leader_window_info( state, 10UL, now+1000L );
+  fd_bundle_client_step_reconnect( state, now );
+  FD_TEST( state->leader_window_pending );
+  FD_TEST( fd_bundle_client_next_deadline( state, now )<=now+1000L ); /* wake to drop it */
+
+  fd_bundle_client_queue_leader_window_info( state, 11UL, now+2000L );
+  FD_TEST( state->metrics.leader_window_expired_cnt==1UL );
+  FD_TEST( state->leader_window_slot==11UL );
+
+  fd_bundle_client_step_reconnect( state, now+2000L );
+  FD_TEST( !state->leader_window_pending );
+  FD_TEST( state->metrics.leader_window_expired_cnt==2UL );
+  FD_TEST( state->metrics.leader_window_submitted_cnt==0UL );
+
+  test_bundle_env_destroy( env );
+}
+
+/* Every failed leader window info is counted.  The engine losing our
+   live block subscription forces a reconnect, other errors do not. */
+
+FD_UNIT_TEST( bundle_client_leader_window_info_failed ) {
+  test_bundle_env_t env[1];
+  test_bundle_env_create( env, wksp );
+  test_bundle_env_mock_conn( env );
+  fd_bundle_tile_t * const state = env->state;
+
+  fd_grpc_resp_hdrs_t hdrs = { .h2_status = 200, .grpc_status = FD_GRPC_STATUS_INVALID_ARGUMENT };
+  fd_bundle_client_grpc_rx_end( state, FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo, &hdrs );
+  FD_TEST( state->metrics.leader_window_failed_cnt==1UL );
+  FD_TEST( state->defer_reset==0 );
+
+  /* Rejected because our block subscription is not up yet */
+  hdrs = (fd_grpc_resp_hdrs_t){ .h2_status = 200, .grpc_status = FD_GRPC_STATUS_FAILED_PRECONDITION };
+  state->harmonic_block_subscription_live = 0;
+  fd_bundle_client_grpc_rx_end( state, FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo, &hdrs );
+  FD_TEST( state->metrics.leader_window_failed_cnt==2UL );
+  FD_TEST( state->defer_reset==0 );
+
+  hdrs = (fd_grpc_resp_hdrs_t){ .h2_status = 200, .grpc_status = FD_GRPC_STATUS_FAILED_PRECONDITION };
+  state->harmonic_block_subscription_live = 1;
+  fd_bundle_client_grpc_rx_end( state, FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo, &hdrs );
+  FD_TEST( state->metrics.leader_window_failed_cnt==3UL );
+  FD_TEST( state->defer_reset==1 );
+
+  state->defer_reset = 0;
+  fd_bundle_client_grpc_rx_timeout( state, FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo, FD_GRPC_DEADLINE_RX_END );
+  FD_TEST( state->metrics.leader_window_failed_cnt==4UL );
+  FD_TEST( state->defer_reset==1 );
+
+  test_bundle_env_destroy( env );
+}
+
+/* Verify that the client submits leader window info */
+
+FD_UNIT_TEST( bundle_client_submit_leader_window_info ) {
+  test_bundle_env_t env[1];
+  test_bundle_env_create( env, wksp );
+  test_bundle_env_mock_conn( env );
+  fd_bundle_tile_t * const state       = env->state;
+  fd_grpc_client_t * const grpc_client = state->grpc_client;
+
+  state->harmonic_block_subscription_live = 1;
+
+  /* Queued, but it's blocked on stream count ... */
+  FD_TEST( fd_grpc_client_request_is_blocked( state->grpc_client )==0 );
+  FD_TEST( state->grpc_client->stream_cnt==2 );
+  state->grpc_client->conn->peer_settings.max_concurrent_streams = 2;
+  FD_TEST( fd_grpc_client_request_is_blocked( state->grpc_client )==1 );
+  long const test_timestamp_ns = 1234567890123456789L;
+  ulong const test_slot = 999999UL;
+  fd_bundle_client_queue_leader_window_info( state, test_slot, test_timestamp_ns );
+  fd_bundle_client_step_reconnect( state, g_clock );
+  FD_TEST( state->leader_window_pending );
+  FD_TEST( fd_bundle_client_next_deadline( state, g_clock )<=g_clock ); /* retry at once */
+
+  /* Unblock it ... */
+  state->grpc_client->conn->peer_settings.max_concurrent_streams = 3;
+  FD_TEST( fd_grpc_client_request_is_blocked( state->grpc_client )==0 );
+  FD_TEST( fd_bundle_client_step_reconnect( state, g_clock )==1 );
+  FD_TEST( !state->leader_window_pending );
+  FD_TEST( state->metrics.leader_window_submitted_cnt==1UL );
+
+  /* Get newly created stream */
+  FD_TEST( !grpc_client->request_stream ); /* request instantly flushed */
+  ulong const stream_id = state->grpc_client->stream_ids[ 2 ];
+  fd_grpc_h2_stream_t * stream = &state->grpc_client->stream_pool[ 2 ];
+  FD_TEST( stream->s.stream_id==stream_id );
+  FD_TEST( stream->request_ctx==FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo );
+
+  /* Request header */
+  char const * const hdrs[] = {
+    ":method",      "POST",
+    ":scheme",      "https",
+    ":path",        "/block_engine.BlockEngineValidator/SubmitLeaderWindowInfo",
+    "te",           "trailers",
+    "content-type", "application/grpc+proto",
+    "user-agent",   "grpc-firedancer/0.0.0",
+    NULL
+  };
+  expect_h2_hdr( grpc_client->frame_tx, stream_id, hdrs );
+
+  /* Request body */
+  fd_h2_frame_hdr_t frame_hdr;
+  FD_TEST( fd_h2_rbuf_used_sz( grpc_client->frame_tx )>=sizeof(fd_h2_frame_hdr_t) );
+  fd_h2_rbuf_pop_copy( grpc_client->frame_tx, &frame_hdr, sizeof(fd_h2_frame_hdr_t) );
+  FD_TEST( fd_h2_frame_type( frame_hdr.typlen )==FD_H2_FRAME_TYPE_DATA );
+  FD_TEST( fd_uint_bswap( frame_hdr.r_stream_id )==stream_id );
+  FD_TEST( frame_hdr.flags==FD_H2_FLAG_END_STREAM );
+  fd_grpc_hdr_t grpc_hdr;
+  FD_TEST( fd_h2_rbuf_used_sz( grpc_client->frame_tx )>=sizeof(fd_grpc_hdr_t) );
+  fd_h2_rbuf_pop_copy( grpc_client->frame_tx, &grpc_hdr, sizeof(fd_grpc_hdr_t) );
+  FD_TEST( grpc_hdr.compressed==0 );
+  ulong msg_sz = fd_uint_bswap( grpc_hdr.msg_sz );
+  FD_TEST( msg_sz>0UL && msg_sz<=128UL && fd_h2_rbuf_used_sz( grpc_client->frame_tx )>=msg_sz );
+  uchar req_buf[ 128 ];
+  fd_h2_rbuf_pop_copy( grpc_client->frame_tx, req_buf, msg_sz );
+  block_engine_SubmitLeaderWindowInfoRequest req = block_engine_SubmitLeaderWindowInfoRequest_init_default;
+  pb_istream_t istream = pb_istream_from_buffer( req_buf, msg_sz );
+  FD_TEST( pb_decode( &istream, &block_engine_SubmitLeaderWindowInfoRequest_msg, &req ) );
+  FD_TEST( req.slot==test_slot );
+  FD_TEST( req.has_end_timestamp );
+  FD_TEST( req.end_timestamp.seconds==test_timestamp_ns/(long)1e9 );
+  FD_TEST( req.end_timestamp.nanos  ==(int)( test_timestamp_ns%(long)1e9 ) );
+
+  /* The response is empty */
+  fd_bundle_client_grpc_rx_start( state, FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo );
+  fd_bundle_client_grpc_rx_msg( state, NULL, 0UL, FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo );
+  fd_grpc_resp_hdrs_t grpc_resp_hdrs = { .h2_status = 200, .grpc_status = FD_GRPC_STATUS_OK };
+  fd_bundle_client_grpc_rx_end( state, FD_BUNDLE_CLIENT_REQ_SubmitLeaderWindowInfo, &grpc_resp_hdrs );
+  FD_TEST( state->metrics.leader_window_failed_cnt==0UL );
+
+  test_bundle_env_destroy( env );
+}
+
 int
 main( int     argc,
       char ** argv ) {
@@ -1741,6 +2327,8 @@ main( int     argc,
 
   wksp = fd_wksp_new_anonymous( fd_cstr_to_shmem_page_sz( _page_sz ), page_cnt, fd_shmem_cpu_idx( numa_idx ), "wksp", 16UL );
   FD_TEST( wksp );
+
+  init_block_test_messages();
 
   fd_unit_tests( argc, argv );
 

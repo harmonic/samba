@@ -141,6 +141,38 @@
             }
         },
         "txn_pending":                { "type": "UInt64",                     "compression": "T64, ZSTD",         "description": "Transactions buffered and waiting to be published" },
-        "txn_buffer_full_dropped":    { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Transactions dropped because the pending transaction buffer was full" }
+        "txn_buffer_full_dropped":    { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Transactions dropped because the pending transaction buffer was full" },
+        "tpu_conn_state": {
+            "type": "LowCardinality(String)",
+            "description": "TPU endpoint connection state; Sleeping means the block engine connection is closed on purpose and the TPU connection is not serviced: 0=disconnected, 1=connecting, 2=connected, 3=sleeping",
+            "field_number": 337613775,
+            "variants": {
+                "disconnected": { "description": "Disconnected" },
+                "connecting":   { "description": "Connecting" },
+                "connected":    { "description": "Connected" },
+                "sleeping":     { "description": "Sleeping" }
+            }
+        },
+        "tpu_txn_rx":                 { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Transactions received from the TPU endpoint", "field_number": 499699948 },
+        "block_rx":                   { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Block messages received from the block engine", "field_number": 471765879 },
+        "block_bundle_rx":            { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Bundles received in Block messages for our leader slot, counting a standalone transaction as a bundle of one", "field_number": 421978776 },
+        "block_txn_rx":               { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Transactions received in Block messages; each is either published to verify or counted in BlockTxnDropped", "field_number": 489535613 },
+        "block_txn_dropped": {
+            "type": "Tuple",
+            "description": "Transactions from blocks dropped before publishing, by reason",
+            "field_number": 393298334,
+            "aliases": {
+                "all": ["wrong_slot", "conn_reset", "invalid_bundle", "malformed"]
+            },
+            "fields": {
+                "wrong_slot":     { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Block is for a slot other than our current leader slot" },
+                "conn_reset":     { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Block engine connection was reset during our leader slot, so the rest of its block is dropped" },
+                "invalid_bundle": { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Bundle has more transactions than a bundle allows, or an empty transaction" },
+                "malformed":      { "type": "UInt64", "compression": "DoubleDelta, ZSTD", "description": "Block message failed to decode" }
+            }
+        },
+        "leader_window_tx":           { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Leader window info requests sent to the block engine", "field_number": 455040879 },
+        "leader_window_failed":       { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Leader window info requests that the block engine rejected, that timed out, or whose connection failed", "field_number": 297593961 },
+        "leader_window_dropped":      { "type": "UInt64",                     "compression": "DoubleDelta, ZSTD", "description": "Leader window info requests never sent because the slot ended or the next leader slot superseded them", "field_number": 511681106 }
     }
 }

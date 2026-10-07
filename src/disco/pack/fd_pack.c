@@ -12,6 +12,7 @@
 #include "fd_pack_unwritable.h"
 #include "fd_chkdup.h"
 #include "fd_pack_tip_prog_blacklist.h"
+#include "../fd_txn_m.h"
 #include <math.h> /* for sqrt */
 #include <stddef.h> /* for offsetof */
 #include "../metrics/fd_metrics.h"
@@ -130,6 +131,7 @@ FD_STATIC_ASSERT( offsetof( fd_pack_ord_txn_t, txn_e->txnp  )==0UL, fd_pack_ord_
 #define FD_ORD_TXN_ROOT_PENALTY( idx )             (3 | (idx)<<8)
 #define FD_ORD_TXN_ROOT_PRE_ROTATION_BUNDLE( idx ) (4 | (idx)<<8)
 #define FD_ORD_TXN_ROOT_NEXT_AUCTION                5
+#define FD_ORD_TXN_ROOT_PENDING_BLOCK               6
 
 /* if root & TAG_MASK == PENALTY, then PENALTY_ACCT_IDX(root) gives the index
    in the transaction's list of account addresses of which penalty treap the
@@ -632,6 +634,28 @@ struct fd_pack_private {
      transactions that come from bundles separately. */
   treap_t pending[1];
   treap_t pending_bundles[1];
+  treap_t pending_blocks[1];  /* Harmonic block transactions, sorted by FIFO index */
+
+  /* Harmonic block mode state.
+     harmonic_bundle_idx: FIFO index for pending_blocks, the analog of
+       relative_bundle_idx for pending_bundles (0 is the crank).
+     harmonic_decision: one of HARMONIC_MODE_*.
+     harmonic_block_slot: the slot we are leader for; block bundles for
+       any other slot are rejected.
+     harmonic_next_seq: sequence number the next block bundle must carry.
+       A gap means a bundle was dropped upstream, which stops the block.
+     harmonic_stopped: no further block bundles are accepted this slot
+       (a bundle failed, reverted, arrived late, or could not fit).
+     harmonic_bank_outstanding: bit i set iff bank i's outstanding
+       microblock is a block bundle.
+     block_end_flags: bitset of FD_PACK_END_FLAG_*, logged at slot end. */
+  ulong harmonic_bundle_idx;
+  int   harmonic_decision;
+  ulong harmonic_block_slot;
+  ulong harmonic_next_seq;
+  int   harmonic_stopped;
+  ulong harmonic_bank_outstanding;
+  int   block_end_flags;
 
   /* Bundles that arrived before our leader rotation has started are
      stored in pre_rotation_bundles, one bundle per treap.
@@ -812,7 +836,7 @@ FD_STATIC_ASSERT( offsetof(fd_pack_t, pending_txn_cnt)==FD_PACK_PENDING_TXN_CNT_
 
 /* Forward-declare some helper functions */
 static ulong delete_transaction( fd_pack_t * pack, fd_pack_ord_txn_t * txn, int delete_full_bundle, int move_from_penalty_treap );
-static inline void insert_bundle_impl( fd_pack_t * pack, ulong bundle_idx, ulong txn_cnt, fd_pack_ord_txn_t * * bundle, ulong expires_at );
+static inline void insert_bundle_impl( fd_pack_t * pack, ulong bundle_idx, ulong txn_cnt, fd_pack_ord_txn_t * * bundle, ulong expires_at, treap_t * bundles, int root );
 static inline ulong insert_pre_rotation_bundle_impl( fd_pack_t * pack, ulong txn_cnt, fd_pack_ord_txn_t * * bundle, ulong expires_at, ulong pre_rotation_tip );
 
 FD_FN_PURE ulong
@@ -1021,6 +1045,16 @@ fd_pack_new( void                   * mem,
   fd_chkdup_new( pack->chkdup, rng );
 
   pack->bundle_meta = bundle_meta;
+
+  /* Initialize harmonic block mode state */
+  treap_new( pack->pending_blocks, pack_depth+extra_depth );
+  pack->harmonic_bundle_idx       = 1UL;
+  pack->harmonic_decision         = HARMONIC_MODE_DONE; /* stays DONE unless fd_pack_harmonic_reset */
+  pack->harmonic_block_slot       = 0UL;
+  pack->harmonic_next_seq         = 1UL;
+  pack->harmonic_stopped          = 0;
+  pack->harmonic_bank_outstanding = 0UL;
+  pack->block_end_flags           = 0;
 
   return mem;
 }
@@ -1324,6 +1358,11 @@ delete_worst( fd_pack_t * pack,
         multiplier = 1e20f;
         break;
       }
+      case FD_ORD_TXN_ROOT_PENDING_BLOCK: {
+        /* Harmonic: never evict block transactions.  If every sample is
+           one, nothing is deleted and the insert is rejected instead. */
+        continue;
+      }
       case FD_ORD_TXN_ROOT_PENALTY( 0 ): {
         fd_txn_t * txn = TXN( sample->txn );
         fd_acct_addr_t const * accts   = fd_txn_get_acct_addrs( txn, sample->txn->payload );
@@ -1607,6 +1646,7 @@ fd_pack_insert_txn_fini( fd_pack_t  * pack,
     fd_pack_ord_txn_t * same_nonce = noncemap_ele_query( pack->noncemap, txne, NULL, pack->pool );
     if( FD_LIKELY( same_nonce ) ) { /* Seems like most nonce transactions are effectively duplicates */
       if( FD_LIKELY( same_nonce->root == FD_ORD_TXN_ROOT_PENDING_BUNDLE || (same_nonce->root & FD_ORD_TXN_ROOT_TAG_MASK) == FD_ORD_TXN_ROOT_PRE_ROTATION_BUNDLE( 0 ) ||
+            same_nonce->root == FD_ORD_TXN_ROOT_PENDING_BLOCK ||
             same_nonce->nonce_expires_at>expires_at ||
             (same_nonce->nonce_expires_at==expires_at && COMPARE_WORSE( ord, same_nonce ) ) ) ) REJECT( NONCE_PRIORITY );
       ulong _delete_cnt = delete_transaction( pack, same_nonce, 0, 0 ); /* Not a bundle, so delete_full_bundle is 0 */
@@ -1738,27 +1778,37 @@ pre_rotation_bundle_remove( fd_pack_t                     * pack,
   }
 }
 
-int
-fd_pack_insert_bundle_fini( fd_pack_t          * pack,
-                            fd_txn_e_t * const * bundle,
-                            ulong                txn_cnt,
-                            ulong                expires_at,
-                            int                  initializer_bundle,
-                            void         const * bundle_meta,
-                            ulong              * delete_cnt ) {
+static int
+insert_bundle_fini_impl( fd_pack_t          * pack,
+                         fd_txn_e_t * const * bundle,
+                         ulong                txn_cnt,
+                         ulong                expires_at,
+                         int                  initializer_bundle,
+                         void         const * bundle_meta,
+                         ulong              * delete_cnt,
+                         int                  harmonic,
+                         int                  revert_protected ) {
 
   int err = 0;
   *delete_cnt = 0UL;
 
-  ulong pending_b_txn_cnt = treap_ele_cnt( pack->pending_bundles );
-  int is_pre_rotation     = (bundle[ 0 ]->txnp->scheduler_arrival_time_nanos>=pack->rotation_end_ns) & (!initializer_bundle);
+  /* Harmonic block bundles are regular bundles that live in their own
+     FIFO (pending_blocks) with its own index counter, and are never
+     pre-rotation bundles. */
+  treap_t * bundles = harmonic ? pack->pending_blocks        : pack->pending_bundles;
+  ulong   * rel_idx = harmonic ? &pack->harmonic_bundle_idx  : &pack->relative_bundle_idx;
+
+  ulong pending_b_txn_cnt = treap_ele_cnt( bundles );
+  int is_pre_rotation     = (bundle[ 0 ]->txnp->scheduler_arrival_time_nanos>=pack->rotation_end_ns) & (!initializer_bundle) & (!harmonic);
     /* We want to prevent bundles from consuming the whole treap, but in
        general, we assume bundles are lucrative.  We'll set the policy
        on capping bundles at half of the pack depth.  We assume that the
        bundles are coming in a pre-prioritized order, so it doesn't make
        sense to drop an earlier bundle for this one.  That means that
        really, the best thing to do is drop this one. */
-  if( FD_UNLIKELY( (!initializer_bundle)&(pending_b_txn_cnt+txn_cnt>pack->pack_depth/2UL) ) ) err = FD_PACK_INSERT_REJECT_PRIORITY;
+  /* Harmonic: a block may legitimately fill most of pack, so the block
+     FIFO is bounded only by pack_depth below. */
+  if( FD_UNLIKELY( (!initializer_bundle)&(!harmonic)&(pending_b_txn_cnt+txn_cnt>pack->pack_depth/2UL) ) ) err = FD_PACK_INSERT_REJECT_PRIORITY;
 
   if( FD_UNLIKELY( expires_at<pack->expire_before                                         ) ) err = FD_PACK_INSERT_REJECT_EXPIRED;
 
@@ -1843,12 +1893,16 @@ fd_pack_insert_bundle_fini( fd_pack_t          * pack,
 
            Fresh bundles take priority over pre-rotation bundles, and
            pre-rotation bundles with higher tips take priority over
-           pre-rotation bundles with lower tips. */
+           pre-rotation bundles with lower tips.
+
+           Harmonic: a block bundle displaces anything pending except
+           another block bundle, and nothing displaces a block bundle. */
         int holder_root     = same_nonce->root & FD_ORD_TXN_ROOT_TAG_MASK;
+        int holder_is_block = holder_root==FD_ORD_TXN_ROOT_PENDING_BLOCK;
         int holder_is_fresh = holder_root==FD_ORD_TXN_ROOT_PENDING_BUNDLE;
         int holder_is_pre   = holder_root==FD_ORD_TXN_ROOT_PRE_ROTATION_BUNDLE( 0 );
         int holder_out_tips = (is_pre_rotation & holder_is_pre) && !pre_rotation_bundle_worse( pack->pre_rotation_bundles + FD_ORD_TXN_ROOT_PRE_ROTATION_BUNDLE_IDX( same_nonce->root ), cand );
-        if( FD_UNLIKELY( holder_is_fresh | (holder_is_pre & holder_out_tips) ) ) {
+        if( FD_UNLIKELY( holder_is_block | ((!harmonic) & (holder_is_fresh | (holder_is_pre & holder_out_tips))) ) ) {
           err = FD_PACK_INSERT_REJECT_NONCE_PRIORITY;
           break;
         } else {
@@ -1869,7 +1923,7 @@ fd_pack_insert_bundle_fini( fd_pack_t          * pack,
   }
 
   if( FD_UNLIKELY( initializer_bundle && pending_b_txn_cnt>0UL ) ) {
-    treap_rev_iter_t _cur=treap_rev_iter_init( pack->pending_bundles, pack->pool );
+    treap_rev_iter_t _cur=treap_rev_iter_init( bundles, pack->pool );
     FD_TEST( !treap_rev_iter_done( _cur ) );
     fd_pack_ord_txn_t * cur = treap_rev_iter_ele( _cur, pack->pool );
     int is_ib = !!(cur->txn->flags & FD_TXN_P_FLAGS_INITIALIZER_BUNDLE);
@@ -1892,7 +1946,7 @@ fd_pack_insert_bundle_fini( fd_pack_t          * pack,
   }
 
   if( FD_UNLIKELY( !pending_b_txn_cnt ) ) {
-    pack->relative_bundle_idx = 1UL;
+    *rel_idx = 1UL;
   }
 
   if( FD_LIKELY( bundle_meta ) ) {
@@ -2031,25 +2085,46 @@ fd_pack_insert_bundle_fini( fd_pack_t          * pack,
 #define BUNDLE_L_PRIME 37896771UL
 #define BUNDLE_N       313721UL
 
-  if( FD_UNLIKELY( pack->relative_bundle_idx>BUNDLE_N ) ) {
+  if( FD_UNLIKELY( *rel_idx>BUNDLE_N ) ) {
     FD_LOG_WARNING(( "Too many bundles inserted without allowing pending bundles to go empty. "
                      "Ordering of bundles may be incorrect." ));
-    pack->relative_bundle_idx = 1UL;
+    *rel_idx = 1UL;
   }
-  ulong bundle_idx = fd_ulong_if( initializer_bundle, 0UL, pack->relative_bundle_idx );
-  insert_bundle_impl( pack, bundle_idx, txn_cnt, (fd_pack_ord_txn_t * *)bundle, expires_at );
+  ulong bundle_idx = fd_ulong_if( initializer_bundle, 0UL, *rel_idx );
+  insert_bundle_impl( pack, bundle_idx, txn_cnt, (fd_pack_ord_txn_t * *)bundle, expires_at, bundles,
+                      harmonic ? FD_ORD_TXN_ROOT_PENDING_BLOCK : FD_ORD_TXN_ROOT_PENDING_BUNDLE );
   /* if IB this is max( 1, x ), which is x.  Otherwise, this is max(x,
      x+1) which is x++ */
-  pack->relative_bundle_idx = fd_ulong_max( bundle_idx+1UL, pack->relative_bundle_idx );
+  *rel_idx = fd_ulong_max( bundle_idx+1UL, *rel_idx );
+
+  if( FD_UNLIKELY( harmonic & !revert_protected & !initializer_bundle ) ) {
+    /* A standalone block transaction is allowed to fail, so it executes
+       without revert protection.  It still keeps its place in the block
+       FIFO. */
+    bundle[ 0 ]->txnp->flags &= ~FD_TXN_P_FLAGS_BUNDLE;
+  }
 
   return (0) | (replaces<<1) | ((!!nonce_txn_cnt)<<2);
+}
+
+int
+fd_pack_insert_bundle_fini( fd_pack_t          * pack,
+                            fd_txn_e_t * const * bundle,
+                            ulong                txn_cnt,
+                            ulong                expires_at,
+                            int                  initializer_bundle,
+                            void         const * bundle_meta,
+                            ulong              * delete_cnt ) {
+  return insert_bundle_fini_impl( pack, bundle, txn_cnt, expires_at, initializer_bundle, bundle_meta, delete_cnt, 0, 1 );
 }
 static inline void
 insert_bundle_impl( fd_pack_t           * pack,
                     ulong                 bundle_idx,
                     ulong                 txn_cnt,
                     fd_pack_ord_txn_t * * bundle,
-                    ulong                 expires_at ) {
+                    ulong                 expires_at,
+                    treap_t             * bundles,
+                    int                   root ) {
   ulong prev_reward = ((BUNDLE_L_PRIME * (BUNDLE_N - bundle_idx))) - 1UL;
   ulong prev_cost = 1UL<<32;
 
@@ -2057,7 +2132,7 @@ insert_bundle_impl( fd_pack_t           * pack,
   for( ulong i=0UL; i<txn_cnt; i++ ) {
     fd_pack_ord_txn_t * ord = bundle[ txn_cnt-1UL - i ];
     ord->rewards = (uint)(((ulong)ord->compute_est * (prev_reward + 1UL) + prev_cost-1UL)/prev_cost);
-    ord->root    = FD_ORD_TXN_ROOT_PENDING_BUNDLE;
+    ord->root    = root;
     prev_reward = ord->rewards;
     prev_cost   = ord->compute_est;
 
@@ -2066,7 +2141,7 @@ insert_bundle_impl( fd_pack_t           * pack,
     uchar  penalty_idx[ FD_TXN_ACCT_ADDR_MAX ];
     populate_bitsets( pack, ord, penalties, penalty_idx );
 
-    treap_ele_insert( pack->pending_bundles, ord, pack->pool );
+    treap_ele_insert( bundles, ord, pack->pool );
     pack->pending_txn_cnt++;
 
     if( FD_UNLIKELY( ord->txn->flags & FD_TXN_P_FLAGS_DURABLE_NONCE ) ) noncemap_ele_insert( pack->noncemap, ord, pack->pool );
@@ -2158,6 +2233,21 @@ fd_pack_peek_bundle_meta( fd_pack_t const * pack ) {
   return (void const *)((uchar const *)pack->bundle_meta + (ulong)_cur * pack->bundle_meta_sz);
 }
 
+void const *
+fd_pack_peek_harmonic_meta( fd_pack_t const * pack ) {
+  int ib_state = pack->initializer_bundle_state;
+  if( FD_UNLIKELY( (ib_state==FD_PACK_IB_STATE_PENDING) | (ib_state==FD_PACK_IB_STATE_FAILED) ) ) return NULL;
+
+  treap_rev_iter_t _cur=treap_rev_iter_init( pack->pending_blocks, pack->pool );
+  if( FD_UNLIKELY( treap_rev_iter_done( _cur ) ) ) return NULL; /* empty */
+
+  fd_pack_ord_txn_t * cur = treap_rev_iter_ele( _cur, pack->pool );
+  int is_ib = !!(cur->txn->flags & FD_TXN_P_FLAGS_INITIALIZER_BUNDLE);
+  if( FD_UNLIKELY( is_ib ) ) return NULL;
+
+  return (void const *)((uchar const *)pack->bundle_meta + (ulong)_cur * pack->bundle_meta_sz);
+}
+
 void
 fd_pack_set_initializer_bundles_ready( fd_pack_t * pack ) {
   pack->initializer_bundle_state = FD_PACK_IB_STATE_READY;
@@ -2172,7 +2262,7 @@ fd_pack_set_rotation_end_ns( fd_pack_t * pack,
 void
 fd_pack_metrics_write( fd_pack_t const * pack ) {
   ulong pending_regular      = treap_ele_cnt( pack->pending         );
-  ulong pending_bundle       = treap_ele_cnt( pack->pending_bundles );
+  ulong pending_bundle       = treap_ele_cnt( pack->pending_bundles ) + treap_ele_cnt( pack->pending_blocks );
   for( ulong i=0UL; i<FD_PACK_PRE_ROTATION_BUNDLE_CAPACITY; i++ ) {
     pending_bundle += treap_ele_cnt( pack->pre_rotation_bundles[ i ].treap );
   }
@@ -2633,6 +2723,8 @@ fd_pack_microblock_complete( fd_pack_t * pack,
   /* outstanding_microblock_mask never has the writable bit set, so we
      don't care about clearing it here either. */
   pack->outstanding_microblock_mask &= clear_mask;
+
+  pack->harmonic_bank_outstanding &= ~(1UL<<bank_tile);
   return 1;
 }
 
@@ -2642,13 +2734,13 @@ fd_pack_microblock_complete( fd_pack_t * pack,
 #define TRY_BUNDLE_SUCCESS(n)          ( n) /* schedule bundle with n transactions */
 static inline int
 fd_pack_try_schedule_bundle( fd_pack_t  * pack,
+                             treap_t    * bundles,
                              ulong        bank_tile,
                              fd_txn_e_t * out ) {
   int state = pack->initializer_bundle_state;
   if( FD_UNLIKELY( (state==FD_PACK_IB_STATE_PENDING) | (state==FD_PACK_IB_STATE_FAILED ) ) ) return TRY_BUNDLE_NO_READY_BUNDLES;
 
   fd_pack_ord_txn_t * pool    = pack->pool;
-  treap_t           * bundles = pack->pending_bundles;
 
   int require_ib;
   if( FD_UNLIKELY( state==FD_PACK_IB_STATE_NOT_INITIALIZED ) ) { require_ib = 1; }
@@ -2670,7 +2762,8 @@ fd_pack_try_schedule_bundle( fd_pack_t  * pack,
   int                             is_pre_rotation     = 0;
   fd_pack_pre_rotation_bundle_t * pre_rotation_bundle = NULL;
   if( FD_UNLIKELY( treap_rev_iter_done( _cur ) ) ) {
-    if( FD_UNLIKELY( require_ib ) ) return TRY_BUNDLE_NO_READY_BUNDLES;
+    /* Harmonic: the block FIFO never falls back to pre-rotation bundles */
+    if( FD_UNLIKELY( require_ib | (bundles!=pack->pending_bundles) ) ) return TRY_BUNDLE_NO_READY_BUNDLES;
     is_pre_rotation = 1;
     ulong best = pre_rotation_best_bundle_idx( pack );
     if( FD_UNLIKELY( best==ULONG_MAX ) ) return TRY_BUNDLE_NO_READY_BUNDLES;
@@ -2911,7 +3004,7 @@ fd_pack_try_schedule_bundle( fd_pack_t  * pack,
     cur->root = FD_ORD_TXN_ROOT_FREE;
     expq_remove( pack->expiration_q, cur->expq_idx );
     if( FD_UNLIKELY( is_pre_rotation ) ) pre_rotation_bundle_remove( pack, pre_rotation_bundle, _cur );
-    else                                 treap_idx_remove( pack->pending_bundles, _cur, pack->pool );
+    else                                 treap_idx_remove( bundles, _cur, pack->pool );
     trp_pool_idx_release( pack->pool, _cur );
     pack->pending_txn_cnt--;
   }
@@ -2971,6 +3064,48 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
                                   int          schedule_flags,
                                   fd_txn_e_t * out ) {
 
+  /* Harmonic: nothing is scheduled while the block is UNDECIDED, and
+     only block bundles while HARMONIC.  Outside harmonic mode the state
+     is always DONE. */
+  if( FD_UNLIKELY( pack->harmonic_decision==HARMONIC_MODE_UNDECIDED ) ) return 0UL;
+
+  if( FD_UNLIKELY( pack->harmonic_decision==HARMONIC_MODE_HARMONIC ) ) {
+    /* Block bundles are scheduled exactly like regular bundles: one
+       bundle per microblock, FIFO with head-of-line blocking, so the
+       stream order is honored by construction. */
+    if( FD_UNLIKELY( pack->initializer_bundle_state==FD_PACK_IB_STATE_FAILED ) ) {
+      fd_pack_harmonic_abort( pack, FD_PACK_END_FLAG_HARMONIC_FAILED );
+      return 0UL;
+    }
+    int bundle_result = fd_pack_try_schedule_bundle( pack, pack->pending_blocks, bank_tile, out );
+    if( FD_LIKELY( bundle_result>0 ) ) {
+      pack->harmonic_bank_outstanding |= 1UL<<bank_tile;
+      return (ulong)bundle_result;
+    }
+    if( FD_UNLIKELY( bundle_result==TRY_BUNDLE_DOES_NOT_FIT ) ) {
+      /* Limits are checked against requested CUs, and rebates from
+         microblocks still in flight can free room.  While anything is
+         in flight, keep the head where it is and try again later; the
+         scheduler marked it as skipped for this block, which would let
+         the next bundle overtake it, so undo that.  Once nothing is in
+         flight the head truly cannot fit, and everything behind it is
+         later in stream order, so the rest of the block is dropped. */
+      if( FD_LIKELY( pack->harmonic_bank_outstanding ) ) {
+        treap_rev_iter_t _cur = treap_rev_iter_init( pack->pending_blocks, pack->pool );
+        fd_pack_ord_txn_t * head = treap_rev_iter_ele( _cur, pack->pool );
+        ulong head_idx = RC_TO_REL_BUNDLE_IDX( head->rewards, head->compute_est );
+        for( ; !treap_rev_iter_done( _cur ); _cur=treap_rev_iter_next( _cur, pack->pool ) ) {
+          fd_pack_ord_txn_t * cur = treap_rev_iter_ele( _cur, pack->pool );
+          if( RC_TO_REL_BUNDLE_IDX( cur->rewards, cur->compute_est )!=head_idx ) break;
+          cur->skip = FD_PACK_SKIP_CNT;
+        }
+      } else {
+        fd_pack_harmonic_abort( pack, FD_PACK_END_FLAG_HARMONIC_FAILED );
+      }
+    }
+    return 0UL;
+  }
+
   /* TODO: Decide if these are exactly how we want to handle limits */
   total_cus = fd_ulong_min( total_cus, pack->lim->max_cost_per_block - pack->cumulative_block_cost );
 
@@ -3003,7 +3138,7 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
   sched_return_t status = {0};
 
   if( FD_UNLIKELY( schedule_flags & FD_PACK_SCHEDULE_BUNDLE ) ) {
-    int bundle_result = fd_pack_try_schedule_bundle( pack, bank_tile, out );
+    int bundle_result = fd_pack_try_schedule_bundle( pack, pack->pending_bundles, bank_tile, out );
     if( FD_UNLIKELY( bundle_result>0                         ) ) return (ulong)bundle_result;
     if( FD_UNLIKELY( bundle_result==TRY_BUNDLE_HAS_CONFLICTS ) ) return 0UL;
     /* in the NO_READY_BUNDLES or DOES_NOT_FIT case, we schedule like
@@ -3034,6 +3169,245 @@ fd_pack_schedule_next_microblock( fd_pack_t *  pack,
 
   pack_memcpy_fini();
   return scheduled;
+}
+
+/* Harmonic block mode.
+
+   A harmonic block arrives from the block engine as a sequence of
+   bundles (see fd_txn_m.h for the bundle_id layout).  Block bundles
+   travel the ordinary bundle path through the bundle, verify, dedup,
+   resolv and pack tiles, so the pack tile assembles each one whole
+   before calling fd_pack_harmonic_insert_bundle_fini, and
+   fd_pack_try_schedule_bundle schedules each one as a single microblock
+   from pending_blocks in FIFO order.
+
+   The mode enforces that the transactions executed from a block form an
+   ordered prefix of the block's complete bundles:
+
+     - a bundle is accepted or rejected as a unit, once, at fini time;
+     - after the first bundle that is rejected, dropped upstream (a gap
+       in the sequence, or a short bundle), arrives too late, reverts at
+       execution, or can never fit in the block, no later bundle is
+       accepted (harmonic_stopped);
+     - when a bundle reverts, every block bundle still pending (all of
+       which are later in stream order) is dropped and nothing further
+       is admitted.  Block bundles already in flight on other banks were
+       account-disjoint from the reverted one when dispatched and are
+       left to finish.
+
+   Any stop before the slot ends means the block stream is bad: once the
+   bundles accepted before it have been dispatched, the slot continues
+   in FALLBACK with our own transactions.  A stop before the block has
+   started (still UNDECIDED, waiting for its crank) falls back at once.
+   A stop after the slot ends is not a stream failure; the block is simply
+   over. */
+
+static void
+harmonic_drop_pending( fd_pack_t * pack ) {
+  ulong deleted = 0UL;
+  while( treap_ele_cnt( pack->pending_blocks )>0UL ) {
+    fd_pack_ord_txn_t * cur = treap_rev_iter_ele( treap_rev_iter_init( pack->pending_blocks, pack->pool ), pack->pool );
+    deleted += delete_transaction( pack, cur, 0, 0 );
+  }
+  FD_MCNT_INC( PACK, TXN_DROPPED_BLOCK_ABANDONED, deleted );
+}
+
+/* harmonic_fallback gives up on the block for the rest of the slot and
+   packs our own transactions instead. */
+
+static void
+harmonic_fallback( fd_pack_t * pack,
+                   int         flag ) {
+  harmonic_drop_pending( pack );
+  pack->block_end_flags   |= flag;
+  pack->harmonic_decision  = HARMONIC_MODE_FALLBACK;
+}
+
+void
+fd_pack_harmonic_stop( fd_pack_t * pack,
+                       int         flag ) {
+  if( FD_LIKELY( !pack->harmonic_stopped ) ) {
+    FD_LOG_INFO(( "HARMONIC: no further block bundles accepted this slot (flags=%d)", pack->block_end_flags|flag ));
+  }
+  pack->harmonic_stopped  = 1;
+  pack->block_end_flags  |= flag;
+  /* The block has not started: none of it runs */
+  if( FD_UNLIKELY( pack->harmonic_decision==HARMONIC_MODE_UNDECIDED ) ) {
+    harmonic_fallback( pack, 0 );
+    FD_LOG_INFO(( "HARMONIC: UNDECIDED -> FALLBACK (stopped, flags=%d)", pack->block_end_flags ));
+  }
+}
+
+void
+fd_pack_harmonic_abort( fd_pack_t * pack,
+                        int         flag ) {
+  fd_pack_harmonic_stop( pack, flag );
+  harmonic_drop_pending( pack );
+}
+
+void
+fd_pack_harmonic_bank_failed( fd_pack_t * pack,
+                              ulong       bank_tile ) {
+  /* Stale completion from a previous slot */
+  if( FD_UNLIKELY( !(pack->harmonic_bank_outstanding & (1UL<<bank_tile)) ) ) {
+    fd_pack_microblock_complete( pack, bank_tile );
+    return;
+  }
+  FD_LOG_WARNING(( "HARMONIC: block bundle reverted on bank %lu, dropping the rest of the block", bank_tile ));
+  fd_pack_harmonic_abort( pack, FD_PACK_END_FLAG_HARMONIC_REVERTED );
+  fd_pack_microblock_complete( pack, bank_tile );
+}
+
+void
+fd_pack_harmonic_reset( fd_pack_t * pack,
+                        ulong       leader_slot ) {
+  harmonic_drop_pending( pack );
+
+  pack->harmonic_bundle_idx       = 1UL;
+  pack->harmonic_decision         = HARMONIC_MODE_UNDECIDED;
+  pack->harmonic_block_slot       = leader_slot;
+  pack->harmonic_next_seq         = 1UL;
+  pack->harmonic_stopped          = 0;
+  pack->harmonic_bank_outstanding = 0UL;
+  pack->block_end_flags           = 0;
+}
+
+int
+fd_pack_harmonic_insert_bundle_fini( fd_pack_t          * pack,
+                                     fd_txn_e_t * const * bundle,
+                                     ulong                txn_cnt,
+                                     ulong                bundle_id,
+                                     int                  revert_protected,
+                                     ulong                expires_at,
+                                     int                  initializer_bundle,
+                                     void         const * bundle_meta,
+                                     long                 now_ns,
+                                     long                 harmonic_threshold_ns,
+                                     long                 slot_end_ns,
+                                     ulong              * delete_cnt ) {
+  *delete_cnt = 0UL;
+
+  int accepting = (pack->harmonic_decision==HARMONIC_MODE_UNDECIDED) | (pack->harmonic_decision==HARMONIC_MODE_HARMONIC);
+  if( FD_UNLIKELY( (!accepting) | pack->harmonic_stopped ) ) {
+    fd_pack_insert_bundle_cancel( pack, bundle, txn_cnt );
+    return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
+  }
+
+  if( FD_LIKELY( !initializer_bundle ) ) {
+    ulong slot = FD_TXN_M_HARMONIC_BUNDLE_SLOT( bundle_id );
+    ulong seq  = FD_TXN_M_HARMONIC_BUNDLE_SEQ ( bundle_id );
+
+    if( FD_UNLIKELY( slot!=pack->harmonic_block_slot ) ) {
+      /* Not part of the block for this slot.  It is dropped whole and
+         does not count against this block's sequence. */
+      FD_LOG_INFO(( "HARMONIC: rejecting block bundle for slot %lu while leader for slot %lu", slot, pack->harmonic_block_slot ));
+      fd_pack_insert_bundle_cancel( pack, bundle, txn_cnt );
+      return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
+    }
+    if( FD_UNLIKELY( seq!=pack->harmonic_next_seq ) ) {
+      FD_LOG_WARNING(( "HARMONIC: block bundle seq %lu arrived but %lu was expected, a bundle was dropped upstream", seq, pack->harmonic_next_seq ));
+      fd_pack_insert_bundle_cancel( pack, bundle, txn_cnt );
+      fd_pack_harmonic_stop( pack, FD_PACK_END_FLAG_HARMONIC_FAILED );
+      return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
+    }
+    pack->harmonic_next_seq++;
+
+    if( FD_UNLIKELY( pack->harmonic_decision==HARMONIC_MODE_HARMONIC && now_ns>=slot_end_ns ) ) {
+      FD_LOG_INFO(( "HARMONIC: block bundle arrived after slot end (arrival=%ld, slot_end=%ld)", now_ns, slot_end_ns ));
+      fd_pack_insert_bundle_cancel( pack, bundle, txn_cnt );
+      fd_pack_harmonic_stop( pack, FD_PACK_END_FLAG_HARMONIC_TIMEOUT );
+      return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
+    }
+  }
+
+  if( FD_UNLIKELY( pack->harmonic_decision==HARMONIC_MODE_UNDECIDED && now_ns>=harmonic_threshold_ns ) ) {
+    FD_LOG_INFO(( "HARMONIC: UNDECIDED -> FALLBACK (block did not start before threshold=%ld)", harmonic_threshold_ns ));
+    harmonic_fallback( pack, FD_PACK_END_FLAG_HARMONIC_TIMEOUT );
+    fd_pack_insert_bundle_cancel( pack, bundle, txn_cnt );
+    return FD_PACK_INSERT_REJECT_BLOCK_FAILED;
+  }
+
+  int result = insert_bundle_fini_impl( pack, bundle, txn_cnt, expires_at, initializer_bundle, bundle_meta, delete_cnt, 1, revert_protected );
+  if( FD_UNLIKELY( result<0 ) ) {
+    /* The bundle was cancelled by the insert.  A crank is retried by
+       the pack tile.  For a block bundle, everything pending is earlier
+       in the block and still executes; nothing later may. */
+    if( FD_UNLIKELY( initializer_bundle ) ) return result;
+    FD_LOG_WARNING(( "HARMONIC: block bundle rejected by pack (%d), no further block bundles this slot", result ));
+    fd_pack_harmonic_stop( pack, FD_PACK_END_FLAG_HARMONIC_FAILED );
+    return result;
+  }
+
+  /* The block starts once its crank is in or not needed, so it never
+     runs against a tip state the block builder does not expect */
+  if( FD_UNLIKELY( pack->harmonic_decision==HARMONIC_MODE_UNDECIDED &&
+                   ( initializer_bundle || pack->initializer_bundle_state==FD_PACK_IB_STATE_READY ) ) ) {
+    pack->harmonic_decision = HARMONIC_MODE_HARMONIC;
+    FD_LOG_INFO(( "HARMONIC: UNDECIDED -> HARMONIC (arrival=%ld < threshold=%ld)", now_ns, harmonic_threshold_ns ));
+  }
+  return result;
+}
+
+int   fd_pack_harmonic_state       ( fd_pack_t const * pack ) { return pack->harmonic_decision;                                }
+int   fd_pack_harmonic_stopped     ( fd_pack_t const * pack ) { return pack->harmonic_stopped;                                 }
+ulong fd_pack_harmonic_pending_cnt ( fd_pack_t const * pack ) { return treap_ele_cnt( pack->pending_blocks );                  }
+ulong fd_pack_harmonic_inflight_cnt( fd_pack_t const * pack ) { return (ulong)fd_ulong_popcnt( pack->harmonic_bank_outstanding ); }
+int   fd_pack_harmonic_end_flags   ( fd_pack_t const * pack ) { return pack->block_end_flags;                                  }
+
+void
+fd_pack_harmonic_state_crank( fd_pack_t * pack,
+                              long        approx_wallclock_ns,
+                              long        harmonic_threshold_ns,
+                              int         past_end_time ) {
+
+  switch( pack->harmonic_decision ) {
+
+    case HARMONIC_MODE_UNDECIDED: {
+      ulong pending_cnt = treap_ele_cnt( pack->pending_blocks );
+      /* No block in time: fall back */
+      if( approx_wallclock_ns>=harmonic_threshold_ns ) {
+        harmonic_fallback( pack, FD_PACK_END_FLAG_HARMONIC_TIMEOUT );
+        FD_LOG_INFO(( "HARMONIC: UNDECIDED -> FALLBACK (block did not start before threshold, pending=%lu)", pending_cnt ));
+      } else if( pending_cnt && pack->initializer_bundle_state==FD_PACK_IB_STATE_READY ) {
+        pack->harmonic_decision = HARMONIC_MODE_HARMONIC;
+        FD_LOG_INFO(( "HARMONIC: UNDECIDED -> HARMONIC (crank not needed)" ));
+      }
+      return;
+    }
+
+    case HARMONIC_MODE_HARMONIC: {
+      /* Once every accepted bundle has been dispatched, a stop before
+         the slot ends means the block stream is bad: fall back.  Bundles
+         still in flight keep their account locks, so nothing scheduled
+         afterwards can conflict with them. */
+      if( treap_ele_cnt( pack->pending_blocks ) ) return;
+      if( !past_end_time ) {
+        if( FD_LIKELY( !pack->harmonic_stopped ) ) return;
+        harmonic_fallback( pack, 0 );
+        FD_LOG_INFO(( "HARMONIC: HARMONIC -> FALLBACK (inflight=%d, flags=%d)",
+                      fd_ulong_popcnt( pack->harmonic_bank_outstanding ), pack->block_end_flags ));
+        return;
+      }
+      break;
+    }
+
+    case HARMONIC_MODE_FALLBACK:
+      break;
+
+    case HARMONIC_MODE_DONE:
+      return;
+
+    default:
+      FD_LOG_ERR(( "HARMONIC: invalid state: %d", pack->harmonic_decision ));
+      return;
+  }
+
+  /* A finished block or a fallback is done once the slot has ended */
+  if( FD_UNLIKELY( past_end_time ) ) {
+    FD_LOG_INFO(( "HARMONIC: %s -> DONE (flags=%d)",
+                  pack->harmonic_decision==HARMONIC_MODE_HARMONIC ? "HARMONIC" : "FALLBACK", pack->block_end_flags ));
+    pack->harmonic_decision = HARMONIC_MODE_DONE;
+  }
 }
 
 ulong fd_pack_bank_tile_cnt       ( fd_pack_t const * pack ) { return pack->bank_tile_cnt;         }
@@ -3185,6 +3559,7 @@ fd_pack_end_block( fd_pack_t * pack ) {
   pack->cumulative_block_cost       = 0UL;
   pack->cumulative_rebated_cus      = 0UL;
   pack->outstanding_microblock_mask = 0UL;
+  pack->harmonic_bank_outstanding   = 0UL;
   pack->alloc_consumed              = 0UL;
 
   pack->initializer_bundle_state = FD_PACK_IB_STATE_NOT_INITIALIZED;
@@ -3340,6 +3715,7 @@ delete_transaction( fd_pack_t         * pack,
       break;
     }
     case FD_ORD_TXN_ROOT_NEXT_AUCTION:        root = pack->next_auction;         break;
+    case FD_ORD_TXN_ROOT_PENDING_BLOCK:       root = pack->pending_blocks;       break;
     case FD_ORD_TXN_ROOT_PENALTY( 0 ): {
       fd_acct_addr_t penalty_acct = *ACCT_IDX_TO_PTR( FD_ORD_TXN_ROOT_PENALTY_ACCT_IDX( root_idx ) );
       penalty_treap = penalty_map_query( pack->penalty_treaps, penalty_acct, NULL );
@@ -3472,7 +3848,15 @@ fd_pack_delete_transaction( fd_pack_t              * pack,
        That means we know next is not part of the same bundle as idx,
        which means that deleting idx will not delete next. */
     next = sig2txn_idx_next_const( idx, ULONG_MAX, pack->pool );
-    cnt += delete_transaction( pack, pack->pool+idx, 1, 1 );
+    fd_pack_ord_txn_t * ord = pack->pool+idx;
+    /* Harmonic: block bundles arrive after became_leader, and replay
+       reports every ancestor's transactions before that, so a block
+       transaction reported here landed on another fork and can still
+       land in ours.  One that landed on our fork fails at execution,
+       which stops the block there. */
+    if( FD_UNLIKELY( ((ord->root & FD_ORD_TXN_ROOT_TAG_MASK)==FD_ORD_TXN_ROOT_PENDING_BLOCK) &
+                     !(ord->txn->flags & FD_TXN_P_FLAGS_INITIALIZER_BUNDLE) ) ) continue;
+    cnt += delete_transaction( pack, ord, 1, 1 );
   }
 
   return cnt;
@@ -3552,8 +3936,8 @@ fd_pack_verify( fd_pack_t * pack,
 
 
   fd_pack_ord_txn_t  * pool = pack->pool;
-  treap_t * treaps   [ 3 ] = { pack->pending, pack->pending_bundles, pack->next_auction };
-  int       root_tags[ 3 ] = { FD_ORD_TXN_ROOT_PENDING, FD_ORD_TXN_ROOT_PENDING_BUNDLE, FD_ORD_TXN_ROOT_NEXT_AUCTION };
+  treap_t * treaps   [ 4 ] = { pack->pending, pack->pending_bundles, pack->next_auction, pack->pending_blocks };
+  int       root_tags[ 4 ] = { FD_ORD_TXN_ROOT_PENDING, FD_ORD_TXN_ROOT_PENDING_BUNDLE, FD_ORD_TXN_ROOT_NEXT_AUCTION, FD_ORD_TXN_ROOT_PENDING_BLOCK };
   ulong txn_cnt = 0UL;
 
   ulong const pre_rotation_bundle_max = FD_PACK_PRE_ROTATION_BUNDLE_CAPACITY;
@@ -3567,17 +3951,17 @@ fd_pack_verify( fd_pack_t * pack,
 
   VERIFY_TEST( pack->auction_running || !treap_ele_cnt( pack->next_auction ), "next_auction not empty outside an auction" );
 
-  for( ulong k=0UL; k<3UL+pre_rotation_bundle_max+penalty_map_slot_cnt( pack->penalty_treaps ); k++ ) {
+  for( ulong k=0UL; k<4UL+pre_rotation_bundle_max+penalty_map_slot_cnt( pack->penalty_treaps ); k++ ) {
     treap_t * treap = NULL;
 
-    if( k<3UL ) treap = treaps[ k ];
-    else if( k<3UL+pre_rotation_bundle_max ) {
-      treap = pack->pre_rotation_bundles[ k-3UL ].treap;
+    if( k<4UL ) treap = treaps[ k ];
+    else if( k<4UL+pre_rotation_bundle_max ) {
+      treap = pack->pre_rotation_bundles[ k-4UL ].treap;
       if( !treap_ele_cnt( treap ) ) continue;
     }
-    else if( FD_LIKELY( penalty_map_key_inval( pack->penalty_treaps[ k-3UL-pre_rotation_bundle_max ].key ) ) ) continue;
+    else if( FD_LIKELY( penalty_map_key_inval( pack->penalty_treaps[ k-4UL-pre_rotation_bundle_max ].key ) ) ) continue;
     else {
-      treap = pack->penalty_treaps[ k-3UL-pre_rotation_bundle_max ].penalty_treap;
+      treap = pack->penalty_treaps[ k-4UL-pre_rotation_bundle_max ].penalty_treap;
       VERIFY_TEST( treap_ele_cnt( treap )>0UL, "empty penalty treap in map" );
     }
 
@@ -3592,14 +3976,14 @@ fd_pack_verify( fd_pack_t * pack,
       fd_pack_ord_txn_t const * in_tbl = sig2txn_ele_query_const( pack->signature_map, &cur->_txn_e, NULL, pool );
       VERIFY_TEST( in_tbl, "signature missing from sig2txn" );
 
-      ulong expected_root = (k<3UL) ? (ulong)root_tags[ k ] : ((k<3UL+pre_rotation_bundle_max) ? (ulong)FD_ORD_TXN_ROOT_PRE_ROTATION_BUNDLE( 0 ) : (ulong)FD_ORD_TXN_ROOT_PENALTY( 0 ));
+      ulong expected_root = (k<4UL) ? (ulong)root_tags[ k ] : ((k<4UL+pre_rotation_bundle_max) ? (ulong)FD_ORD_TXN_ROOT_PRE_ROTATION_BUNDLE( 0 ) : (ulong)FD_ORD_TXN_ROOT_PENALTY( 0 ));
       VERIFY_TEST( (ulong)(cur->root & FD_ORD_TXN_ROOT_TAG_MASK)==expected_root, "treap element had bad root" );
       if( FD_UNLIKELY( (cur->root & FD_ORD_TXN_ROOT_TAG_MASK)==FD_ORD_TXN_ROOT_PRE_ROTATION_BUNDLE( 0 ) ) ) {
-        VERIFY_TEST( (ulong)FD_ORD_TXN_ROOT_PRE_ROTATION_BUNDLE_IDX( cur->root )==k-3UL, "transaction in wrong pre-rotation bundle" );
+        VERIFY_TEST( (ulong)FD_ORD_TXN_ROOT_PRE_ROTATION_BUNDLE_IDX( cur->root )==k-4UL, "transaction in wrong pre-rotation bundle" );
       }
       if( FD_LIKELY( (cur->root & FD_ORD_TXN_ROOT_TAG_MASK)==FD_ORD_TXN_ROOT_PENALTY(0) ) ) {
         fd_acct_addr_t const * penalty_acct = ACCT_IDX_TO_PTR( FD_ORD_TXN_ROOT_PENALTY_ACCT_IDX( cur->root ) );
-        VERIFY_TEST( !memcmp( penalty_acct, pack->penalty_treaps[ k-3UL-pre_rotation_bundle_max ].key.b, 32UL ), "transaction in wrong penalty treap" );
+        VERIFY_TEST( !memcmp( penalty_acct, pack->penalty_treaps[ k-4UL-pre_rotation_bundle_max ].key.b, 32UL ), "transaction in wrong penalty treap" );
       }
       VERIFY_TEST( cur->expires_at>=pack->expire_before, "treap element expired" );
 
