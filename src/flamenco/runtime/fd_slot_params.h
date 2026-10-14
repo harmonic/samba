@@ -30,7 +30,12 @@
 
    50ms is used to match Agave's behaviour:
    https://github.com/anza-xyz/agave/blob/v4.2/poh/src/poh_service.rs#L47 */
-#define FD_TARGET_SLOT_ADJUSTMENT_NS (0UL)
+#define FD_TARGET_SLOT_ADJUSTMENT_NS (50000000UL)
+
+/* Harmonic: TowerBFT leader slots (ns_per_slot_adjusted) get the full
+   slot time.  Alpenglow ends leader windows relative to ParentReady
+   and keeps FD_TARGET_SLOT_ADJUSTMENT_NS. */
+#define FD_HARMONIC_TOWER_SLOT_ADJUSTMENT_NS (0UL)
 
 /* Runtime parameters that need to change when the slot time changes
    due to one of the reduce_slot_time feature gates.
@@ -55,7 +60,7 @@ typedef struct fd_slot_params fd_slot_params_t;
 /* https://github.com/anza-xyz/agave/blob/v4.2/runtime/src/slot_params.rs#L123-L133 */
 #define FD_SLOT_PARAMS_400MS ((fd_slot_params_t){                                 \
   .ns_per_slot                        = 400000000UL,                              \
-  .ns_per_slot_adjusted               = 400000000UL-FD_TARGET_SLOT_ADJUSTMENT_NS, \
+  .ns_per_slot_adjusted               = 400000000UL-FD_HARMONIC_TOWER_SLOT_ADJUSTMENT_NS, \
   .slots_per_year                     = 78892314.984,                             \
   .hashes_per_tick                    = FD_LEGACY_HASHES_PER_TICK,                \
   .max_block_units                    = 60000000UL,                               \
@@ -70,7 +75,7 @@ typedef struct fd_slot_params fd_slot_params_t;
 /* https://github.com/anza-xyz/agave/blob/v4.2/runtime/src/slot_params.rs#L135-L145 */
 #define FD_SLOT_PARAMS_350MS ((fd_slot_params_t){                                 \
   .ns_per_slot                        = 350000000UL,                              \
-  .ns_per_slot_adjusted               = 350000000UL-FD_TARGET_SLOT_ADJUSTMENT_NS, \
+  .ns_per_slot_adjusted               = 350000000UL-FD_HARMONIC_TOWER_SLOT_ADJUSTMENT_NS, \
   .slots_per_year                     = 90162645.696,                             \
   .hashes_per_tick                    = 54687UL,                                  \
   .max_block_units                    = 52500000UL,                               \
@@ -85,7 +90,7 @@ typedef struct fd_slot_params fd_slot_params_t;
 /* https://github.com/anza-xyz/agave/blob/v4.2/runtime/src/slot_params.rs#L147-L157 */
 #define FD_SLOT_PARAMS_300MS ((fd_slot_params_t){                                 \
   .ns_per_slot                        = 300000000UL,                              \
-  .ns_per_slot_adjusted               = 300000000UL-FD_TARGET_SLOT_ADJUSTMENT_NS, \
+  .ns_per_slot_adjusted               = 300000000UL-FD_HARMONIC_TOWER_SLOT_ADJUSTMENT_NS, \
   .slots_per_year                     = 105189753.312,                            \
   .hashes_per_tick                    = 46875UL,                                  \
   .max_block_units                    = 45000000UL,                               \
@@ -100,7 +105,7 @@ typedef struct fd_slot_params fd_slot_params_t;
 /* https://github.com/anza-xyz/agave/blob/v4.2/runtime/src/slot_params.rs#L159-L169 */
 #define FD_SLOT_PARAMS_250MS ((fd_slot_params_t){                                 \
   .ns_per_slot                        = 250000000UL,                              \
-  .ns_per_slot_adjusted               = 250000000UL-FD_TARGET_SLOT_ADJUSTMENT_NS, \
+  .ns_per_slot_adjusted               = 250000000UL-FD_HARMONIC_TOWER_SLOT_ADJUSTMENT_NS, \
   .slots_per_year                     = 126227703.974,                            \
   .hashes_per_tick                    = 39062UL,                                  \
   .max_block_units                    = 37500000UL,                               \
@@ -115,7 +120,7 @@ typedef struct fd_slot_params fd_slot_params_t;
 /* https://github.com/anza-xyz/agave/blob/v4.2/runtime/src/slot_params.rs#L171-L181 */
 #define FD_SLOT_PARAMS_200MS ((fd_slot_params_t){                                 \
   .ns_per_slot                        = 200000000UL,                              \
-  .ns_per_slot_adjusted               = 200000000UL-FD_TARGET_SLOT_ADJUSTMENT_NS, \
+  .ns_per_slot_adjusted               = 200000000UL-FD_HARMONIC_TOWER_SLOT_ADJUSTMENT_NS, \
   .slots_per_year                     = 157784629.968,                            \
   .hashes_per_tick                    = 31250UL,                                  \
   .max_block_units                    = 30000000UL,                               \
