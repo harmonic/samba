@@ -400,7 +400,7 @@ fd_ssload_recover_apply( fd_snapshot_manifest_t * manifest,
   bank->f.genesis_creation_time            = manifest->creation_time_seconds;
   bank->f.slot_params                      = FD_SLOT_PARAMS_400MS;
   bank->f.slot_params.ns_per_slot          = manifest->ns_per_slot;
-  bank->f.slot_params.ns_per_slot_adjusted = fd_ulong_sat_sub( bank->f.slot_params.ns_per_slot, FD_TARGET_SLOT_ADJUSTMENT_NS );
+  bank->f.slot_params.ns_per_slot_adjusted = fd_ulong_sat_sub( bank->f.slot_params.ns_per_slot, FD_HARMONIC_TOWER_SLOT_ADJUSTMENT_NS );
   bank->f.slot_params.slots_per_year       = manifest->slots_per_year;
   bank->f.slot_params.hashes_per_tick      = restored_hashes_per_tick;
   bank->f.block_height                     = manifest->block_height;

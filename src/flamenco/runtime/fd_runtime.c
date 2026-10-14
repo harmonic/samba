@@ -1630,7 +1630,7 @@ fd_runtime_init_bank_from_genesis( fd_banks_t *         banks,
   bank->f.max_tick_height                  = genesis->poh.ticks_per_slot * (bank->f.slot + 1);
   bank->f.slot_params                      = FD_SLOT_PARAMS_400MS;
   bank->f.slot_params.ns_per_slot          = (ulong)( target_tick_duration * genesis->poh.ticks_per_slot );
-  bank->f.slot_params.ns_per_slot_adjusted = fd_ulong_sat_sub( bank->f.slot_params.ns_per_slot, FD_TARGET_SLOT_ADJUSTMENT_NS );
+  bank->f.slot_params.ns_per_slot_adjusted = fd_ulong_sat_sub( bank->f.slot_params.ns_per_slot, FD_HARMONIC_TOWER_SLOT_ADJUSTMENT_NS );
   bank->f.slot_params.slots_per_year       = SECONDS_PER_YEAR * (1000000000.0 / (double)target_tick_duration) / (double)genesis->poh.ticks_per_slot;
   bank->f.slot_params.hashes_per_tick      = genesis->poh.hashes_per_tick;
   bank->f.slot_params_default              = bank->f.slot_params;
