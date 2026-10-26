@@ -13,3 +13,7 @@
 /src/waltz/quic @nbridge-jump @ripatel-fd @akhinvasara-jumptrading
 /src/waltz/tls @ripatel-fd @mmcgee-jump
 /src/waltz/xdp @ripatel-fd @mmcgee-jump
+
+# Temporal: this team approves every change (ruleset: Code owner review).
+# Kept last so it overrides the upstream owners above, who have no access here.
+* @harmonic/harmonic-validator-owners
